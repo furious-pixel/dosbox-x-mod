@@ -31,6 +31,16 @@ namespace {
 
 struct PyObject;
 typedef intptr_t Py_ssize_t;
+typedef PyObject *(*PyCFunction)(PyObject *, PyObject *);
+
+#define DOSBOX_PY_METH_VARARGS 0x0001
+
+struct PyMethodDef {
+	const char *ml_name;
+	PyCFunction ml_meth;
+	int ml_flags;
+	const char *ml_doc;
+};
 
 struct PythonAPI {
 #if defined(WIN32) && !defined(HX_DOS)
@@ -42,34 +52,69 @@ struct PythonAPI {
 	const char *(*Py_GetVersion)(void) = NULL;
 	int (*PyRun_SimpleStringFlags)(const char *, void *) = NULL;
 	PyObject *(*PyImport_ImportModule)(const char *) = NULL;
+	PyObject *(*PyImport_AddModule)(const char *) = NULL;
 	PyObject *(*PyObject_GetAttrString)(PyObject *, const char *) = NULL;
+	int (*PyObject_SetAttrString)(PyObject *, const char *, PyObject *) = NULL;
 	PyObject *(*PyObject_CallFunctionObjArgs)(PyObject *, ...) = NULL;
+	int (*PyCallable_Check)(PyObject *) = NULL;
+	PyObject *(*PyCFunction_NewEx)(PyMethodDef *, PyObject *, PyObject *) = NULL;
 	PyObject *(*PyMapping_GetItemString)(PyObject *, const char *) = NULL;
 	int (*PyMapping_HasKeyString)(PyObject *, const char *) = NULL;
 	Py_ssize_t (*PySequence_Size)(PyObject *) = NULL;
 	PyObject *(*PySequence_GetItem)(PyObject *, Py_ssize_t) = NULL;
+	Py_ssize_t (*PyTuple_Size)(PyObject *) = NULL;
+	PyObject *(*PyTuple_GetItem)(PyObject *, Py_ssize_t) = NULL;
 	PyObject *(*PyUnicode_FromString)(const char *) = NULL;
 	const char *(*PyUnicode_AsUTF8)(PyObject *) = NULL;
 	unsigned long (*PyLong_AsUnsignedLong)(PyObject *) = NULL;
+	long (*PyLong_AsLong)(PyObject *) = NULL;
+	PyObject *(*PyLong_FromUnsignedLong)(unsigned long) = NULL;
+	PyObject *(*PyLong_FromUnsignedLongLong)(unsigned long long) = NULL;
+	PyObject *(*PyLong_FromLong)(long) = NULL;
+	PyObject *(*PyFloat_FromDouble)(double) = NULL;
+	void (*Py_IncRef)(PyObject *) = NULL;
 	void (*Py_DecRef)(PyObject *) = NULL;
 	void *(*PyErr_Occurred)(void) = NULL;
 	void (*PyErr_Clear)(void) = NULL;
 	void (*PyErr_Print)(void) = NULL;
+	void (*PyErr_SetString)(PyObject *, const char *) = NULL;
 	int (*Py_FinalizeEx)(void) = NULL;
+
+	PyObject *PyExc_RuntimeError = NULL;
+	PyObject *PyExc_TypeError = NULL;
+	PyObject *PyExc_ValueError = NULL;
+	PyObject *PyExc_OverflowError = NULL;
 
 	bool loaded(void) const
 	{
 		return Py_SetProgramName && Py_Initialize && Py_IsInitialized &&
 		       Py_GetVersion && PyRun_SimpleStringFlags &&
-		       PyImport_ImportModule && PyObject_GetAttrString &&
-		       PyObject_CallFunctionObjArgs && PyMapping_GetItemString &&
+		       PyImport_ImportModule && PyImport_AddModule &&
+		       PyObject_GetAttrString && PyObject_SetAttrString &&
+		       PyObject_CallFunctionObjArgs && PyCallable_Check &&
+		       PyCFunction_NewEx && PyMapping_GetItemString &&
 		       PyMapping_HasKeyString && PySequence_Size &&
-		       PySequence_GetItem && PyUnicode_FromString &&
-		       PyUnicode_AsUTF8 && PyLong_AsUnsignedLong &&
-		       Py_DecRef &&
+		       PySequence_GetItem && PyTuple_Size && PyTuple_GetItem &&
+		       PyUnicode_FromString && PyUnicode_AsUTF8 &&
+		       PyLong_AsUnsignedLong && PyLong_AsLong &&
+		       PyLong_FromUnsignedLong &&
+		       PyLong_FromUnsignedLongLong && PyLong_FromLong &&
+		       PyFloat_FromDouble && Py_IncRef && Py_DecRef &&
 		       PyErr_Occurred && PyErr_Clear && PyErr_Print &&
-		       Py_FinalizeEx;
+		       PyErr_SetString && Py_FinalizeEx &&
+		       PyExc_RuntimeError && PyExc_TypeError &&
+		       PyExc_ValueError && PyExc_OverflowError;
 	}
+};
+
+struct PythonHookRegistration {
+	size_t hook_id = 0;
+	std::string exe_name_upper = {};
+	uint32_t reloc_eip = 0;
+	std::string kind = {};
+	std::string description = {};
+	bool enabled = true;
+	PyObject *callback = NULL;
 };
 
 struct PythonRuntime {
@@ -79,6 +124,10 @@ struct PythonRuntime {
 	std::string mods_dir = {};
 	std::string venv_dir = {};
 	std::string python_dll = {};
+	PyObject *mod_module = NULL;
+	PyObject *modstate = NULL;
+	PyObject *gamemem = NULL;
+	std::vector<PythonHookRegistration> hooks = {};
 };
 
 PythonRuntime g_python = {};
@@ -220,6 +269,14 @@ static std::string uppercase_ascii_copy(std::string value)
 	return value;
 }
 
+static std::string lowercase_ascii_copy(std::string value)
+{
+	std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+		return static_cast<char>(std::tolower(ch));
+	});
+	return value;
+}
+
 static std::string versioned_python_dll_name(const std::string &version_info)
 {
 	std::vector<int> parts;
@@ -263,7 +320,46 @@ static std::string escape_python_string(std::string path)
 	return escaped;
 }
 
-static std::string build_python_bootstrap(const std::string &mods_dir)
+static std::string build_mod_helper_bootstrap(void)
+{
+	std::ostringstream script;
+	script
+		<< "import mod\n"
+		<< "class _DOSBoxModState(object):\n"
+		<< "    pass\n"
+		<< "if not hasattr(mod, 'modstate'):\n"
+		<< "    mod.modstate = _DOSBoxModState()\n"
+		<< "mod.modstate.frame = 0\n"
+		<< "mod.modstate.time = 0.0\n"
+		<< "mod.modstate.frame_delta = 0.0\n"
+		<< "class _DOSBoxGameMemory(object):\n"
+		<< "    def read_u8(self, addr):\n"
+		<< "        return mod._read_u8(addr)\n"
+		<< "    def read_u16(self, addr):\n"
+		<< "        return mod._read_u16(addr)\n"
+		<< "    def read_u32(self, addr):\n"
+		<< "        return mod._read_u32(addr)\n"
+		<< "    def read_i32(self, addr):\n"
+		<< "        return mod._read_i32(addr)\n"
+		<< "    def write_u8(self, addr, value):\n"
+		<< "        return mod._write_u8(addr, value)\n"
+		<< "    def write_u16(self, addr, value):\n"
+		<< "        return mod._write_u16(addr, value)\n"
+		<< "    def write_u32(self, addr, value):\n"
+		<< "        return mod._write_u32(addr, value)\n"
+		<< "    def write_i32(self, addr, value):\n"
+		<< "        return mod._write_i32(addr, value)\n"
+		<< "if not hasattr(mod, 'gamemem'):\n"
+		<< "    mod.gamemem = _DOSBoxGameMemory()\n"
+		<< "def modhook(exe_name, eip, kind):\n"
+		<< "    def decorator(func):\n"
+		<< "        return mod._register_hook(exe_name, eip, kind, func)\n"
+		<< "    return decorator\n"
+		<< "mod.modhook = modhook\n";
+	return script.str();
+}
+
+static std::string build_mod_loader_script(const std::string &mods_dir)
 {
 	const std::string escaped_mods_dir = escape_python_string(mods_dir);
 	std::ostringstream script;
@@ -273,6 +369,7 @@ static std::string build_python_bootstrap(const std::string &mods_dir)
 		<< "import pathlib\n"
 		<< "import runpy\n"
 		<< "import sys\n"
+		<< "import traceback\n"
 		<< "if os.name == 'nt':\n"
 		<< "    try:\n"
 		<< "        _dosbox_console = builtins.open('CONOUT$', 'w', encoding='utf-8', buffering=1)\n"
@@ -289,11 +386,24 @@ static std::string build_python_bootstrap(const std::string &mods_dir)
 		<< "        if mod_path.name.lower() == 'mod_init.py':\n"
 		<< "            continue\n"
 		<< "        print(f'PYTHON: loading mod {mod_path.name}', flush=True)\n"
-		<< "        runpy.run_path(str(mod_path), run_name=f'dosbox_mod_{mod_path.stem}')\n"
+		<< "        try:\n"
+		<< "            runpy.run_path(str(mod_path), run_name=f'dosbox_mod_{mod_path.stem}')\n"
+		<< "        except Exception:\n"
+		<< "            print(f'MOD ERROR: failed loading {mod_path.name}', flush=True)\n"
+		<< "            traceback.print_exc()\n"
 		<< "else:\n"
 		<< "    print(f'PYTHON: mods directory not found: {mods_dir}', flush=True)\n"
 		<< "sys.stdout.flush()\n";
 	return script.str();
+}
+
+static void clear_registered_hooks(void)
+{
+	for (size_t i = 0; i < g_python.hooks.size(); ++i) {
+		if (g_python.hooks[i].callback && g_python.api.Py_DecRef)
+			g_python.api.Py_DecRef(g_python.hooks[i].callback);
+	}
+	g_python.hooks.clear();
 }
 
 static void clear_python_error(void)
@@ -315,11 +425,54 @@ static void log_python_exception(const char *context)
 	}
 }
 
+static void set_python_error(PyObject *exception_type, const char *message)
+{
+	if (g_python.api.PyErr_SetString && exception_type && message)
+		g_python.api.PyErr_SetString(exception_type, message);
+}
+
 static std::string append_context_index(const std::string &context, size_t index)
 {
 	std::ostringstream stream;
 	stream << context << "[" << static_cast<unsigned int>(index) << "]";
 	return stream.str();
+}
+
+static bool set_object_attr(PyObject *object, const char *name, PyObject *value)
+{
+	if (!object || !value)
+		return false;
+
+	if (g_python.api.PyObject_SetAttrString(object, name, value) != 0) {
+		log_python_exception(("failed to set attribute " + std::string(name)).c_str());
+		return false;
+	}
+
+	return true;
+}
+
+static bool set_object_attr_u64(PyObject *object, const char *name, uint64_t value)
+{
+	PyOwnedRef py_value(
+	        g_python.api.PyLong_FromUnsignedLongLong(
+	                static_cast<unsigned long long>(value)));
+	if (!py_value) {
+		log_python_exception(("failed to create integer for " + std::string(name)).c_str());
+		return false;
+	}
+
+	return set_object_attr(object, name, py_value.get());
+}
+
+static bool set_object_attr_double(PyObject *object, const char *name, double value)
+{
+	PyOwnedRef py_value(g_python.api.PyFloat_FromDouble(value));
+	if (!py_value) {
+		log_python_exception(("failed to create float for " + std::string(name)).c_str());
+		return false;
+	}
+
+	return set_object_attr(object, name, py_value.get());
 }
 
 static PyObject *get_required_mapping_item(PyObject *mapping,
@@ -401,6 +554,430 @@ static bool ensure_mods_dir_on_sys_path(const std::string &mods_dir)
 		return false;
 	}
 
+	return true;
+}
+
+static std::string get_callable_description(PyObject *callable,
+                                            const std::string &exe_name_upper,
+                                            uint32_t reloc_eip)
+{
+	std::string module_name = {};
+	std::string function_name = {};
+
+	PyOwnedRef module_obj(g_python.api.PyObject_GetAttrString(callable, "__module__"));
+	if (module_obj)
+		py_object_to_string(module_obj.get(), "__module__", &module_name);
+	else
+		clear_python_error();
+
+	PyOwnedRef name_obj(g_python.api.PyObject_GetAttrString(callable, "__name__"));
+	if (name_obj)
+		py_object_to_string(name_obj.get(), "__name__", &function_name);
+	else
+		clear_python_error();
+
+	std::ostringstream description;
+	if (!module_name.empty() && !function_name.empty())
+		description << module_name << "." << function_name;
+	else if (!function_name.empty())
+		description << function_name;
+	else
+		description << "<python hook>";
+
+	description << " -> " << exe_name_upper
+	            << ":0x" << std::hex << std::uppercase
+	            << static_cast<unsigned long>(reloc_eip);
+	return description.str();
+}
+
+static bool attach_module_function(PyObject *module,
+                                   const char *name,
+                                   PyMethodDef *method)
+{
+	PyOwnedRef function(g_python.api.PyCFunction_NewEx(method, module, NULL));
+	if (!function) {
+		log_python_exception(("failed to create Python callable " + std::string(name)).c_str());
+		return false;
+	}
+
+	if (g_python.api.PyObject_SetAttrString(module, name, function.get()) != 0) {
+		log_python_exception(("failed to attach Python callable " + std::string(name)).c_str());
+		return false;
+	}
+
+	return true;
+}
+
+static bool py_tuple_get_uint32_arg(PyObject *args,
+                                    Py_ssize_t index,
+                                    unsigned long *value)
+{
+	PyObject *item = g_python.api.PyTuple_GetItem(args, index);
+	if (!item) {
+		set_python_error(g_python.api.PyExc_RuntimeError,
+		                 "failed to read integer argument");
+		return false;
+	}
+
+	clear_python_error();
+	*value = g_python.api.PyLong_AsUnsignedLong(item);
+	if (g_python.api.PyErr_Occurred && g_python.api.PyErr_Occurred() != NULL)
+		return false;
+
+	return true;
+}
+
+static bool py_tuple_get_int32_arg(PyObject *args,
+                                   Py_ssize_t index,
+                                   long *value)
+{
+	PyObject *item = g_python.api.PyTuple_GetItem(args, index);
+	if (!item) {
+		set_python_error(g_python.api.PyExc_RuntimeError,
+		                 "failed to read integer argument");
+		return false;
+	}
+
+	clear_python_error();
+	*value = g_python.api.PyLong_AsLong(item);
+	if (g_python.api.PyErr_Occurred && g_python.api.PyErr_Occurred() != NULL)
+		return false;
+
+	return true;
+}
+
+static PyObject *py_register_hook(PyObject *, PyObject *args)
+{
+	if (g_python.api.PyTuple_Size(args) != 4) {
+		set_python_error(g_python.api.PyExc_TypeError,
+		                 "_register_hook expects (exe_name, eip, kind, func)");
+		return NULL;
+	}
+
+	PyObject *exe_name_obj = g_python.api.PyTuple_GetItem(args, 0);
+	PyObject *reloc_eip_obj = g_python.api.PyTuple_GetItem(args, 1);
+	PyObject *kind_obj = g_python.api.PyTuple_GetItem(args, 2);
+	PyObject *callable_obj = g_python.api.PyTuple_GetItem(args, 3);
+	if (!exe_name_obj || !reloc_eip_obj || !kind_obj || !callable_obj) {
+		set_python_error(g_python.api.PyExc_RuntimeError,
+		                 "failed to read hook arguments");
+		return NULL;
+	}
+
+	const char *exe_name_utf8 = g_python.api.PyUnicode_AsUTF8(exe_name_obj);
+	if (!exe_name_utf8)
+		return NULL;
+
+	const char *kind_utf8 = g_python.api.PyUnicode_AsUTF8(kind_obj);
+	if (!kind_utf8)
+		return NULL;
+
+	clear_python_error();
+	const unsigned long reloc_eip_value =
+	        g_python.api.PyLong_AsUnsignedLong(reloc_eip_obj);
+	if (g_python.api.PyErr_Occurred && g_python.api.PyErr_Occurred() != NULL)
+		return NULL;
+
+	const std::string exe_name = exe_name_utf8;
+	std::string kind = kind_utf8;
+	const uint32_t reloc_eip = static_cast<uint32_t>(reloc_eip_value);
+
+	kind = lowercase_ascii_copy(kind);
+	if (kind != "call") {
+		set_python_error(g_python.api.PyExc_ValueError,
+		                 "only 'call' hooks are supported");
+		return NULL;
+	}
+
+	if (!g_python.api.PyCallable_Check(callable_obj)) {
+		set_python_error(g_python.api.PyExc_TypeError,
+		                 "hook target must be callable");
+		return NULL;
+	}
+
+	PythonHookRegistration hook = {};
+	hook.hook_id = g_python.hooks.size();
+	hook.exe_name_upper = uppercase_ascii_copy(exe_name);
+	hook.reloc_eip = reloc_eip;
+	hook.kind = kind;
+	hook.description = get_callable_description(callable_obj,
+	                                            hook.exe_name_upper,
+	                                            hook.reloc_eip);
+	hook.enabled = true;
+	hook.callback = callable_obj;
+	g_python.api.Py_IncRef(hook.callback);
+	g_python.hooks.push_back(hook);
+
+	LOG_MSG("MOD: registered hook %s", hook.description.c_str());
+
+	g_python.api.Py_IncRef(callable_obj);
+	return callable_obj;
+}
+
+static PyObject *py_read_u8(PyObject *, PyObject *args)
+{
+	if (g_python.api.PyTuple_Size(args) != 1) {
+		set_python_error(g_python.api.PyExc_TypeError, "read_u8 expects (addr)");
+		return NULL;
+	}
+
+	unsigned long reloc_addr = 0;
+	if (!py_tuple_get_uint32_arg(args, 0, &reloc_addr))
+		return NULL;
+
+	uint8_t value = 0;
+	if (!MOD_ReadMemoryU8(static_cast<uint32_t>(reloc_addr), &value)) {
+		set_python_error(g_python.api.PyExc_RuntimeError, "read_u8 failed");
+		return NULL;
+	}
+
+	return g_python.api.PyLong_FromUnsignedLong(static_cast<unsigned long>(value));
+}
+
+static PyObject *py_read_u16(PyObject *, PyObject *args)
+{
+	if (g_python.api.PyTuple_Size(args) != 1) {
+		set_python_error(g_python.api.PyExc_TypeError, "read_u16 expects (addr)");
+		return NULL;
+	}
+
+	unsigned long reloc_addr = 0;
+	if (!py_tuple_get_uint32_arg(args, 0, &reloc_addr))
+		return NULL;
+
+	uint16_t value = 0;
+	if (!MOD_ReadMemoryU16(static_cast<uint32_t>(reloc_addr), &value)) {
+		set_python_error(g_python.api.PyExc_RuntimeError, "read_u16 failed");
+		return NULL;
+	}
+
+	return g_python.api.PyLong_FromUnsignedLong(static_cast<unsigned long>(value));
+}
+
+static PyObject *py_read_u32(PyObject *, PyObject *args)
+{
+	if (g_python.api.PyTuple_Size(args) != 1) {
+		set_python_error(g_python.api.PyExc_TypeError, "read_u32 expects (addr)");
+		return NULL;
+	}
+
+	unsigned long reloc_addr = 0;
+	if (!py_tuple_get_uint32_arg(args, 0, &reloc_addr))
+		return NULL;
+
+	uint32_t value = 0;
+	if (!MOD_ReadMemoryU32(static_cast<uint32_t>(reloc_addr), &value)) {
+		set_python_error(g_python.api.PyExc_RuntimeError, "read_u32 failed");
+		return NULL;
+	}
+
+	return g_python.api.PyLong_FromUnsignedLong(static_cast<unsigned long>(value));
+}
+
+static PyObject *py_read_i32(PyObject *, PyObject *args)
+{
+	if (g_python.api.PyTuple_Size(args) != 1) {
+		set_python_error(g_python.api.PyExc_TypeError, "read_i32 expects (addr)");
+		return NULL;
+	}
+
+	unsigned long reloc_addr = 0;
+	if (!py_tuple_get_uint32_arg(args, 0, &reloc_addr))
+		return NULL;
+
+	int32_t value = 0;
+	if (!MOD_ReadMemoryI32(static_cast<uint32_t>(reloc_addr), &value)) {
+		set_python_error(g_python.api.PyExc_RuntimeError, "read_i32 failed");
+		return NULL;
+	}
+
+	return g_python.api.PyLong_FromLong(static_cast<long>(value));
+}
+
+static PyObject *py_write_u8(PyObject *, PyObject *args)
+{
+	if (g_python.api.PyTuple_Size(args) != 2) {
+		set_python_error(g_python.api.PyExc_TypeError, "write_u8 expects (addr, value)");
+		return NULL;
+	}
+
+	unsigned long reloc_addr = 0;
+	unsigned long value = 0;
+	if (!py_tuple_get_uint32_arg(args, 0, &reloc_addr) ||
+	    !py_tuple_get_uint32_arg(args, 1, &value)) {
+		return NULL;
+	}
+
+	if (value > 0xfful) {
+		set_python_error(g_python.api.PyExc_OverflowError,
+		                 "write_u8 value out of range");
+		return NULL;
+	}
+
+	if (!MOD_WriteMemoryU8(static_cast<uint32_t>(reloc_addr),
+	                       static_cast<uint8_t>(value))) {
+		set_python_error(g_python.api.PyExc_RuntimeError, "write_u8 failed");
+		return NULL;
+	}
+
+	PyObject *value_obj = g_python.api.PyTuple_GetItem(args, 1);
+	g_python.api.Py_IncRef(value_obj);
+	return value_obj;
+}
+
+static PyObject *py_write_u16(PyObject *, PyObject *args)
+{
+	if (g_python.api.PyTuple_Size(args) != 2) {
+		set_python_error(g_python.api.PyExc_TypeError, "write_u16 expects (addr, value)");
+		return NULL;
+	}
+
+	unsigned long reloc_addr = 0;
+	unsigned long value = 0;
+	if (!py_tuple_get_uint32_arg(args, 0, &reloc_addr) ||
+	    !py_tuple_get_uint32_arg(args, 1, &value)) {
+		return NULL;
+	}
+
+	if (value > 0xfffful) {
+		set_python_error(g_python.api.PyExc_OverflowError,
+		                 "write_u16 value out of range");
+		return NULL;
+	}
+
+	if (!MOD_WriteMemoryU16(static_cast<uint32_t>(reloc_addr),
+	                        static_cast<uint16_t>(value))) {
+		set_python_error(g_python.api.PyExc_RuntimeError, "write_u16 failed");
+		return NULL;
+	}
+
+	PyObject *value_obj = g_python.api.PyTuple_GetItem(args, 1);
+	g_python.api.Py_IncRef(value_obj);
+	return value_obj;
+}
+
+static PyObject *py_write_u32(PyObject *, PyObject *args)
+{
+	if (g_python.api.PyTuple_Size(args) != 2) {
+		set_python_error(g_python.api.PyExc_TypeError, "write_u32 expects (addr, value)");
+		return NULL;
+	}
+
+	unsigned long reloc_addr = 0;
+	unsigned long value = 0;
+	if (!py_tuple_get_uint32_arg(args, 0, &reloc_addr) ||
+	    !py_tuple_get_uint32_arg(args, 1, &value)) {
+		return NULL;
+	}
+
+	if (!MOD_WriteMemoryU32(static_cast<uint32_t>(reloc_addr),
+	                        static_cast<uint32_t>(value))) {
+		set_python_error(g_python.api.PyExc_RuntimeError, "write_u32 failed");
+		return NULL;
+	}
+
+	PyObject *value_obj = g_python.api.PyTuple_GetItem(args, 1);
+	g_python.api.Py_IncRef(value_obj);
+	return value_obj;
+}
+
+static PyObject *py_write_i32(PyObject *, PyObject *args)
+{
+	if (g_python.api.PyTuple_Size(args) != 2) {
+		set_python_error(g_python.api.PyExc_TypeError, "write_i32 expects (addr, value)");
+		return NULL;
+	}
+
+	unsigned long reloc_addr = 0;
+	long value = 0;
+	if (!py_tuple_get_uint32_arg(args, 0, &reloc_addr) ||
+	    !py_tuple_get_int32_arg(args, 1, &value)) {
+		return NULL;
+	}
+
+	if (!MOD_WriteMemoryI32(static_cast<uint32_t>(reloc_addr),
+	                        static_cast<int32_t>(value))) {
+		set_python_error(g_python.api.PyExc_RuntimeError, "write_i32 failed");
+		return NULL;
+	}
+
+	PyObject *value_obj = g_python.api.PyTuple_GetItem(args, 1);
+	g_python.api.Py_IncRef(value_obj);
+	return value_obj;
+}
+
+static bool ensure_mod_helper_module(void)
+{
+	if (g_python.mod_module && g_python.modstate && g_python.gamemem)
+		return true;
+
+	if (!g_python.api.PyImport_AddModule("mod")) {
+		log_python_exception("failed to add Python helper module 'mod'");
+		return false;
+	}
+
+	PyOwnedRef mod_module(g_python.api.PyImport_ImportModule("mod"));
+	if (!mod_module) {
+		log_python_exception("failed to import Python helper module 'mod'");
+		return false;
+	}
+
+	static PyMethodDef register_hook_method = {
+	        "_register_hook", py_register_hook, DOSBOX_PY_METH_VARARGS, NULL};
+	static PyMethodDef read_u8_method = {
+	        "_read_u8", py_read_u8, DOSBOX_PY_METH_VARARGS, NULL};
+	static PyMethodDef read_u16_method = {
+	        "_read_u16", py_read_u16, DOSBOX_PY_METH_VARARGS, NULL};
+	static PyMethodDef read_u32_method = {
+	        "_read_u32", py_read_u32, DOSBOX_PY_METH_VARARGS, NULL};
+	static PyMethodDef read_i32_method = {
+	        "_read_i32", py_read_i32, DOSBOX_PY_METH_VARARGS, NULL};
+	static PyMethodDef write_u8_method = {
+	        "_write_u8", py_write_u8, DOSBOX_PY_METH_VARARGS, NULL};
+	static PyMethodDef write_u16_method = {
+	        "_write_u16", py_write_u16, DOSBOX_PY_METH_VARARGS, NULL};
+	static PyMethodDef write_u32_method = {
+	        "_write_u32", py_write_u32, DOSBOX_PY_METH_VARARGS, NULL};
+	static PyMethodDef write_i32_method = {
+	        "_write_i32", py_write_i32, DOSBOX_PY_METH_VARARGS, NULL};
+
+	if (!attach_module_function(mod_module.get(), "_register_hook", &register_hook_method) ||
+	    !attach_module_function(mod_module.get(), "_read_u8", &read_u8_method) ||
+	    !attach_module_function(mod_module.get(), "_read_u16", &read_u16_method) ||
+	    !attach_module_function(mod_module.get(), "_read_u32", &read_u32_method) ||
+	    !attach_module_function(mod_module.get(), "_read_i32", &read_i32_method) ||
+	    !attach_module_function(mod_module.get(), "_write_u8", &write_u8_method) ||
+	    !attach_module_function(mod_module.get(), "_write_u16", &write_u16_method) ||
+	    !attach_module_function(mod_module.get(), "_write_u32", &write_u32_method) ||
+	    !attach_module_function(mod_module.get(), "_write_i32", &write_i32_method)) {
+		return false;
+	}
+
+	const std::string bootstrap = build_mod_helper_bootstrap();
+	if (g_python.api.PyRun_SimpleStringFlags(bootstrap.c_str(), NULL) != 0) {
+		log_python_exception("failed to bootstrap Python helper module");
+		return false;
+	}
+
+	PyOwnedRef modstate(
+	        g_python.api.PyObject_GetAttrString(mod_module.get(), "modstate"));
+	PyOwnedRef gamemem(
+	        g_python.api.PyObject_GetAttrString(mod_module.get(), "gamemem"));
+	if (!modstate || !gamemem) {
+		log_python_exception("failed to resolve mod.modstate or mod.gamemem");
+		return false;
+	}
+
+	if (g_python.mod_module && g_python.api.Py_DecRef)
+		g_python.api.Py_DecRef(g_python.mod_module);
+	if (g_python.modstate && g_python.api.Py_DecRef)
+		g_python.api.Py_DecRef(g_python.modstate);
+	if (g_python.gamemem && g_python.api.Py_DecRef)
+		g_python.api.Py_DecRef(g_python.gamemem);
+
+	g_python.mod_module = mod_module.release();
+	g_python.modstate = modstate.release();
+	g_python.gamemem = gamemem.release();
 	return true;
 }
 
@@ -515,6 +1092,16 @@ static bool load_mod_init_config(const std::string &mods_dir,
 			}
 		}
 
+		PyOwnedRef frame_start(
+		        get_optional_mapping_item(executable.get(), "frame_start", entry_context));
+		if (frame_start) {
+			if (py_object_to_uint32(frame_start.get(),
+			                        entry_context + "['frame_start']",
+			                        &config.frame_start_reloc)) {
+				config.has_frame_start = true;
+			}
+		}
+
 		configs->push_back(config);
 	}
 
@@ -551,6 +1138,14 @@ static FARPROC resolve_symbol(HMODULE dll, const char *name)
 	if (!symbol)
 		LOG_MSG("PYTHON: missing symbol %s", name);
 	return symbol;
+}
+
+static PyObject *resolve_exception_object(HMODULE dll, const char *name)
+{
+	FARPROC symbol = resolve_symbol(dll, name);
+	if (!symbol)
+		return NULL;
+	return *reinterpret_cast<PyObject **>(reinterpret_cast<ULONG_PTR>(symbol));
 }
 
 static bool load_python_api(const std::string &dll_path)
@@ -592,12 +1187,24 @@ static bool load_python_api(const std::string &dll_path)
 	g_python.api.PyImport_ImportModule =
 	        reinterpret_cast<PyObject *(*)(const char *)>(
 	                resolve_symbol(g_python.api.dll, "PyImport_ImportModule"));
+	g_python.api.PyImport_AddModule =
+	        reinterpret_cast<PyObject *(*)(const char *)>(
+	                resolve_symbol(g_python.api.dll, "PyImport_AddModule"));
 	g_python.api.PyObject_GetAttrString =
 	        reinterpret_cast<PyObject *(*)(PyObject *, const char *)>(
 	                resolve_symbol(g_python.api.dll, "PyObject_GetAttrString"));
+	g_python.api.PyObject_SetAttrString =
+	        reinterpret_cast<int (*)(PyObject *, const char *, PyObject *)>(
+	                resolve_symbol(g_python.api.dll, "PyObject_SetAttrString"));
 	g_python.api.PyObject_CallFunctionObjArgs =
 	        reinterpret_cast<PyObject *(*)(PyObject *, ...)>(
 	                resolve_symbol(g_python.api.dll, "PyObject_CallFunctionObjArgs"));
+	g_python.api.PyCallable_Check =
+	        reinterpret_cast<int (*)(PyObject *)>(
+	                resolve_symbol(g_python.api.dll, "PyCallable_Check"));
+	g_python.api.PyCFunction_NewEx =
+	        reinterpret_cast<PyObject *(*)(PyMethodDef *, PyObject *, PyObject *)>(
+	                resolve_symbol(g_python.api.dll, "PyCFunction_NewEx"));
 	g_python.api.PyMapping_GetItemString =
 	        reinterpret_cast<PyObject *(*)(PyObject *, const char *)>(
 	                resolve_symbol(g_python.api.dll, "PyMapping_GetItemString"));
@@ -610,6 +1217,12 @@ static bool load_python_api(const std::string &dll_path)
 	g_python.api.PySequence_GetItem =
 	        reinterpret_cast<PyObject *(*)(PyObject *, Py_ssize_t)>(
 	                resolve_symbol(g_python.api.dll, "PySequence_GetItem"));
+	g_python.api.PyTuple_Size =
+	        reinterpret_cast<Py_ssize_t (*)(PyObject *)>(
+	                resolve_symbol(g_python.api.dll, "PyTuple_Size"));
+	g_python.api.PyTuple_GetItem =
+	        reinterpret_cast<PyObject *(*)(PyObject *, Py_ssize_t)>(
+	                resolve_symbol(g_python.api.dll, "PyTuple_GetItem"));
 	g_python.api.PyUnicode_FromString =
 	        reinterpret_cast<PyObject *(*)(const char *)>(
 	                resolve_symbol(g_python.api.dll, "PyUnicode_FromString"));
@@ -619,6 +1232,24 @@ static bool load_python_api(const std::string &dll_path)
 	g_python.api.PyLong_AsUnsignedLong =
 	        reinterpret_cast<unsigned long (*)(PyObject *)>(
 	                resolve_symbol(g_python.api.dll, "PyLong_AsUnsignedLong"));
+	g_python.api.PyLong_AsLong =
+	        reinterpret_cast<long (*)(PyObject *)>(
+	                resolve_symbol(g_python.api.dll, "PyLong_AsLong"));
+	g_python.api.PyLong_FromUnsignedLong =
+	        reinterpret_cast<PyObject *(*)(unsigned long)>(
+	                resolve_symbol(g_python.api.dll, "PyLong_FromUnsignedLong"));
+	g_python.api.PyLong_FromUnsignedLongLong =
+	        reinterpret_cast<PyObject *(*)(unsigned long long)>(
+	                resolve_symbol(g_python.api.dll, "PyLong_FromUnsignedLongLong"));
+	g_python.api.PyLong_FromLong =
+	        reinterpret_cast<PyObject *(*)(long)>(
+	                resolve_symbol(g_python.api.dll, "PyLong_FromLong"));
+	g_python.api.PyFloat_FromDouble =
+	        reinterpret_cast<PyObject *(*)(double)>(
+	                resolve_symbol(g_python.api.dll, "PyFloat_FromDouble"));
+	g_python.api.Py_IncRef =
+	        reinterpret_cast<void (*)(PyObject *)>(
+	                resolve_symbol(g_python.api.dll, "Py_IncRef"));
 	g_python.api.Py_DecRef =
 	        reinterpret_cast<void (*)(PyObject *)>(
 	                resolve_symbol(g_python.api.dll, "Py_DecRef"));
@@ -631,9 +1262,21 @@ static bool load_python_api(const std::string &dll_path)
 	g_python.api.PyErr_Print =
 	        reinterpret_cast<void (*)(void)>(
 	                resolve_symbol(g_python.api.dll, "PyErr_Print"));
+	g_python.api.PyErr_SetString =
+	        reinterpret_cast<void (*)(PyObject *, const char *)>(
+	                resolve_symbol(g_python.api.dll, "PyErr_SetString"));
 	g_python.api.Py_FinalizeEx =
 	        reinterpret_cast<int (*)(void)>(
 	                resolve_symbol(g_python.api.dll, "Py_FinalizeEx"));
+
+	g_python.api.PyExc_RuntimeError =
+	        resolve_exception_object(g_python.api.dll, "PyExc_RuntimeError");
+	g_python.api.PyExc_TypeError =
+	        resolve_exception_object(g_python.api.dll, "PyExc_TypeError");
+	g_python.api.PyExc_ValueError =
+	        resolve_exception_object(g_python.api.dll, "PyExc_ValueError");
+	g_python.api.PyExc_OverflowError =
+	        resolve_exception_object(g_python.api.dll, "PyExc_OverflowError");
 
 	if (!g_python.api.loaded()) {
 		FreeLibrary(g_python.api.dll);
@@ -735,15 +1378,9 @@ bool DOSBoxPython_Init(const Config& config)
 	if (version)
 		LOG_MSG("PYTHON: version %s", version);
 
-	if (!g_python.mods_dir.empty()) {
-		const std::string bootstrap = build_python_bootstrap(g_python.mods_dir);
-		if (g_python.api.PyRun_SimpleStringFlags(bootstrap.c_str(), NULL) != 0) {
-			LOG_MSG("PYTHON: mod bootstrap failed");
-			if (g_python.api.PyErr_Occurred && g_python.api.PyErr_Occurred() != NULL &&
-			    g_python.api.PyErr_Print) {
-				g_python.api.PyErr_Print();
-			}
-		}
+	if (!ensure_mod_helper_module()) {
+		DOSBoxPython_Shutdown();
+		return false;
 	}
 
 	return true;
@@ -752,6 +1389,21 @@ bool DOSBoxPython_Init(const Config& config)
 
 void DOSBoxPython_Shutdown(void)
 {
+	clear_registered_hooks();
+
+	if (g_python.mod_module && g_python.api.Py_DecRef) {
+		g_python.api.Py_DecRef(g_python.mod_module);
+		g_python.mod_module = NULL;
+	}
+	if (g_python.modstate && g_python.api.Py_DecRef) {
+		g_python.api.Py_DecRef(g_python.modstate);
+		g_python.modstate = NULL;
+	}
+	if (g_python.gamemem && g_python.api.Py_DecRef) {
+		g_python.api.Py_DecRef(g_python.gamemem);
+		g_python.gamemem = NULL;
+	}
+
 #if defined(WIN32) && !defined(HX_DOS)
 	if (g_python.initialized && g_python.api.Py_FinalizeEx)
 		g_python.api.Py_FinalizeEx();
@@ -776,4 +1428,87 @@ bool DOSBoxPython_LoadModInitConfigs(std::vector<ModExecutableConfig> *configs)
 		return false;
 
 	return load_mod_init_config(g_python.mods_dir, configs);
+}
+
+bool DOSBoxPython_LoadMods(std::vector<ModPythonHookRegistration> *hooks)
+{
+	if (!hooks || !g_python.initialized)
+		return false;
+
+	hooks->clear();
+	clear_registered_hooks();
+
+	if (g_python.mods_dir.empty() || !directory_exists(g_python.mods_dir))
+		return false;
+
+	if (!ensure_mods_dir_on_sys_path(g_python.mods_dir) ||
+	    !ensure_mod_helper_module()) {
+		return false;
+	}
+
+	const std::string loader = build_mod_loader_script(g_python.mods_dir);
+	if (g_python.api.PyRun_SimpleStringFlags(loader.c_str(), NULL) != 0) {
+		log_python_exception("mod loader bootstrap failed");
+		return false;
+	}
+
+	hooks->reserve(g_python.hooks.size());
+	for (size_t i = 0; i < g_python.hooks.size(); ++i) {
+		const PythonHookRegistration &registered = g_python.hooks[i];
+		ModPythonHookRegistration hook = {};
+		hook.hook_id = registered.hook_id;
+		hook.exe_name_upper = registered.exe_name_upper;
+		hook.reloc_eip = registered.reloc_eip;
+		hook.kind = registered.kind;
+		hook.description = registered.description;
+		hooks->push_back(hook);
+	}
+
+	if (hooks->empty())
+		LOG_MSG("MOD: no Python hooks registered");
+
+	return !hooks->empty();
+}
+
+void DOSBoxPython_ResetModStateTiming(void)
+{
+	if (!g_python.initialized || !g_python.modstate)
+		return;
+
+	set_object_attr_u64(g_python.modstate, "frame", 0);
+	set_object_attr_double(g_python.modstate, "time", 0.0);
+	set_object_attr_double(g_python.modstate, "frame_delta", 0.0);
+}
+
+bool DOSBoxPython_UpdateModStateTiming(const ModFrameState &state)
+{
+	if (!g_python.initialized || !g_python.modstate)
+		return false;
+
+	return set_object_attr_u64(g_python.modstate, "frame", state.frame) &&
+	       set_object_attr_double(g_python.modstate, "time", state.time_seconds) &&
+	       set_object_attr_double(g_python.modstate, "frame_delta",
+	                              state.frame_delta_seconds);
+}
+
+bool DOSBoxPython_InvokeHook(size_t hook_id)
+{
+	if (!g_python.initialized || !g_python.modstate || !g_python.gamemem)
+		return false;
+	if (hook_id >= g_python.hooks.size())
+		return false;
+
+	PythonHookRegistration &hook = g_python.hooks[hook_id];
+	if (!hook.enabled || !hook.callback)
+		return false;
+
+	PyOwnedRef result(g_python.api.PyObject_CallFunctionObjArgs(
+	        hook.callback, g_python.modstate, g_python.gamemem, NULL));
+	if (!result) {
+		hook.enabled = false;
+		log_python_exception(("disabling hook after exception: " + hook.description).c_str());
+		return false;
+	}
+
+	return true;
 }

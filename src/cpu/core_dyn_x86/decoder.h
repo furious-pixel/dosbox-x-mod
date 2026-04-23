@@ -2310,6 +2310,11 @@ static void dyn_call_near_imm(void) {
 	else imm=(int16_t)decode_fetchw();
 	dyn_set_eip_end(DREG(TMPW));
 	dyn_push(DREG(TMPW));
+	{
+		const uint32_t linear_eip = static_cast<uint32_t>(decode.op_start);
+		if (MOD_FastEnabled())
+			gen_call_function((void *)&MOD_OnCallsite,"%Id",linear_eip);
+	}
 	gen_dop_word_imm(DOP_ADD,decode.big_op,DREG(TMPW),imm);
 	if (cpu.code.big) gen_dop_word(DOP_MOV,true,DREG(EIP),DREG(TMPW));
 	else gen_extend_word(false,DREG(EIP),DREG(TMPW));
@@ -2334,6 +2339,11 @@ static void dyn_call_far_imm(void) {
 	Bitu sel,off;
 	off=decode.big_op ? decode_fetchd() : decode_fetchw();
 	sel=decode_fetchw();
+	{
+		const uint32_t linear_eip = static_cast<uint32_t>(decode.op_start);
+		if (MOD_FastEnabled())
+			gen_call_function((void *)&MOD_OnCallsite,"%Id",linear_eip);
+	}
 	dyn_reduce_cycles();
 	dyn_set_eip_last_end(DREG(TMPW));
 	dyn_flags_gen_to_host();
@@ -3213,6 +3223,11 @@ restart_prefix:
 			case 0x2:	/* CALL Ev */
 				gen_lea(DREG(TMPB),DREG(EIP),nullptr,0,decode.code-decode.code_start);
 				dyn_push(DREG(TMPB));
+				{
+					const uint32_t linear_eip = static_cast<uint32_t>(decode.op_start);
+					if (MOD_FastEnabled())
+						gen_call_function((void *)&MOD_OnCallsite,"%Id",linear_eip);
+				}
 				gen_releasereg(DREG(TMPB));
 				gen_dop_word(DOP_MOV,decode.big_op,DREG(EIP),src);
 				goto core_close_block;
@@ -3221,6 +3236,11 @@ restart_prefix:
 				goto core_close_block;
 			case 0x3:	/* CALL Ep */
 			case 0x5:	/* JMP Ep */
+				if (decode.modrm.reg == 0x3) {
+					const uint32_t linear_eip = static_cast<uint32_t>(decode.op_start);
+					if (MOD_FastEnabled())
+						gen_call_function((void *)&MOD_OnCallsite,"%Id",linear_eip);
+				}
 				gen_protectflags();
 				dyn_flags_gen_to_host();
 				gen_lea(DREG(EA),DREG(EA),nullptr,0,decode.big_op ? 4: 2);

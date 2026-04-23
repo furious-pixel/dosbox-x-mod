@@ -10,5 +10,9 @@ class Config;
 bool DOSBoxPython_Init(const Config& config);
 void DOSBoxPython_Shutdown(void);
 bool DOSBoxPython_LoadModInitConfigs(std::vector<ModExecutableConfig> *configs);
+bool DOSBoxPython_LoadMods(std::vector<ModPythonHookRegistration> *hooks);
+void DOSBoxPython_ResetModStateTiming(void);
+bool DOSBoxPython_UpdateModStateTiming(const ModFrameState &state);
+bool DOSBoxPython_InvokeHook(size_t hook_id);
 
 #endif

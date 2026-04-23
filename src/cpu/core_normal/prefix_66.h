@@ -414,8 +414,10 @@
 		break;
 	CASE_D(0x9a)												/* CALL FAR Ad */
 		{ 
+			const uint32_t callsite = static_cast<uint32_t>(GETIP - 1u);
 			uint32_t newip=Fetchd();uint16_t newcs=Fetchw();
 			FillFlags();
+			MOD_CALL_HOOK(cs, callsite);
 			CPU_CALL(true,newcs,newip,GETIP);
 #if CPU_TRAP_CHECK
 			if (GETFLAG(TF)) {	
@@ -622,9 +624,11 @@
 		{ 
 			/* must not adjust (E)IP until we have completed the instruction.
 			 * if interrupted by a page fault, EIP must be unmodified. */
+			const uint32_t callsite = static_cast<uint32_t>(GETIP - 1u);
 			int32_t addip=Fetchds();
 			uint32_t here=GETIP;
 			Push_32(here);
+			MOD_CALL_HOOK(cs, callsite);
 			reg_eip=(uint32_t)((uint32_t)addip+here);
 			continue;
 		}
@@ -710,6 +714,7 @@
 		}
 	CASE_D(0xff)												/* GRP 5 Ed */
 		{
+			const uint32_t callsite = static_cast<uint32_t>(GETIP - 1u);
 			GetRM;Bitu which=(rm>>3)&7;
 			switch (which) {
 			case 0x00:											/* INC Ed */
@@ -724,6 +729,7 @@
 					if (rm >= 0xc0 ) {GetEArd;new_eip=*eard;}
 					else {GetEAa;new_eip=LoadMd(eaa);}
 					Push_32(GETIP); /* <- PF can happen here */
+					MOD_CALL_HOOK(cs, callsite);
 					reg_eip = new_eip;
 				}
 				continue;
@@ -734,6 +740,7 @@
 					uint32_t newip=LoadMd(eaa);
 					uint16_t newcs=LoadMw(eaa+4);
 					FillFlags();
+					MOD_CALL_HOOK(cs, callsite);
 					CPU_CALL(true,newcs,newip,GETIP);
 #if CPU_TRAP_CHECK
 					if (GETFLAG(TF)) {	

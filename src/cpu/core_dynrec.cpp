@@ -40,6 +40,7 @@
 #include "mem.h"
 #include "cpu.h"
 #include "debug.h"
+#include "mod.h"
 #include "paging.h"
 #include "inout.h"
 #include "lazyflags.h"

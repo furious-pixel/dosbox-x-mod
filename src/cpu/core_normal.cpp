@@ -21,6 +21,7 @@
 #include "callback.h"
 #include "pic.h"
 #include "fpu.h"
+#include "mod.h"
 #include "paging.h"
 #include "mmx.h"
 

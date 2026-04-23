@@ -780,8 +780,10 @@
 		break;
 	CASE_W(0x9a)												/* CALL Ap */
 		{ 
+			const uint16_t callsite = static_cast<uint16_t>(GETIP - 1u);
 			FillFlags();
 			uint16_t newip=Fetchw();uint16_t newcs=Fetchw();
+			MOD_CALL_HOOK(cs, callsite);
 			CPU_CALL(false,newcs,newip,GETIP);
 #if CPU_TRAP_CHECK
 			if (GETFLAG(TF)) {	
@@ -1261,9 +1263,11 @@
 		{ 
 			/* must not adjust (E)IP until we have completed the instruction.
 			 * if interrupted by a page fault, EIP must be unmodified. */
+			const uint16_t callsite = static_cast<uint16_t>(GETIP - 1u);
 			uint16_t addip=(uint16_t)Fetchws();
 			uint16_t here=GETIP;
 			Push_16(here);
+			MOD_CALL_HOOK(cs, callsite);
 			reg_eip=(uint16_t)(addip+here);
 			continue;
 		}
@@ -1522,6 +1526,7 @@
 		}
 	CASE_W(0xff)												/* GRP5 Ew */
 		{
+			const uint16_t callsite = static_cast<uint16_t>(GETIP - 1u);
 			GetRM;Bitu which=(rm>>3)&7;
 			switch (which) {
 			case 0x00:										/* INC Ew */
@@ -1536,6 +1541,7 @@
 					if (rm >= 0xc0 ) {GetEArw;new_eip=*earw;}
 					else {GetEAa;new_eip=LoadMw(eaa);}
 					Push_16(GETIP); /* <- PF may happen here */
+					MOD_CALL_HOOK(cs, callsite);
 					reg_eip = new_eip;
 				}
 				continue;
@@ -1546,6 +1552,7 @@
 					uint16_t newip=LoadMw(eaa);
 					uint16_t newcs=LoadMw(eaa+2);
 					FillFlags();
+					MOD_CALL_HOOK(cs, callsite);
 					CPU_CALL(false,newcs,newip,GETIP);
 #if CPU_TRAP_CHECK
 					if (GETFLAG(TF)) {	

@@ -856,6 +856,12 @@ static Bitu dyn_grp4_ev(void) {
 		gen_add_imm(FC_OP1,(uint32_t)(decode.code-decode.code_start));
 		if (decode.big_op) gen_call_function_raw(dynrec_push_dword);
 		else gen_call_function_raw(dynrec_push_word);
+		{
+			const uint32_t callsite = static_cast<uint32_t>(decode.op_start - SegPhys(cs));
+			const uint32_t linear_eip = static_cast<uint32_t>(SegPhys(cs) + callsite);
+			if (MOD_FastEnabled())
+				gen_call_function_I(MOD_OnCallsite, linear_eip);
+		}
 
 		gen_restore_addr_reg();
 		gen_mov_word_from_reg(FC_ADDR,decode.big_op?(void*)(&reg_eip):(void*)(&reg_ip),decode.big_op);
@@ -864,6 +870,12 @@ static Bitu dyn_grp4_ev(void) {
 		gen_mov_word_from_reg(FC_OP1,decode.big_op?(void*)(&reg_eip):(void*)(&reg_ip),decode.big_op);
 		return 1;
 	case 0x3:	// CALL Ep
+		{
+			const uint32_t callsite = static_cast<uint32_t>(decode.op_start - SegPhys(cs));
+			const uint32_t linear_eip = static_cast<uint32_t>(SegPhys(cs) + callsite);
+			if (MOD_FastEnabled())
+				gen_call_function_I(MOD_OnCallsite, linear_eip);
+		}
 	case 0x5:	// JMP Ep
 		if (!decode.big_op) gen_extend_word(false,FC_OP1);
 		if (decode.modrm.mod<3) gen_restore_addr_reg();
@@ -1209,6 +1221,12 @@ static void dyn_call_near_imm(void) {
 	dyn_set_eip_end(FC_OP1);
 	if (decode.big_op) gen_call_function_raw(dynrec_push_dword);
 	else gen_call_function_raw(dynrec_push_word);
+	{
+		const uint32_t callsite = static_cast<uint32_t>(decode.op_start - SegPhys(cs));
+		const uint32_t linear_eip = static_cast<uint32_t>(SegPhys(cs) + callsite);
+		if (MOD_FastEnabled())
+			gen_call_function_I(MOD_OnCallsite, linear_eip);
+	}
 
 	dyn_set_eip_end(FC_OP1,imm);
 	gen_mov_word_from_reg(FC_OP1,decode.big_op?(void*)(&reg_eip):(void*)(&reg_ip),decode.big_op);
@@ -1230,6 +1248,12 @@ static void dyn_call_far_imm(void) {
 	Bitu sel,off;
 	off=decode.big_op ? decode_fetchd() : decode_fetchw();
 	sel=decode_fetchw();
+	{
+		const uint32_t callsite = static_cast<uint32_t>(decode.op_start - SegPhys(cs));
+		const uint32_t linear_eip = static_cast<uint32_t>(SegPhys(cs) + callsite);
+		if (MOD_FastEnabled())
+			gen_call_function_I(MOD_OnCallsite, linear_eip);
+	}
 	dyn_reduce_cycles();
 	dyn_set_eip_last_end(FC_RETOP);
 	gen_call_function_IIIR(CPU_CALL,decode.big_op,sel,off,FC_RETOP);

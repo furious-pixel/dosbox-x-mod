@@ -18,6 +18,8 @@
 
 #include <math.h>
 
+#include "mod.h"
+
 #define LoadMbs(off) (int8_t)(LoadMb(off))
 #define LoadMws(off) (int16_t)(LoadMw(off))
 #define LoadMds(off) (int32_t)(LoadMd(off))
@@ -54,6 +56,15 @@ static INLINE int32_t Fetchds() {
 		CPU_Exception(blah);								\
 		continue;											\
 	}
+
+#define MOD_CALL_HOOK(_cs, _ip) \
+	do { \
+		const uint32_t linear_eip = \
+		        static_cast<uint32_t>(SegPhys(_cs) + static_cast<uint32_t>(_ip)); \
+		if (MOD_FastEnabled()) { \
+			MOD_OnCallsite(linear_eip); \
+		} \
+	} while (0)
 
 /* NTS: At first glance, this looks like code that will only fetch the delta for conditional jumps
  *      if the condition is true. Further examination shows that DOSBox's core has two different

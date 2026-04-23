@@ -40,6 +40,7 @@
 #include "debug.h"
 #include "paging.h"
 #include "fpu.h"
+#include "mod.h"
 
 #define CACHE_MAXSIZE	(4096*8)
 #define CACHE_TOTAL		(1024*1024*8)

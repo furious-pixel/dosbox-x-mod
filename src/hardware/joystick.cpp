@@ -539,6 +539,21 @@ int16_t ModJoystick_GetAxis(const int axis_index)
     return mod_joystick_manager.GetAxis(axis_index);
 }
 
+void ModJoystick_ReadAxes(int16_t* axis_values, const int axis_count)
+{
+    if (axis_values == nullptr || axis_count <= 0)
+        return;
+
+    for (int axis_index = 0; axis_index < axis_count; axis_index++)
+        axis_values[axis_index] = 0;
+
+    SDL_JoystickUpdate();
+
+    const int read_count = axis_count < max_modjoy_axes ? axis_count : max_modjoy_axes;
+    for (int axis_index = 0; axis_index < read_count; axis_index++)
+        axis_values[axis_index] = mod_joystick_manager.GetAxis(axis_index);
+}
+
 int ModJoystick_GetDeviceCount()
 {
     return mod_joystick_manager.GetDeviceCount();

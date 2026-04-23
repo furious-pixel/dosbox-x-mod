@@ -67,6 +67,7 @@ extern ModJoyAxisBinding modjoy_axis_bindings[max_modjoy_axes];
 void ModJoystick_Initialize();
 void ModJoystick_Shutdown();
 int16_t ModJoystick_GetAxis(int axis_index);
+void ModJoystick_ReadAxes(int16_t* axis_values, int axis_count);
 int ModJoystick_GetDeviceCount();
 const char* ModJoystick_GetDeviceName(int device_index);
 int16_t ModJoystick_GetDeviceAxisValue(int device_index, int axis_index);

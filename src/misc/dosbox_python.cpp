@@ -8,6 +8,7 @@
 #include "dosbox_python.h"
 
 #include "control.h"
+#include "joystick.h"
 #include "logging.h"
 
 #include <algorithm>
@@ -72,6 +73,8 @@ struct PythonAPI {
 	PyObject *(*PyLong_FromUnsignedLongLong)(unsigned long long) = NULL;
 	PyObject *(*PyLong_FromLong)(long) = NULL;
 	PyObject *(*PyFloat_FromDouble)(double) = NULL;
+	PyObject *(*PyTuple_New)(Py_ssize_t) = NULL;
+	int (*PyTuple_SetItem)(PyObject *, Py_ssize_t, PyObject *) = NULL;
 	void (*Py_IncRef)(PyObject *) = NULL;
 	void (*Py_DecRef)(PyObject *) = NULL;
 	void *(*PyErr_Occurred)(void) = NULL;
@@ -99,7 +102,8 @@ struct PythonAPI {
 		       PyLong_AsUnsignedLong && PyLong_AsLong &&
 		       PyLong_FromUnsignedLong &&
 		       PyLong_FromUnsignedLongLong && PyLong_FromLong &&
-		       PyFloat_FromDouble && Py_IncRef && Py_DecRef &&
+		       PyFloat_FromDouble && PyTuple_New && PyTuple_SetItem &&
+		       Py_IncRef && Py_DecRef &&
 		       PyErr_Occurred && PyErr_Clear && PyErr_Print &&
 		       PyErr_SetString && Py_FinalizeEx &&
 		       PyExc_RuntimeError && PyExc_TypeError &&
@@ -326,6 +330,8 @@ static std::string build_mod_helper_bootstrap(void)
 	script
 		<< "import mod\n"
 		<< "class _DOSBoxModState(object):\n"
+		<< "    def get_modjoystick_axes(self):\n"
+		<< "        return mod._get_modjoystick_axes()\n"
 		<< "    pass\n"
 		<< "if not hasattr(mod, 'modstate'):\n"
 		<< "    mod.modstate = _DOSBoxModState()\n"
@@ -365,6 +371,8 @@ static std::string build_modstate_reset_script(void)
 	script
 		<< "import mod\n"
 		<< "class _DOSBoxModState(object):\n"
+		<< "    def get_modjoystick_axes(self):\n"
+		<< "        return mod._get_modjoystick_axes()\n"
 		<< "    pass\n"
 		<< "mod.modstate = _DOSBoxModState()\n"
 		<< "mod.modstate.frame = 0\n"
@@ -728,6 +736,42 @@ static PyObject *py_register_hook(PyObject *, PyObject *args)
 	return callable_obj;
 }
 
+static PyObject *py_get_modjoystick_axes(PyObject *, PyObject *args)
+{
+	if (g_python.api.PyTuple_Size(args) != 0) {
+		set_python_error(g_python.api.PyExc_TypeError,
+		                 "_get_modjoystick_axes expects no arguments");
+		return NULL;
+	}
+
+	int16_t axis_values[max_modjoy_axes] = {};
+	ModJoystick_ReadAxes(axis_values, max_modjoy_axes);
+
+	PyOwnedRef axis_tuple(g_python.api.PyTuple_New(max_modjoy_axes));
+	if (!axis_tuple) {
+		log_python_exception("failed to allocate joystick axis tuple");
+		return NULL;
+	}
+
+	for (Py_ssize_t i = 0; i < max_modjoy_axes; ++i) {
+		PyOwnedRef axis_value(g_python.api.PyLong_FromLong(
+		        static_cast<long>(axis_values[i])));
+		if (!axis_value) {
+			log_python_exception("failed to convert joystick axis value");
+			return NULL;
+		}
+
+		if (g_python.api.PyTuple_SetItem(axis_tuple.get(), i, axis_value.get()) != 0) {
+			log_python_exception("failed to populate joystick axis tuple");
+			return NULL;
+		}
+
+		axis_value.release();
+	}
+
+	return axis_tuple.release();
+}
+
 static PyObject *py_read_u8(PyObject *, PyObject *args)
 {
 	if (g_python.api.PyTuple_Size(args) != 1) {
@@ -938,6 +982,8 @@ static bool ensure_mod_helper_module(void)
 
 	static PyMethodDef register_hook_method = {
 	        "_register_hook", py_register_hook, DOSBOX_PY_METH_VARARGS, NULL};
+	static PyMethodDef get_modjoystick_axes_method = {
+	        "_get_modjoystick_axes", py_get_modjoystick_axes, DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef read_u8_method = {
 	        "_read_u8", py_read_u8, DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef read_u16_method = {
@@ -956,6 +1002,8 @@ static bool ensure_mod_helper_module(void)
 	        "_write_i32", py_write_i32, DOSBOX_PY_METH_VARARGS, NULL};
 
 	if (!attach_module_function(mod_module.get(), "_register_hook", &register_hook_method) ||
+	    !attach_module_function(mod_module.get(), "_get_modjoystick_axes",
+	                            &get_modjoystick_axes_method) ||
 	    !attach_module_function(mod_module.get(), "_read_u8", &read_u8_method) ||
 	    !attach_module_function(mod_module.get(), "_read_u16", &read_u16_method) ||
 	    !attach_module_function(mod_module.get(), "_read_u32", &read_u32_method) ||
@@ -1280,6 +1328,12 @@ static bool load_python_api(const std::string &dll_path)
 	g_python.api.PyFloat_FromDouble =
 	        reinterpret_cast<PyObject *(*)(double)>(
 	                resolve_symbol(g_python.api.dll, "PyFloat_FromDouble"));
+	g_python.api.PyTuple_New =
+	        reinterpret_cast<PyObject *(*)(Py_ssize_t)>(
+	                resolve_symbol(g_python.api.dll, "PyTuple_New"));
+	g_python.api.PyTuple_SetItem =
+	        reinterpret_cast<int (*)(PyObject *, Py_ssize_t, PyObject *)>(
+	                resolve_symbol(g_python.api.dll, "PyTuple_SetItem"));
 	g_python.api.Py_IncRef =
 	        reinterpret_cast<void (*)(PyObject *)>(
 	                resolve_symbol(g_python.api.dll, "Py_IncRef"));

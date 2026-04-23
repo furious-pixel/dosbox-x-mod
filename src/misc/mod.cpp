@@ -1,6 +1,7 @@
 #include "mod.h"
 
 #include "control.h"
+#include "cpu.h"
 #include "dosbox_python.h"
 #include "logging.h"
 #include "mem.h"
@@ -9,6 +10,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <unordered_map>
 #include <vector>
 
@@ -58,6 +60,7 @@ struct ModRuntime {
 	bool active_executable_valid = false;
 	size_t active_executable_index = 0;
 	bool fast_enabled = false;
+	bool unsupported_core_logged = false;
 	std::vector<ModExecutableRuntime> executables = {};
 };
 
@@ -71,12 +74,103 @@ static std::string uppercase_ascii_copy(std::string value)
 	return value;
 }
 
+static std::string lowercase_ascii_copy(std::string value)
+{
+	std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+		return static_cast<char>(std::tolower(ch));
+	});
+	return value;
+}
+
 static std::string basename_of(const std::string &path)
 {
 	const size_t pos = path.find_last_of("/\\");
 	if (pos == std::string::npos)
 		return path;
 	return path.substr(pos + 1);
+}
+
+static bool core_setting_supports_mod_hooks(const std::string &core)
+{
+	return core == "normal" ||
+	       core == "dynamic" ||
+	       core == "dynamic_x86" ||
+	       core == "dynamic_rec" ||
+	       core == "dynamic_nodhfpu";
+}
+
+static std::string get_configured_core_setting(const Config& config)
+{
+	const Section_prop *cpu_section =
+	        dynamic_cast<const Section_prop *>(config.GetSection("cpu"));
+	if (!cpu_section)
+		return {};
+
+	return lowercase_ascii_copy(cpu_section->Get_string("core"));
+}
+
+static bool is_supported_non_dynamic_decoder(CPU_Decoder *decoder)
+{
+	return decoder == &CPU_Core_Normal_Run ||
+	       decoder == &CPU_Core_Normal_Trap_Run ||
+	       decoder == &CPU_Core286_Normal_Run ||
+	       decoder == &CPU_Core286_Normal_Trap_Run ||
+	       decoder == &CPU_Core8086_Normal_Run ||
+	       decoder == &CPU_Core8086_Normal_Trap_Run ||
+	       decoder == &CPU_Core_Prefetch_Run ||
+	       decoder == &CPU_Core_Prefetch_Trap_Run ||
+	       decoder == &CPU_Core286_Prefetch_Run ||
+	       decoder == &CPU_Core8086_Prefetch_Run
+#if !defined(C_EMSCRIPTEN)
+	       || decoder == &CPU_Core_Simple_Run ||
+	       decoder == &CPU_Core_Simple_Trap_Run
+#endif
+	       ;
+}
+
+static const char *describe_active_core(void)
+{
+#if (C_DYNAMIC_X86)
+	if (cpudecoder == &CPU_Core_Dyn_X86_Run || cpudecoder == &CPU_Core_Dyn_X86_Trap_Run)
+		return "dynamic";
+#endif
+#if (C_DYNREC)
+	if (cpudecoder == &CPU_Core_Dynrec_Run || cpudecoder == &CPU_Core_Dynrec_Trap_Run)
+		return "dynamic";
+#endif
+	if (cpudecoder == &CPU_Core_Normal_Run || cpudecoder == &CPU_Core_Normal_Trap_Run ||
+	    cpudecoder == &CPU_Core286_Normal_Run || cpudecoder == &CPU_Core286_Normal_Trap_Run ||
+	    cpudecoder == &CPU_Core8086_Normal_Run || cpudecoder == &CPU_Core8086_Normal_Trap_Run)
+		return "normal";
+	if (cpudecoder == &CPU_Core_Prefetch_Run || cpudecoder == &CPU_Core_Prefetch_Trap_Run ||
+	    cpudecoder == &CPU_Core286_Prefetch_Run || cpudecoder == &CPU_Core8086_Prefetch_Run)
+		return "prefetch";
+#if !defined(C_EMSCRIPTEN)
+	if (cpudecoder == &CPU_Core_Simple_Run || cpudecoder == &CPU_Core_Simple_Trap_Run)
+		return "simple";
+	if (cpudecoder == &CPU_Core_Full_Run)
+		return "full";
+#endif
+	return "unknown";
+}
+
+static bool active_core_supports_mod_hooks(void)
+{
+	return CPU_IsDynamicCore() != 0 || is_supported_non_dynamic_decoder(cpudecoder);
+}
+
+static void maybe_log_unsupported_active_core(void)
+{
+	if (g_mod.unsupported_core_logged)
+		return;
+	if (active_core_supports_mod_hooks())
+		return;
+
+	g_mod.unsupported_core_logged = true;
+	fprintf(stderr,
+	        "MOD ERROR: active CPU core '%s' does not support mod hooks; use core=normal or core=dynamic\n",
+	        describe_active_core());
+	fflush(stderr);
 }
 
 static uint32_t clamp_scan_end(uint64_t address)
@@ -115,6 +209,12 @@ static void update_fast_enabled(void)
 {
 	ModExecutableRuntime *runtime = NULL;
 	if (!get_active_runtime(&runtime)) {
+		g_mod.fast_enabled = false;
+		return;
+	}
+
+	if (!active_core_supports_mod_hooks()) {
+		maybe_log_unsupported_active_core();
 		g_mod.fast_enabled = false;
 		return;
 	}
@@ -402,6 +502,14 @@ static void attach_python_hooks(const std::vector<ModPythonHookRegistration> &ho
 bool MOD_Init(const Config& config)
 {
 	g_mod = {};
+
+	const std::string core_setting = get_configured_core_setting(config);
+	if (!core_setting.empty() && !core_setting_supports_mod_hooks(core_setting)) {
+		fprintf(stderr,
+		        "MOD ERROR: cpu core setting '%s' is not supported for mod hooks; use core=normal or core=dynamic\n",
+		        core_setting.c_str());
+		fflush(stderr);
+	}
 
 	if (!DOSBoxPython_Init(config))
 		return false;

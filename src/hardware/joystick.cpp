@@ -18,6 +18,10 @@
 
 
 #include <string.h>
+#include <string>
+#include <cstdlib>
+#include <vector>
+#include "SDL.h"
 #include "dosbox.h"
 #include "inout.h"
 #include "logging.h"
@@ -50,10 +54,208 @@ static bool write_active = false;
 static bool swap34 = false;
 bool button_wrapping_enabled = true;
 bool modjoy_rawvalue_log = false;
+bool modjoy_axis_log = false;
+ModJoyAxisBinding modjoy_axis_bindings[max_modjoy_axes] = {};
 
 extern bool autofire; //sdl_mapper.cpp
 extern int joy1axes[]; //sdl_mapper.cpp
 extern int joy2axes[]; //sdl_mapper.cpp
+
+static std::string TrimModJoyString(const std::string& value)
+{
+    const auto begin = value.find_first_not_of(" \t\r\n");
+    if (begin == std::string::npos)
+        return {};
+
+    const auto end = value.find_last_not_of(" \t\r\n");
+    return value.substr(begin, end - begin + 1);
+}
+
+static void ResetModJoyBinding(ModJoyAxisBinding& binding)
+{
+    binding.configured = false;
+    binding.sdl_joystick_index = -1;
+    binding.sdl_axis_index = -1;
+    binding.sdl_joystick = nullptr;
+    binding.joystick_name[0] = 0;
+}
+
+static bool ParseModJoyBinding(const std::string& value, ModJoyAxisBinding& binding)
+{
+    ResetModJoyBinding(binding);
+
+    std::string input = TrimModJoyString(value);
+    if (input.empty())
+        return false;
+
+    std::string joystick_name = {};
+    std::string axis_spec = {};
+
+    if (input[0] == '"') {
+        const auto closing_quote = input.find('"', 1);
+        if (closing_quote == std::string::npos)
+            return false;
+
+        joystick_name = input.substr(1, closing_quote - 1);
+        axis_spec = TrimModJoyString(input.substr(closing_quote + 1));
+        if (!axis_spec.empty() && axis_spec[0] == ',')
+            axis_spec = TrimModJoyString(axis_spec.substr(1));
+    } else {
+        const auto comma = input.find(',');
+        if (comma == std::string::npos)
+            return false;
+
+        joystick_name = TrimModJoyString(input.substr(0, comma));
+        axis_spec = TrimModJoyString(input.substr(comma + 1));
+    }
+
+    if (joystick_name.empty() || axis_spec.size() < 5 || strncasecmp(axis_spec.c_str(), "axis", 4))
+        return false;
+
+    char* end_ptr = nullptr;
+    const long axis_index = strtol(axis_spec.c_str() + 4, &end_ptr, 10);
+    const std::string remainder = TrimModJoyString(end_ptr ? end_ptr : "");
+    if (end_ptr == axis_spec.c_str() + 4 || !remainder.empty() || axis_index < 0)
+        return false;
+
+    safe_strncpy(binding.joystick_name, joystick_name.c_str(), sizeof(binding.joystick_name));
+    binding.configured = true;
+    binding.sdl_axis_index = static_cast<int>(axis_index);
+    return true;
+}
+
+namespace {
+
+struct OpenModJoystickDevice {
+    SDL_Joystick* sdl_joystick = nullptr;
+    std::string joystick_name = {};
+};
+
+class ModJoystickManager {
+public:
+    void Initialize()
+    {
+        Shutdown();
+
+        const auto joystick_count = SDL_NumJoysticks();
+        opened_devices.reserve(static_cast<size_t>(joystick_count));
+
+        for (int joystick_index = 0; joystick_index < joystick_count; joystick_index++) {
+            SDL_Joystick* sdl_joystick = SDL_JoystickOpen(joystick_index);
+            if (sdl_joystick == nullptr) {
+                LOG_MSG("modjoy: unable to open SDL joystick %d: %s", joystick_index, SDL_GetError());
+                continue;
+            }
+
+#if defined(C_SDL2)
+            const char* joystick_name = SDL_JoystickNameForIndex(joystick_index);
+#else
+            const char* joystick_name = SDL_JoystickName(joystick_index);
+#endif
+
+            OpenModJoystickDevice device = {};
+            device.sdl_joystick = sdl_joystick;
+            device.joystick_name = joystick_name ? joystick_name : "[unknown joystick]";
+            opened_devices.push_back(device);
+        }
+
+        ResolveMappings();
+        initialized = true;
+    }
+
+    void Shutdown()
+    {
+        for (auto& binding : modjoy_axis_bindings) {
+            binding.sdl_joystick_index = -1;
+            binding.sdl_joystick = nullptr;
+        }
+
+        for (auto& device : opened_devices) {
+            if (device.sdl_joystick != nullptr) {
+                SDL_JoystickClose(device.sdl_joystick);
+                device.sdl_joystick = nullptr;
+            }
+        }
+
+        opened_devices.clear();
+        initialized = false;
+    }
+
+    void ResolveMappings()
+    {
+        for (auto& binding : modjoy_axis_bindings) {
+            binding.sdl_joystick_index = -1;
+            binding.sdl_joystick = nullptr;
+
+            if (!binding.configured || binding.sdl_axis_index < 0)
+                continue;
+
+            for (size_t device_index = 0; device_index < opened_devices.size(); device_index++) {
+                auto& device = opened_devices[device_index];
+                if (device.joystick_name != binding.joystick_name)
+                    continue;
+                if (device.sdl_joystick == nullptr)
+                    continue;
+                if (binding.sdl_axis_index >= SDL_JoystickNumAxes(device.sdl_joystick))
+                    continue;
+
+                binding.sdl_joystick = device.sdl_joystick;
+                binding.sdl_joystick_index = static_cast<int>(device_index);
+                break;
+            }
+        }
+    }
+
+    int16_t GetAxis(const int axis_index) const
+    {
+        if (axis_index < 0 || axis_index >= max_modjoy_axes)
+            return 0;
+
+        const auto& binding = modjoy_axis_bindings[axis_index];
+        if (binding.sdl_joystick == nullptr)
+            return 0;
+
+        return SDL_JoystickGetAxis(static_cast<SDL_Joystick*>(binding.sdl_joystick),
+                                   binding.sdl_axis_index);
+    }
+
+    int GetDeviceCount() const
+    {
+        return static_cast<int>(opened_devices.size());
+    }
+
+    const char* GetDeviceName(const int device_index) const
+    {
+        if (device_index < 0 || device_index >= static_cast<int>(opened_devices.size()))
+            return "[unknown joystick]";
+
+        return opened_devices[device_index].joystick_name.c_str();
+    }
+
+    int16_t GetDeviceAxisValue(const int device_index, const int axis_index) const
+    {
+        if (device_index < 0 || device_index >= static_cast<int>(opened_devices.size()))
+            return 0;
+        if (axis_index < 0 || axis_index >= max_modjoy_axes)
+            return 0;
+
+        auto* sdl_joystick = opened_devices[device_index].sdl_joystick;
+        if (sdl_joystick == nullptr)
+            return 0;
+        if (axis_index >= SDL_JoystickNumAxes(sdl_joystick))
+            return 0;
+
+        return SDL_JoystickGetAxis(sdl_joystick, axis_index);
+    }
+
+private:
+    bool initialized = false;
+    std::vector<OpenModJoystickDevice> opened_devices = {};
+};
+
+ModJoystickManager mod_joystick_manager = {};
+
+}
 
 static Bitu read_p201(Bitu port,Bitu iolen) {
     (void)iolen;//UNUSED
@@ -222,6 +424,7 @@ static JOYSTICK* test = NULL;
 
 void JOYSTICK_Destroy(Section* sec) {
     (void)sec;//UNUSED
+    ModJoystick_Shutdown();
     if (test != NULL) {
         delete test;
         test = NULL;
@@ -261,6 +464,7 @@ void JOYSTICK_Init() {
 		swap34 = section->Get_bool("swap34");
 		button_wrapping_enabled = section->Get_bool("buttonwrap");
 		modjoy_rawvalue_log = section->Get_bool("modjoy_rawvalue_log");
+		modjoy_axis_log = section->Get_bool("modjoy_axis_log");
 		stick[0].enabled = false;
 		stick[1].enabled = false;
 		stick[0].xtick = stick[0].ytick = stick[1].xtick =
@@ -285,6 +489,11 @@ void JOYSTICK_Init() {
 				}
 			}
 		}
+
+        for (auto i = 0; i < 4; i++) {
+            auto propname = "modjoyaxis" + std::to_string(i);
+            ParseModJoyBinding(section->Get_string(propname), modjoy_axis_bindings[i]);
+        }
 	}
 
 	AddExitFunction(AddExitFunctionFuncPair(JOYSTICK_Destroy),true);
@@ -308,7 +517,39 @@ public:
         registerPOD(swap34);
         registerPOD(button_wrapping_enabled);
         registerPOD(modjoy_rawvalue_log);
+        registerPOD(modjoy_axis_log);
+        registerPOD(modjoy_axis_bindings);
         registerPOD(autofire);
     }
 } dummy;
+}
+
+void ModJoystick_Initialize()
+{
+    mod_joystick_manager.Initialize();
+}
+
+void ModJoystick_Shutdown()
+{
+    mod_joystick_manager.Shutdown();
+}
+
+int16_t ModJoystick_GetAxis(const int axis_index)
+{
+    return mod_joystick_manager.GetAxis(axis_index);
+}
+
+int ModJoystick_GetDeviceCount()
+{
+    return mod_joystick_manager.GetDeviceCount();
+}
+
+const char* ModJoystick_GetDeviceName(const int device_index)
+{
+    return mod_joystick_manager.GetDeviceName(device_index);
+}
+
+int16_t ModJoystick_GetDeviceAxisValue(const int device_index, const int axis_index)
+{
+    return mod_joystick_manager.GetDeviceAxisValue(device_index, axis_index);
 }

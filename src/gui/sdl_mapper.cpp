@@ -5167,9 +5167,16 @@ void BIND_MappingEvents(void) {
 static void InitializeJoysticks(void) {
     mapper.sticks.num=0;
     mapper.sticks.num_groups=0;
+    if (joytype != JOY_MODJOY)
+        ModJoystick_Shutdown();
     if (joytype != JOY_NONE) {
         mapper.sticks.num=(Bitu)SDL_NumJoysticks();
         LOG(LOG_MISC,LOG_DEBUG)("Joystick type != none, SDL reports %u sticks",(unsigned int)mapper.sticks.num);
+        if (joytype == JOY_MODJOY) {
+            ModJoystick_Initialize();
+            initjoy=false;
+            return;
+        }
         if (joytype==JOY_AUTO) {
             // try to figure out what joystick type to select
             // depending on the number of physically attached joysticks
@@ -5279,7 +5286,6 @@ static void CreateBindGroups(void) {
 static void LogAllSdlJoystickAxes()
 {
     static constexpr uint32_t raw_axis_report_interval_ms = 4000;
-    static constexpr int raw_axis_count = 4;
     static uint32_t next_raw_axis_report_tick = 0;
 
     if (joytype != JOY_MODJOY || !modjoy_rawvalue_log)
@@ -5289,41 +5295,22 @@ static void LogAllSdlJoystickAxes()
     if (now < next_raw_axis_report_tick)
         return;
 
-    const int joystick_count = SDL_NumJoysticks();
     struct RawJoystickLogEntry {
         std::string name = {};
-        Sint16 axis_values[raw_axis_count] = {};
+        Sint16 axis_values[max_modjoy_axes] = {};
     };
     std::vector<RawJoystickLogEntry> entries = {};
-    entries.reserve(static_cast<size_t>(joystick_count));
+    entries.reserve(static_cast<size_t>(ModJoystick_GetDeviceCount()));
     size_t longest_name_len = 0;
 
-    for (int joystick_index = 0; joystick_index < joystick_count; joystick_index++) {
-        SDL_Joystick* joystick = SDL_JoystickOpen(joystick_index);
-        if (joystick == nullptr) {
-            LOG_MSG("Raw joystick %d unavailable: %s", joystick_index, SDL_GetError());
-            continue;
-        }
-
-#if defined(C_SDL2)
-        const char* joystick_name = SDL_JoystickNameForIndex(joystick_index);
-#else
-        const char* joystick_name = SDL_JoystickName(joystick_index);
-#endif
-        if (joystick_name == nullptr)
-            joystick_name = "[unknown joystick]";
-
+    for (int joystick_index = 0; joystick_index < ModJoystick_GetDeviceCount(); joystick_index++) {
         RawJoystickLogEntry entry = {};
-        entry.name = joystick_name;
+        entry.name = ModJoystick_GetDeviceName(joystick_index);
         longest_name_len = std::max(longest_name_len, entry.name.size());
 
-        const int axis_count = SDL_JoystickNumAxes(joystick);
-        const int tracked_axes = std::min(raw_axis_count, axis_count);
-        for (int axis_index = 0; axis_index < tracked_axes; axis_index++) {
-            entry.axis_values[axis_index] = SDL_JoystickGetAxis(joystick, axis_index);
+        for (int axis_index = 0; axis_index < max_modjoy_axes; axis_index++) {
+            entry.axis_values[axis_index] = ModJoystick_GetDeviceAxisValue(joystick_index, axis_index);
         }
-
-        SDL_JoystickClose(joystick);
         entries.push_back(entry);
     }
 
@@ -5340,8 +5327,35 @@ static void LogAllSdlJoystickAxes()
     next_raw_axis_report_tick = now + raw_axis_report_interval_ms;
 }
 
+static void LogModJoyAxes()
+{
+    static constexpr uint32_t modjoy_axis_report_interval_ms = 4000;
+    static uint32_t next_modjoy_axis_report_tick = 0;
+
+    if (joytype != JOY_MODJOY || !modjoy_axis_log)
+        return;
+
+    const uint32_t now = SDL_GetTicks();
+    if (now < next_modjoy_axis_report_tick)
+        return;
+
+    Sint16 axis_values[max_modjoy_axes] = {};
+    for (int modjoy_axis = 0; modjoy_axis < max_modjoy_axes; modjoy_axis++) {
+        axis_values[modjoy_axis] = ModJoystick_GetAxis(modjoy_axis);
+    }
+
+    LOG_MSG("modjoy axes: [0]=%6d [1]=%6d [2]=%6d [3]=%6d",
+            axis_values[0],
+            axis_values[1],
+            axis_values[2],
+            axis_values[3]);
+
+    next_modjoy_axis_report_tick = now + modjoy_axis_report_interval_ms;
+}
+
 void MAPPER_UpdateJoysticks(void) {
     LogAllSdlJoystickAxes();
+    LogModJoyAxes();
     for (Bitu i=0; i<mapper.sticks.num_groups; i++) {
         mapper.sticks.stick[i]->UpdateJoystick();
     }

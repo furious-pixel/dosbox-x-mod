@@ -1543,6 +1543,7 @@ for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "
     <ClCompile Include="..\src\libs\passthroughio\passthroughio.cpp" />
     <ClCompile Include="..\src\misc\clipboard.cpp" />
     <ClCompile Include="..\src\misc\cross.cpp" />
+    <ClCompile Include="..\src\misc\dosbox_python.cpp" />
     <ClCompile Include="..\src\misc\ethernet.cpp" />
     <ClCompile Include="..\src\misc\messages.cpp" />
     <ClCompile Include="..\src\misc\ethernet_pcap.cpp" />
@@ -1627,6 +1628,7 @@ for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "
     <ClInclude Include="..\include\callback.h" />
     <ClInclude Include="..\include\clockdomain.h" />
     <ClInclude Include="..\include\control.h" />
+    <ClInclude Include="..\include\dosbox_python.h" />
     <ClInclude Include="..\include\cp437_uni.h" />
     <ClInclude Include="..\include\cp808_uni.h" />
     <ClInclude Include="..\include\cp850_uni.h" />

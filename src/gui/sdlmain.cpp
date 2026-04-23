@@ -137,6 +137,7 @@ char* revert_escape_newlines(const char* aMessage);
 #include "callback.h"
 #include "support.h"
 #include "debug.h"
+#include "dosbox_python.h"
 #include "ide.h"
 #include "bitop.h"
 #include "ptrop.h"
@@ -7309,6 +7310,8 @@ bool DOSBOX_parse_argv() {
             fprintf(stderr,"  -v, -ver, -version                      Display DOSBox-X version information\n");
             fprintf(stderr,"  -fs, -fullscreen                        Start DOSBox-X in fullscreen mode\n");
             fprintf(stderr,"  -conf <configfile>                      Start DOSBox-X with the specific config file\n");
+            fprintf(stderr,"  -python                                 Enable embedded Python mod loading\n");
+            fprintf(stderr,"  -moddir <path>                          Set the Python mod directory (working dir still provides .venv)\n");
             fprintf(stderr,"  -editconf <editor>                      Edit the config file with the specific editor\n");
             fprintf(stderr,"  -userconf                               Create user level config file\n");
             fprintf(stderr,"  -printconf                              Print config file location\n");
@@ -7532,6 +7535,13 @@ bool DOSBOX_parse_argv() {
         else if (optname == "conf") {
             if (!control->cmdline->NextOptArgv(tmp)) return false;
             control->config_file_list.push_back(tmp);
+        }
+        else if (optname == "python") {
+            control->opt_python = true;
+        }
+        else if (optname == "moddir") {
+            if (!control->cmdline->NextOptArgv(control->opt_moddir)) return false;
+            control->opt_python = true;
         }
         else if (optname == "defaultconf") {
             control->opt_defaultconf = true;
@@ -9152,6 +9162,7 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
 
         /* -- initialize logging first, so that higher level inits can report problems to the log file */
         LOG::Init();
+        DOSBoxPython_Init(*control);
 
 #if defined(C_HAVE_DUKTAPE)
 	LOG(LOG_MISC,LOG_NORMAL)("Initializing ECMA heap");
@@ -10419,6 +10430,7 @@ fresh_boot:
 	}
 #endif
 
+        DOSBoxPython_Shutdown();
         LOG::Exit();
 
 #if DOSBOXMENU_TYPE == DOSBOXMENU_HMENU && defined(WIN32) && !defined(HX_DOS) && (!defined(C_SDL2) && defined(SDL_DOSBOX_X_SPECIAL) || defined(C_SDL2))

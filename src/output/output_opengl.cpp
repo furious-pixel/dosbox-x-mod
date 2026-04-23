@@ -113,6 +113,12 @@ static ModRenderViewMode mod_render_view_mode = MOD_RENDER_VIEW_SIDE_BY_SIDE;
 static bool mod_render_saved_window_size_valid = false;
 static Bitu mod_render_saved_window_width = 0;
 static Bitu mod_render_saved_window_height = 0;
+static bool mod_render_was_active = false;
+
+// One normal inactive present clears the current back buffer before swapping.
+// Two post-swap clears drain the other buffers when drivers are effectively
+// triple-buffering behind SDL's back.
+static constexpr int MOD_RENDER_INACTIVE_POST_SWAP_CLEARS = 2;
 
 struct GLViewport {
     GLint x = 0;
@@ -1391,12 +1397,44 @@ static void ClearOpenGLBackbuffer(void)
     glClear(GL_COLOR_BUFFER_BIT);
 }
 
+static void ClearOpenGLViewport(const GLViewport &viewport)
+{
+    if (ViewportIsEmpty(viewport))
+        return;
+
+    if (dosbox_glBindFramebuffer)
+        dosbox_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(viewport.x, viewport.y, viewport.w, viewport.h);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDisable(GL_SCISSOR_TEST);
+}
+
+static void DrainInactiveModRenderBuffers(const OpenGLPresentationLayout &layout)
+{
+    for (int i = 0; i < MOD_RENDER_INACTIVE_POST_SWAP_CLEARS; ++i) {
+        ClearOpenGLViewport(layout.mod);
+        DrawDOSBoxTextureToViewport(layout, layout.game);
+        RestoreOpenGLPresentationState(layout);
+
+        if (i + 1 < MOD_RENDER_INACTIVE_POST_SWAP_CLEARS)
+            SDL_GL_SwapBuffers();
+    }
+}
+
 static void FinishOpenGLPresentation(void)
 {
     const OpenGLPresentationLayout layout = BuildOpenGLPresentationLayout();
     ModOpenGLState mod_state = BuildModOpenGLState(layout);
     mod_state.present_count = ++sdl_opengl.mod_present_count;
     const bool mod_render_active = MOD_RenderActive();
+    const bool drain_inactive_buffers =
+            mod_render_view_mode != MOD_RENDER_VIEW_GAME_ONLY &&
+            mod_render_was_active && !mod_render_active;
 
     if (mod_render_active)
         DOSBoxPython_InvokeOpenGLInitCallback(mod_state);
@@ -1412,6 +1450,11 @@ static void FinishOpenGLPresentation(void)
 
     RestoreOpenGLPresentationState(layout);
     SDL_GL_SwapBuffers();
+
+    if (drain_inactive_buffers)
+        DrainInactiveModRenderBuffers(layout);
+
+    mod_render_was_active = mod_render_active;
 }
 
 void OUTPUT_OPENGL_EndUpdate(const uint16_t *changedLines)

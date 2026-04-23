@@ -13,6 +13,7 @@ extern "C" {
 }
 #include "control.h"
 #include "dosbox.h"
+#include "dosbox_python.h"
 #include "logging.h"
 #include "menudef.h"
 #include "../ints/int10.h"
@@ -42,6 +43,9 @@ PFNGLDELETEBUFFERSARBPROC glDeleteBuffersARB = NULL;
 PFNGLBUFFERDATAARBPROC glBufferDataARB = NULL;
 PFNGLMAPBUFFERARBPROC glMapBufferARB = NULL;
 PFNGLUNMAPBUFFERARBPROC glUnmapBufferARB = NULL;
+PFNGLACTIVETEXTUREPROC dosbox_glActiveTexture = NULL;
+PFNGLBINDFRAMEBUFFERPROC dosbox_glBindFramebuffer = NULL;
+PFNGLBINDVERTEXARRAYPROC dosbox_glBindVertexArray = NULL;
 
 /* Apple defines these functions in their GL header (as core functions)
  * so we can't use their names as function pointers. We can't link
@@ -104,6 +108,66 @@ extern int initgl, lastcp;
 extern bool font_16_init;
 
 SDL_OpenGL sdl_opengl = {0};
+static ModRenderViewMode mod_render_view_mode = MOD_RENDER_VIEW_SIDE_BY_SIDE;
+static bool mod_render_saved_window_size_valid = false;
+static Bitu mod_render_saved_window_width = 0;
+static Bitu mod_render_saved_window_height = 0;
+
+struct GLViewport {
+    GLint x = 0;
+    GLint y = 0;
+    GLsizei w = 0;
+    GLsizei h = 0;
+};
+
+struct OpenGLPresentationLayout {
+    uint32_t backbuffer_width = 0;
+    uint32_t backbuffer_height = 0;
+    GLViewport natural_game = {};
+    GLViewport game = {};
+    GLViewport mod = {};
+};
+
+static Bitu ClampOpenGLWindowDimension(const Bitu value)
+{
+    return std::min<Bitu>(std::max<Bitu>(1u, value), 65535u);
+}
+
+static bool GetConfiguredWindowSize(Bitu *width, Bitu *height)
+{
+    if (sdl.desktop.window.width == 0 || sdl.desktop.window.height == 0)
+        return false;
+
+    if (width)
+        *width = (Bitu)sdl.desktop.window.width;
+    if (height)
+        *height = (Bitu)sdl.desktop.window.height;
+    return true;
+}
+
+static bool GetSideBySideWindowSize(Bitu *target_width, Bitu *target_height)
+{
+    Bitu base_width = 0;
+    Bitu base_height = 0;
+
+    if (!GetConfiguredWindowSize(&base_width, &base_height)) {
+        const Bitu current_width = currentWindowWidth ? currentWindowWidth :
+                (sdl.surface ? (Bitu)sdl.surface->w : (Bitu)0u);
+        const Bitu current_height = currentWindowHeight ? currentWindowHeight :
+                (sdl.surface ? (Bitu)sdl.surface->h : (Bitu)0u);
+        base_width = sdl.clip.w > 0 ? (Bitu)sdl.clip.w : current_width;
+        base_height = sdl.clip.h > 0 ? (Bitu)sdl.clip.h : current_height;
+    }
+
+    if (base_width == 0 || base_height == 0)
+        return false;
+
+    if (target_width)
+        *target_width = ClampOpenGLWindowDimension(base_width * 2u);
+    if (target_height)
+        *target_height = ClampOpenGLWindowDimension(base_height);
+    return true;
+}
 
 int Voodoo_OGL_GetWidth();
 int Voodoo_OGL_GetHeight();
@@ -187,8 +251,19 @@ retry:
     }
     else 
     {
-        fixedWidth = sdl.desktop.window.width;
-        fixedHeight = sdl.desktop.window.height;
+        Bitu side_by_side_width = 0;
+        Bitu side_by_side_height = 0;
+        const bool side_by_side_resize_override =
+                mod_render_view_mode == MOD_RENDER_VIEW_SIDE_BY_SIDE &&
+                GetSideBySideWindowSize(&side_by_side_width, &side_by_side_height);
+
+        // Side-by-side is the one presentation mode where we intentionally
+        // override windowresolution: the configured window size becomes one
+        // side, and the actual SDL window widens to hold game + compositor.
+        fixedWidth = side_by_side_resize_override ?
+                (uint16_t)side_by_side_width : sdl.desktop.window.width;
+        fixedHeight = side_by_side_resize_override ?
+                (uint16_t)side_by_side_height : sdl.desktop.window.height;
 #if !defined(C_SDL2)
         sdl_flags |= (unsigned int)SDL_HWSURFACE;
 #endif
@@ -357,6 +432,13 @@ void OUTPUT_OPENGL_Select( GLKind kind )
             sdl_opengl.context = nullptr;
         }
         sdl_opengl.context = SDL_GL_CreateContext(sdl.window);
+        if (sdl_opengl.context && SDL_GL_MakeCurrent(sdl.window, sdl_opengl.context) != 0)
+            LOG_MSG("WARNING: SDL2 unable to make current GL context");
+        if (sdl_opengl.context) {
+            sdl_opengl.context_generation++;
+            sdl_opengl.mod_present_count = 0;
+            DOSBoxPython_NotifyOpenGLContextCreated(sdl_opengl.context_generation);
+        }
         sdl.surface = SDL_GetWindowSurface(sdl.window);
 
         LOG_MSG( "OpenGL Version : %s", glGetString( GL_VERSION ));
@@ -408,6 +490,9 @@ void OUTPUT_OPENGL_Select( GLKind kind )
         glBufferDataARB = (PFNGLBUFFERDATAARBPROC)SDL_GL_GetProcAddress("glBufferDataARB");
         glMapBufferARB = (PFNGLMAPBUFFERARBPROC)SDL_GL_GetProcAddress("glMapBufferARB");
         glUnmapBufferARB = (PFNGLUNMAPBUFFERARBPROC)SDL_GL_GetProcAddress("glUnmapBufferARB");
+        dosbox_glActiveTexture = (PFNGLACTIVETEXTUREPROC)SDL_GL_GetProcAddress("glActiveTexture");
+        dosbox_glBindFramebuffer = (PFNGLBINDFRAMEBUFFERPROC)SDL_GL_GetProcAddress("glBindFramebuffer");
+        dosbox_glBindVertexArray = (PFNGLBINDVERTEXARRAYPROC)SDL_GL_GetProcAddress("glBindVertexArray");
         const char * gl_ext = (const char *)glGetString (GL_EXTENSIONS);
         if(gl_ext && *gl_ext){
             sdl_opengl.packed_pixel=(strstr(gl_ext,"EXT_packed_pixels") != NULL);
@@ -731,6 +816,7 @@ Bitu OUTPUT_OPENGL_SetSize()
                 glUseProgram(sdl_opengl.program_object);
 
                 GLint u = glGetAttribLocation(sdl_opengl.program_object, "a_position");
+                sdl_opengl.position_attrib = u;
                 // NTS: This is now a triangle strip (GL_TRIANGLE_STRIP)
                 // upper left
                 sdl_opengl.vertex_data[0] = -1.0f;
@@ -776,6 +862,9 @@ Bitu OUTPUT_OPENGL_SetSize()
         sdl_opengl.framebuf = calloc((adjTexWidth*adjTexHeight) + (4096/4), 4); //32 bit color
     }
     sdl_opengl.pitch = adjTexWidth * 4;
+    sdl_opengl.input_width = adjTexWidth;
+    sdl_opengl.input_height = adjTexHeight;
+    sdl_opengl.texture_size = texsize;
 
     glBindTexture(GL_TEXTURE_2D, 0);
 
@@ -976,6 +1065,335 @@ static void CheckManagement(void) {
 	CheckMenuDrawing();
 }
 
+static bool ViewportIsEmpty(const GLViewport &viewport)
+{
+    return viewport.w <= 0 || viewport.h <= 0;
+}
+
+static uint32_t ScaleSurfaceCoordinate(uint32_t value,
+                                       uint32_t surface_extent,
+                                       uint32_t backbuffer_extent)
+{
+    if (surface_extent == 0u || backbuffer_extent == 0u)
+        return value;
+
+    return (uint32_t)(((uint64_t)value * (uint64_t)backbuffer_extent +
+                       (uint64_t)(surface_extent / 2u)) /
+                      (uint64_t)surface_extent);
+}
+
+static const char *GetModRenderViewModeNameInternal(const ModRenderViewMode mode)
+{
+    switch (mode) {
+    case MOD_RENDER_VIEW_MOD_ONLY:
+        return "mod-only";
+    case MOD_RENDER_VIEW_SIDE_BY_SIDE:
+        return "side-by-side";
+    case MOD_RENDER_VIEW_GAME_ONLY:
+    default:
+        return "game-only";
+    }
+}
+
+bool OUTPUT_OPENGL_CycleModRenderViewMode(Bitu *target_width, Bitu *target_height)
+{
+    if (target_width)
+        *target_width = 0;
+    if (target_height)
+        *target_height = 0;
+
+    switch (mod_render_view_mode) {
+    case MOD_RENDER_VIEW_GAME_ONLY:
+        mod_render_view_mode = MOD_RENDER_VIEW_MOD_ONLY;
+        return false;
+    case MOD_RENDER_VIEW_MOD_ONLY: {
+        mod_render_view_mode = MOD_RENDER_VIEW_SIDE_BY_SIDE;
+        if (sdl.desktop.fullscreen)
+            return false;
+
+        const Bitu current_width = currentWindowWidth ? currentWindowWidth :
+                (sdl.surface ? (Bitu)sdl.surface->w : (Bitu)0u);
+        const Bitu current_height = currentWindowHeight ? currentWindowHeight :
+                (sdl.surface ? (Bitu)sdl.surface->h : (Bitu)0u);
+        Bitu side_by_side_width = 0;
+        Bitu side_by_side_height = 0;
+        const bool have_side_by_side_size =
+                GetSideBySideWindowSize(&side_by_side_width, &side_by_side_height);
+
+        mod_render_saved_window_width = current_width;
+        mod_render_saved_window_height = current_height;
+        mod_render_saved_window_size_valid =
+                (mod_render_saved_window_width > 0u &&
+                 mod_render_saved_window_height > 0u);
+
+        if (target_width)
+            *target_width = side_by_side_width;
+        if (target_height)
+            *target_height = side_by_side_height;
+        return mod_render_saved_window_size_valid && have_side_by_side_size;
+    }
+    case MOD_RENDER_VIEW_SIDE_BY_SIDE:
+    default:
+        mod_render_view_mode = MOD_RENDER_VIEW_GAME_ONLY;
+        if (sdl.desktop.fullscreen || !mod_render_saved_window_size_valid)
+            return false;
+
+        if (target_width)
+            *target_width = mod_render_saved_window_width;
+        if (target_height)
+            *target_height = mod_render_saved_window_height;
+        mod_render_saved_window_size_valid = false;
+        return true;
+    }
+}
+
+const char *OUTPUT_OPENGL_GetModRenderViewModeName(void)
+{
+    return GetModRenderViewModeNameInternal(mod_render_view_mode);
+}
+
+static OpenGLPresentationLayout BuildOpenGLPresentationLayout(void)
+{
+    OpenGLPresentationLayout layout = {};
+    uint32_t surface_width = sdl.surface ? (uint32_t)sdl.surface->w : 0u;
+    uint32_t surface_height = sdl.surface ? (uint32_t)sdl.surface->h : 0u;
+
+    layout.backbuffer_width = surface_width;
+    layout.backbuffer_height = surface_height;
+#if defined(C_SDL2)
+    if (sdl.window) {
+        int drawable_w = 0;
+        int drawable_h = 0;
+        SDL_GL_GetDrawableSize(sdl.window, &drawable_w, &drawable_h);
+        if (drawable_w > 0 && drawable_h > 0) {
+            layout.backbuffer_width = (uint32_t)drawable_w;
+            layout.backbuffer_height = (uint32_t)drawable_h;
+        }
+    }
+#endif
+
+    if (layout.backbuffer_width == 0u)
+        layout.backbuffer_width = surface_width;
+    if (layout.backbuffer_height == 0u)
+        layout.backbuffer_height = surface_height;
+
+    if (surface_width == 0u)
+        surface_width = layout.backbuffer_width;
+    if (surface_height == 0u)
+        surface_height = layout.backbuffer_height;
+
+    layout.natural_game.x = (GLint)ScaleSurfaceCoordinate((uint32_t)std::max(0, sdl.clip.x),
+                                                          surface_width,
+                                                          layout.backbuffer_width);
+    layout.natural_game.y = (GLint)ScaleSurfaceCoordinate((uint32_t)std::max(0, sdl.clip.y),
+                                                          surface_height,
+                                                          layout.backbuffer_height);
+    layout.natural_game.w = (GLsizei)ScaleSurfaceCoordinate((uint32_t)std::max(0, sdl.clip.w),
+                                                            surface_width,
+                                                            layout.backbuffer_width);
+    layout.natural_game.h = (GLsizei)ScaleSurfaceCoordinate((uint32_t)std::max(0, sdl.clip.h),
+                                                            surface_height,
+                                                            layout.backbuffer_height);
+
+    if (ViewportIsEmpty(layout.natural_game)) {
+        layout.natural_game.x = 0;
+        layout.natural_game.y = 0;
+        layout.natural_game.w = (GLsizei)layout.backbuffer_width;
+        layout.natural_game.h = (GLsizei)layout.backbuffer_height;
+    }
+
+    layout.mod.x = 0;
+    layout.mod.y = 0;
+    layout.mod.w = (GLsizei)layout.backbuffer_width;
+    layout.mod.h = (GLsizei)layout.backbuffer_height;
+    layout.game = layout.natural_game;
+
+    switch (mod_render_view_mode) {
+    case MOD_RENDER_VIEW_MOD_ONLY:
+        layout.game = GLViewport();
+        break;
+    case MOD_RENDER_VIEW_SIDE_BY_SIDE: {
+        const uint32_t half_width = layout.backbuffer_width / 2u;
+        layout.game.x = 0;
+        layout.game.y = 0;
+        layout.game.w = (GLsizei)half_width;
+        layout.game.h = (GLsizei)layout.backbuffer_height;
+
+        layout.mod.x = (GLint)half_width;
+        layout.mod.y = 0;
+        layout.mod.w = (GLsizei)(layout.backbuffer_width - half_width);
+        layout.mod.h = (GLsizei)layout.backbuffer_height;
+        break;
+    }
+    case MOD_RENDER_VIEW_GAME_ONLY:
+    default:
+        break;
+    }
+
+    return layout;
+}
+
+static void PrepareOpenGLPresentationState(const OpenGLPresentationLayout &layout,
+                                           const GLViewport &viewport)
+{
+    if (dosbox_glBindFramebuffer)
+        dosbox_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (dosbox_glActiveTexture)
+        dosbox_glActiveTexture(GL_TEXTURE0);
+    if (dosbox_glBindVertexArray)
+        dosbox_glBindVertexArray(0);
+    if (glBindBufferARB) {
+        glBindBufferARB(GL_ARRAY_BUFFER, 0);
+        glBindBufferARB(GL_ELEMENT_ARRAY_BUFFER, 0);
+        glBindBufferARB(GL_PIXEL_UNPACK_BUFFER_EXT, 0);
+    }
+
+    if (glUseProgram)
+        glUseProgram(sdl_opengl.program_object);
+
+    if (sdl_opengl.use_shader && !ViewportIsEmpty(viewport))
+        glViewport(viewport.x, viewport.y, viewport.w, viewport.h);
+    else
+        glViewport(0, 0, (GLsizei)layout.backbuffer_width, (GLsizei)layout.backbuffer_height);
+
+    glBlendFunc(GL_ONE, GL_ZERO);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_LIGHTING);
+    glDisable(GL_BLEND);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_ALPHA_TEST);
+    glDisable(GL_FOG);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthMask(GL_TRUE);
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, sdl_opengl.texture);
+
+    if (sdl_opengl.program_object) {
+        if (sdl_opengl.position_attrib >= 0) {
+            glVertexAttribPointer((GLuint)sdl_opengl.position_attrib, 2, GL_FLOAT,
+                                  GL_FALSE, 0, sdl_opengl.vertex_data);
+            glEnableVertexAttribArray((GLuint)sdl_opengl.position_attrib);
+        }
+        glUniform2f(sdl_opengl.ruby.texture_size,
+                    (float)sdl_opengl.texture_size,
+                    (float)sdl_opengl.texture_size);
+        glUniform2f(sdl_opengl.ruby.input_size,
+                    (float)sdl_opengl.input_width,
+                    (float)sdl_opengl.input_height);
+        glUniform2f(sdl_opengl.ruby.output_size,
+                    (GLfloat)std::max<GLsizei>(1, viewport.w),
+                    (GLfloat)std::max<GLsizei>(1, viewport.h));
+    } else {
+        if (glUseProgram)
+            glUseProgram(0);
+        glMatrixMode(GL_MODELVIEW);
+        glLoadIdentity();
+
+        glMatrixMode(GL_PROJECTION);
+        glLoadIdentity();
+        glOrtho(0,
+                (GLdouble)layout.backbuffer_width,
+                (GLdouble)layout.backbuffer_height,
+                0,
+                -1,
+                1);
+
+        glMatrixMode(GL_TEXTURE);
+        glLoadIdentity();
+        if (sdl_opengl.texture_size != 0)
+            glScaled(1.0 / sdl_opengl.texture_size,
+                     1.0 / sdl_opengl.texture_size,
+                     1.0);
+
+        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_COLOR, 0);
+    }
+}
+
+static void RestoreOpenGLPresentationState(const OpenGLPresentationLayout &layout)
+{
+    PrepareOpenGLPresentationState(layout, layout.natural_game);
+}
+
+static ModOpenGLState BuildModOpenGLState(const OpenGLPresentationLayout &layout)
+{
+    ModOpenGLState state = {};
+    state.context_generation = sdl_opengl.context_generation;
+    state.backbuffer_width = layout.backbuffer_width;
+    state.backbuffer_height = layout.backbuffer_height;
+    state.backbuffer_framebuffer = 0;
+    state.draw_width = (uint32_t)sdl.draw.width;
+    state.draw_height = (uint32_t)sdl.draw.height;
+    state.view_mode = (uint32_t)mod_render_view_mode;
+    state.clip_x = (uint32_t)std::max(0, layout.natural_game.x);
+    state.clip_y = (uint32_t)std::max(0, layout.natural_game.y);
+    state.clip_w = (uint32_t)std::max(0, layout.natural_game.w);
+    state.clip_h = (uint32_t)std::max(0, layout.natural_game.h);
+    state.game_viewport_x = (uint32_t)std::max(0, layout.game.x);
+    state.game_viewport_y = (uint32_t)std::max(0, layout.game.y);
+    state.game_viewport_w = (uint32_t)std::max(0, layout.game.w);
+    state.game_viewport_h = (uint32_t)std::max(0, layout.game.h);
+    state.mod_viewport_x = (uint32_t)std::max(0, layout.mod.x);
+    state.mod_viewport_y = (uint32_t)std::max(0, layout.mod.y);
+    state.mod_viewport_w = (uint32_t)std::max(0, layout.mod.w);
+    state.mod_viewport_h = (uint32_t)std::max(0, layout.mod.h);
+    return state;
+}
+
+static void DrawDOSBoxTextureToViewport(const OpenGLPresentationLayout &layout,
+                                        const GLViewport &viewport)
+{
+    if (ViewportIsEmpty(viewport))
+        return;
+
+    PrepareOpenGLPresentationState(layout, viewport);
+    if (sdl_opengl.program_object) {
+        glUniform1i(sdl_opengl.ruby.frame_count, sdl_opengl.actual_frame_count++);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    } else {
+        const GLint right = viewport.x + viewport.w;
+        const GLint bottom = viewport.y + viewport.h;
+        glBegin(GL_QUADS);
+        glTexCoord2i(0, 0); glVertex2i(viewport.x, viewport.y);
+        glTexCoord2i((GLint)sdl_opengl.input_width, 0); glVertex2i(right, viewport.y);
+        glTexCoord2i((GLint)sdl_opengl.input_width, (GLint)sdl_opengl.input_height); glVertex2i(right, bottom);
+        glTexCoord2i(0, (GLint)sdl_opengl.input_height); glVertex2i(viewport.x, bottom);
+        glEnd();
+    }
+}
+
+static void ClearOpenGLBackbuffer(void)
+{
+    if (dosbox_glBindFramebuffer)
+        dosbox_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDisable(GL_SCISSOR_TEST);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+}
+
+static void FinishOpenGLPresentation(void)
+{
+    const OpenGLPresentationLayout layout = BuildOpenGLPresentationLayout();
+    ModOpenGLState mod_state = BuildModOpenGLState(layout);
+    mod_state.present_count = ++sdl_opengl.mod_present_count;
+
+    DOSBoxPython_InvokeOpenGLInitCallback(mod_state);
+
+    if (mod_render_view_mode != MOD_RENDER_VIEW_GAME_ONLY)
+        ClearOpenGLBackbuffer();
+
+    CheckManagement();
+    DrawDOSBoxTextureToViewport(layout, layout.game);
+
+    if (mod_render_view_mode != MOD_RENDER_VIEW_GAME_ONLY)
+        DOSBoxPython_InvokeOpenGLCompositorCallback(mod_state);
+
+    RestoreOpenGLPresentationState(layout);
+    SDL_GL_SwapBuffers();
+}
+
 void OUTPUT_OPENGL_EndUpdate(const uint16_t *changedLines)
 {
     if (!(sdl.must_redraw_all && changedLines == NULL)) 
@@ -1036,9 +1454,7 @@ void OUTPUT_OPENGL_EndUpdate(const uint16_t *changedLines)
 #endif
                     (uint8_t *)sdl_opengl.framebuf);
             }
-            CheckManagement();
-            glCallList(sdl_opengl.displaylist);
-            SDL_GL_SwapBuffers();
+            FinishOpenGLPresentation();
         }
         else
 #endif /*C_XBRZ*/
@@ -1108,12 +1524,7 @@ void OUTPUT_OPENGL_EndUpdate(const uint16_t *changedLines)
         } else
             return;
 
-        CheckManagement();
-        if (sdl_opengl.program_object) {
-            glUniform1i(sdl_opengl.ruby.frame_count, sdl_opengl.actual_frame_count++);
-            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-        } else
-            glCallList(sdl_opengl.displaylist);
+        FinishOpenGLPresentation();
 
 #if 0 /* DEBUG Prove to me that you're drawing the damn texture */
         glBindTexture(GL_TEXTURE_2D, SDLDrawGenFontTexture);
@@ -1145,8 +1556,6 @@ void OUTPUT_OPENGL_EndUpdate(const uint16_t *changedLines)
 
 	glBindTexture(GL_TEXTURE_2D, sdl_opengl.texture);
 #endif
-
-	SDL_GL_SwapBuffers();
 
         if (!menu.hidecycles && !sdl.desktop.fullscreen) frames++;
     }

@@ -86,6 +86,7 @@ bool mountfro[26], mountiro[26];
 bool OpenGL_using(void), Direct3D_using(void);
 void DOSBox_SetSysMenu(void), GFX_OpenGLRedrawScreen(void), InitFontHandle(void), DOSV_FillScreen(void), refreshExtChar(void), Add_VFiles(bool usecp), SetAlpha(double alpha), SetWindowTransparency(int trans);
 void MenuBrowseProgramFile(void), OutputSettingMenuUpdate(void), aspect_ratio_menu(void), update_pc98_clock_pit_menu(void), AllocCallback1(void), AllocCallback2(void), ToggleMenu(bool pressed);
+static void RedrawScreen(unsigned int nWidth, unsigned int nHeight);
 extern int tryconvertcp, Reflect_Menu(void);
 bool kana_input = false; // true if a half-width kana was typed
 
@@ -185,6 +186,7 @@ char* revert_escape_newlines(const char* aMessage);
 
 #include <output/output_direct3d11.h>
 #include <output/output_direct3d.h>
+#include <dosbox_python.h>
 #include <output/output_opengl.h>
 #include <output/output_surface.h>
 #include <output/output_tools.h>
@@ -1792,6 +1794,16 @@ SDL_Window* GFX_SetSDLWindowMode(uint16_t width, uint16_t height, SCREEN_TYPES s
         }
     }
 
+#if C_OPENGL && defined(C_SDL2)
+    if (screenType == SCREEN_OPENGL) {
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
+                            SDL_GL_CONTEXT_PROFILE_COMPATIBILITY);
+        SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    }
+#endif
+
 #if C_OPENGL
     if (sdl_opengl.context) {
         SDL_GL_DeleteContext(sdl_opengl.context);
@@ -1857,6 +1869,22 @@ SDL_Window* GFX_SetSDLWindowMode(uint16_t width, uint16_t height, SCREEN_TYPES s
             sdl_opengl.context = SDL_GL_CreateContext(sdl.window);
             if (sdl_opengl.context == NULL) LOG_MSG("WARNING: SDL2 unable to create GL context");
             if (SDL_GL_MakeCurrent(sdl.window, sdl_opengl.context) != 0) LOG_MSG("WARNING: SDL2 unable to make current GL context");
+            if (sdl_opengl.context != NULL) {
+                sdl_opengl.context_generation++;
+                sdl_opengl.mod_present_count = 0;
+                DOSBoxPython_NotifyOpenGLContextCreated(sdl_opengl.context_generation);
+                int gl_major = 0, gl_minor = 0, gl_profile = 0;
+                SDL_GL_GetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, &gl_major);
+                SDL_GL_GetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, &gl_minor);
+                SDL_GL_GetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, &gl_profile);
+                LOG_MSG("SDL2 GL context created: %d.%d profile=%s generation=%llu",
+                        gl_major,
+                        gl_minor,
+                        gl_profile == SDL_GL_CONTEXT_PROFILE_CORE ? "core" :
+                        gl_profile == SDL_GL_CONTEXT_PROFILE_COMPATIBILITY ? "compatibility" :
+                        gl_profile == SDL_GL_CONTEXT_PROFILE_ES ? "es" : "unknown",
+                        (unsigned long long)sdl_opengl.context_generation);
+            }
         }
 #endif
 
@@ -1912,6 +1940,22 @@ SDL_Window* GFX_SetSDLWindowMode(uint16_t width, uint16_t height, SCREEN_TYPES s
         sdl_opengl.context = SDL_GL_CreateContext(sdl.window);
         if (sdl_opengl.context == NULL) LOG_MSG("WARNING: SDL2 unable to create GL context");
         if (SDL_GL_MakeCurrent(sdl.window, sdl_opengl.context) != 0) LOG_MSG("WARNING: SDL2 unable to make current GL context");
+        if (sdl_opengl.context != NULL) {
+            sdl_opengl.context_generation++;
+            sdl_opengl.mod_present_count = 0;
+            DOSBoxPython_NotifyOpenGLContextCreated(sdl_opengl.context_generation);
+            int gl_major = 0, gl_minor = 0, gl_profile = 0;
+            SDL_GL_GetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, &gl_major);
+            SDL_GL_GetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, &gl_minor);
+            SDL_GL_GetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, &gl_profile);
+            LOG_MSG("SDL2 GL context created: %d.%d profile=%s generation=%llu",
+                    gl_major,
+                    gl_minor,
+                    gl_profile == SDL_GL_CONTEXT_PROFILE_CORE ? "core" :
+                    gl_profile == SDL_GL_CONTEXT_PROFILE_COMPATIBILITY ? "compatibility" :
+                    gl_profile == SDL_GL_CONTEXT_PROFILE_ES ? "es" : "unknown",
+                    (unsigned long long)sdl_opengl.context_generation);
+        }
     }
 #endif
 
@@ -3123,6 +3167,42 @@ static void SwitchFullScreen(bool pressed) {
     }
 }
 
+static void CycleModRenderView(bool pressed)
+{
+#if C_OPENGL
+    if (!pressed)
+        return;
+    if (sdl.desktop.want_type != SCREEN_OPENGL) {
+        LOG_MSG("MOD: render view cycling requires output=opengl");
+        return;
+    }
+
+    Bitu target_width = 0;
+    Bitu target_height = 0;
+    const bool resize_window =
+            OUTPUT_OPENGL_CycleModRenderViewMode(&target_width, &target_height);
+    LOG_MSG("MOD: render view -> %s", OUTPUT_OPENGL_GetModRenderViewModeName());
+
+#if defined(C_SDL2)
+    if (resize_window && !sdl.desktop.fullscreen && sdl.window &&
+        target_width > 0 && target_height > 0) {
+        NonUserResizeCounter++;
+        UpdateWindowDimensions(target_width, target_height);
+        userResizeWindowWidth = target_width;
+        userResizeWindowHeight = target_height;
+        SDL_SetWindowSize(sdl.window, (int)target_width, (int)target_height);
+        sdl.surface = SDL_GetWindowSurface(sdl.window);
+        RedrawScreen((uint32_t)target_width, (uint32_t)target_height);
+        return;
+    }
+#endif
+
+    RedrawScreen((uint32_t)sdl.draw.width, (uint32_t)sdl.draw.height);
+#else
+    (void)pressed;
+#endif
+}
+
 void GFX_SwitchLazyFullscreen(bool lazy) {
     sdl.desktop.lazy_fullscreen=lazy;
     sdl.desktop.lazy_fullscreen_req=false;
@@ -3975,6 +4055,9 @@ static void GUI_StartUp() {
 
         MAPPER_AddHandler(&GUI_ResetResize, MK_backspace, MMODHOST, "resetsize", "Reset window size", &item);
         item->set_text("Reset window size");
+
+        MAPPER_AddHandler(&CycleModRenderView, MK_slash, MMOD1, "modrenderview", "Cycle mod render view", &item);
+        item->set_text("Cycle mod render view");
     }
 
 #if defined(USE_TTF)

@@ -121,6 +121,19 @@ struct PythonHookRegistration {
 	PyObject *callback = NULL;
 };
 
+enum PythonRenderCallbackKind {
+	PYTHON_RENDER_CALLBACK_NONE = 0,
+	PYTHON_RENDER_CALLBACK_INIT = 1,
+	PYTHON_RENDER_CALLBACK_COMPOSITOR = 2,
+};
+
+struct PythonRenderCallbackRegistration {
+	PythonRenderCallbackKind kind = PYTHON_RENDER_CALLBACK_NONE;
+	std::string description = {};
+	bool enabled = true;
+	PyObject *callback = NULL;
+};
+
 struct PythonRuntime {
 	PythonAPI api = {};
 	bool initialized = false;
@@ -131,7 +144,12 @@ struct PythonRuntime {
 	PyObject *mod_module = NULL;
 	PyObject *modstate = NULL;
 	PyObject *gamemem = NULL;
+	PyObject *modgl = NULL;
 	std::vector<PythonHookRegistration> hooks = {};
+	PythonRenderCallbackRegistration init_callback = {};
+	PythonRenderCallbackRegistration compositor_callback = {};
+	uint64_t initialized_context_generation = 0;
+	ModOpenGLState gl_state = {};
 };
 
 PythonRuntime g_python = {};
@@ -357,11 +375,44 @@ static std::string build_mod_helper_bootstrap(void)
 		<< "        return mod._write_i32(addr, value)\n"
 		<< "if not hasattr(mod, 'gamemem'):\n"
 		<< "    mod.gamemem = _DOSBoxGameMemory()\n"
+		<< "class _DOSBoxOpenGL(object):\n"
+		<< "    pass\n"
+		<< "if not hasattr(mod, 'modgl'):\n"
+		<< "    mod.modgl = _DOSBoxOpenGL()\n"
+		<< "mod.modgl.context_generation = 0\n"
+		<< "mod.modgl.present_count = 0\n"
+		<< "mod.modgl.backbuffer_width = 0\n"
+		<< "mod.modgl.backbuffer_height = 0\n"
+		<< "mod.modgl.backbuffer_framebuffer = 0\n"
+		<< "mod.modgl.draw_width = 0\n"
+		<< "mod.modgl.draw_height = 0\n"
+		<< "mod.modgl.view_mode = 0\n"
+		<< "mod.modgl.clip_x = 0\n"
+		<< "mod.modgl.clip_y = 0\n"
+		<< "mod.modgl.clip_w = 0\n"
+		<< "mod.modgl.clip_h = 0\n"
+		<< "mod.modgl.game_viewport_x = 0\n"
+		<< "mod.modgl.game_viewport_y = 0\n"
+		<< "mod.modgl.game_viewport_w = 0\n"
+		<< "mod.modgl.game_viewport_h = 0\n"
+		<< "mod.modgl.mod_viewport_x = 0\n"
+		<< "mod.modgl.mod_viewport_y = 0\n"
+		<< "mod.modgl.mod_viewport_w = 0\n"
+		<< "mod.modgl.mod_viewport_h = 0\n"
+		<< "mod.MOD_RENDER_VIEW_GAME_ONLY = 0\n"
+		<< "mod.MOD_RENDER_VIEW_MOD_ONLY = 1\n"
+		<< "mod.MOD_RENDER_VIEW_SIDE_BY_SIDE = 2\n"
 		<< "def modhook(exe_name, eip, kind):\n"
 		<< "    def decorator(func):\n"
 		<< "        return mod._register_hook(exe_name, eip, kind, func)\n"
 		<< "    return decorator\n"
 		<< "mod.modhook = modhook\n";
+	script
+		<< "def modrender(kind):\n"
+		<< "    def decorator(func):\n"
+		<< "        return mod._register_render_callback(kind, func)\n"
+		<< "    return decorator\n"
+		<< "mod.modrender = modrender\n";
 	return script.str();
 }
 
@@ -426,6 +477,20 @@ static void clear_registered_hooks(void)
 			g_python.api.Py_DecRef(g_python.hooks[i].callback);
 	}
 	g_python.hooks.clear();
+}
+
+static void clear_registered_render_callbacks(void)
+{
+	PythonRenderCallbackRegistration *callbacks[2] = {
+	        &g_python.init_callback, &g_python.compositor_callback};
+
+	for (size_t i = 0; i < 2; ++i) {
+		if (callbacks[i]->callback && g_python.api.Py_DecRef)
+			g_python.api.Py_DecRef(callbacks[i]->callback);
+		*callbacks[i] = PythonRenderCallbackRegistration();
+	}
+
+	g_python.initialized_context_generation = 0;
 }
 
 static void clear_python_error(void)
@@ -495,6 +560,42 @@ static bool set_object_attr_double(PyObject *object, const char *name, double va
 	}
 
 	return set_object_attr(object, name, py_value.get());
+}
+
+static bool update_modgl_state_object(PyObject *object, const ModOpenGLState &state)
+{
+	if (!object)
+		return false;
+
+	return set_object_attr_u64(object, "context_generation", state.context_generation) &&
+	       set_object_attr_u64(object, "present_count", state.present_count) &&
+	       set_object_attr_u64(object, "backbuffer_width", state.backbuffer_width) &&
+	       set_object_attr_u64(object, "backbuffer_height", state.backbuffer_height) &&
+	       set_object_attr_u64(object, "backbuffer_framebuffer",
+	                           state.backbuffer_framebuffer) &&
+	       set_object_attr_u64(object, "draw_width", state.draw_width) &&
+	       set_object_attr_u64(object, "draw_height", state.draw_height) &&
+	       set_object_attr_u64(object, "view_mode", state.view_mode) &&
+	       set_object_attr_u64(object, "clip_x", state.clip_x) &&
+	       set_object_attr_u64(object, "clip_y", state.clip_y) &&
+	       set_object_attr_u64(object, "clip_w", state.clip_w) &&
+	       set_object_attr_u64(object, "clip_h", state.clip_h) &&
+	       set_object_attr_u64(object, "game_viewport_x",
+	                           state.game_viewport_x) &&
+	       set_object_attr_u64(object, "game_viewport_y",
+	                           state.game_viewport_y) &&
+	       set_object_attr_u64(object, "game_viewport_w",
+	                           state.game_viewport_w) &&
+	       set_object_attr_u64(object, "game_viewport_h",
+	                           state.game_viewport_h) &&
+	       set_object_attr_u64(object, "mod_viewport_x",
+	                           state.mod_viewport_x) &&
+	       set_object_attr_u64(object, "mod_viewport_y",
+	                           state.mod_viewport_y) &&
+	       set_object_attr_u64(object, "mod_viewport_w",
+	                           state.mod_viewport_w) &&
+	       set_object_attr_u64(object, "mod_viewport_h",
+	                           state.mod_viewport_h);
 }
 
 static PyObject *get_required_mapping_item(PyObject *mapping,
@@ -579,9 +680,7 @@ static bool ensure_mods_dir_on_sys_path(const std::string &mods_dir)
 	return true;
 }
 
-static std::string get_callable_description(PyObject *callable,
-                                            const std::string &exe_name_upper,
-                                            uint32_t reloc_eip)
+static std::string get_callable_name(PyObject *callable)
 {
 	std::string module_name = {};
 	std::string function_name = {};
@@ -606,6 +705,15 @@ static std::string get_callable_description(PyObject *callable,
 	else
 		description << "<python hook>";
 
+	return description.str();
+}
+
+static std::string get_callable_description(PyObject *callable,
+                                            const std::string &exe_name_upper,
+                                            uint32_t reloc_eip)
+{
+	std::ostringstream description;
+	description << get_callable_name(callable);
 	description << " -> " << exe_name_upper
 	            << ":0x" << std::hex << std::uppercase
 	            << static_cast<unsigned long>(reloc_eip);
@@ -731,6 +839,68 @@ static PyObject *py_register_hook(PyObject *, PyObject *args)
 	g_python.hooks.push_back(hook);
 
 	LOG_MSG("MOD: registered hook %s", hook.description.c_str());
+
+	g_python.api.Py_IncRef(callable_obj);
+	return callable_obj;
+}
+
+static PyObject *py_register_render_callback(PyObject *, PyObject *args)
+{
+	if (g_python.api.PyTuple_Size(args) != 2) {
+		set_python_error(g_python.api.PyExc_TypeError,
+		                 "_register_render_callback expects (kind, func)");
+		return NULL;
+	}
+
+	PyObject *kind_obj = g_python.api.PyTuple_GetItem(args, 0);
+	PyObject *callable_obj = g_python.api.PyTuple_GetItem(args, 1);
+	if (!kind_obj || !callable_obj) {
+		set_python_error(g_python.api.PyExc_RuntimeError,
+		                 "failed to read render callback arguments");
+		return NULL;
+	}
+
+	const char *kind_utf8 = g_python.api.PyUnicode_AsUTF8(kind_obj);
+	if (!kind_utf8)
+		return NULL;
+
+	if (!g_python.api.PyCallable_Check(callable_obj)) {
+		set_python_error(g_python.api.PyExc_TypeError,
+		                 "render callback target must be callable");
+		return NULL;
+	}
+
+	std::string kind = lowercase_ascii_copy(kind_utf8);
+	PythonRenderCallbackRegistration *slot = NULL;
+	PythonRenderCallbackKind callback_kind = PYTHON_RENDER_CALLBACK_NONE;
+
+	if (kind == "init") {
+		slot = &g_python.init_callback;
+		callback_kind = PYTHON_RENDER_CALLBACK_INIT;
+	} else if (kind == "compositor") {
+		slot = &g_python.compositor_callback;
+		callback_kind = PYTHON_RENDER_CALLBACK_COMPOSITOR;
+	} else {
+		set_python_error(g_python.api.PyExc_ValueError,
+		                 "render callback kind must be 'init' or 'compositor'");
+		return NULL;
+	}
+
+	if (slot->callback) {
+		set_python_error(g_python.api.PyExc_ValueError,
+		                 "only one render callback may be registered per kind");
+		return NULL;
+	}
+
+	slot->kind = callback_kind;
+	slot->description = get_callable_name(callable_obj);
+	slot->enabled = true;
+	slot->callback = callable_obj;
+	g_python.api.Py_IncRef(slot->callback);
+
+	LOG_MSG("MOD: registered %s render callback %s",
+	        kind.c_str(),
+	        slot->description.c_str());
 
 	g_python.api.Py_IncRef(callable_obj);
 	return callable_obj;
@@ -966,7 +1136,7 @@ static PyObject *py_write_i32(PyObject *, PyObject *args)
 
 static bool ensure_mod_helper_module(void)
 {
-	if (g_python.mod_module && g_python.modstate && g_python.gamemem)
+	if (g_python.mod_module && g_python.modstate && g_python.gamemem && g_python.modgl)
 		return true;
 
 	if (!g_python.api.PyImport_AddModule("mod")) {
@@ -982,6 +1152,9 @@ static bool ensure_mod_helper_module(void)
 
 	static PyMethodDef register_hook_method = {
 	        "_register_hook", py_register_hook, DOSBOX_PY_METH_VARARGS, NULL};
+	static PyMethodDef register_render_callback_method = {
+	        "_register_render_callback", py_register_render_callback,
+	        DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef get_modjoystick_axes_method = {
 	        "_get_modjoystick_axes", py_get_modjoystick_axes, DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef read_u8_method = {
@@ -1002,6 +1175,8 @@ static bool ensure_mod_helper_module(void)
 	        "_write_i32", py_write_i32, DOSBOX_PY_METH_VARARGS, NULL};
 
 	if (!attach_module_function(mod_module.get(), "_register_hook", &register_hook_method) ||
+	    !attach_module_function(mod_module.get(), "_register_render_callback",
+	                            &register_render_callback_method) ||
 	    !attach_module_function(mod_module.get(), "_get_modjoystick_axes",
 	                            &get_modjoystick_axes_method) ||
 	    !attach_module_function(mod_module.get(), "_read_u8", &read_u8_method) ||
@@ -1025,8 +1200,10 @@ static bool ensure_mod_helper_module(void)
 	        g_python.api.PyObject_GetAttrString(mod_module.get(), "modstate"));
 	PyOwnedRef gamemem(
 	        g_python.api.PyObject_GetAttrString(mod_module.get(), "gamemem"));
-	if (!modstate || !gamemem) {
-		log_python_exception("failed to resolve mod.modstate or mod.gamemem");
+	PyOwnedRef modgl(
+	        g_python.api.PyObject_GetAttrString(mod_module.get(), "modgl"));
+	if (!modstate || !gamemem || !modgl) {
+		log_python_exception("failed to resolve mod.modstate, mod.gamemem, or mod.modgl");
 		return false;
 	}
 
@@ -1036,10 +1213,14 @@ static bool ensure_mod_helper_module(void)
 		g_python.api.Py_DecRef(g_python.modstate);
 	if (g_python.gamemem && g_python.api.Py_DecRef)
 		g_python.api.Py_DecRef(g_python.gamemem);
+	if (g_python.modgl && g_python.api.Py_DecRef)
+		g_python.api.Py_DecRef(g_python.modgl);
 
 	g_python.mod_module = mod_module.release();
 	g_python.modstate = modstate.release();
 	g_python.gamemem = gamemem.release();
+	g_python.modgl = modgl.release();
+	update_modgl_state_object(g_python.modgl, g_python.gl_state);
 	return true;
 }
 
@@ -1477,6 +1658,7 @@ bool DOSBoxPython_Init(const Config& config)
 void DOSBoxPython_Shutdown(void)
 {
 	clear_registered_hooks();
+	clear_registered_render_callbacks();
 
 	if (g_python.mod_module && g_python.api.Py_DecRef) {
 		g_python.api.Py_DecRef(g_python.mod_module);
@@ -1489,6 +1671,10 @@ void DOSBoxPython_Shutdown(void)
 	if (g_python.gamemem && g_python.api.Py_DecRef) {
 		g_python.api.Py_DecRef(g_python.gamemem);
 		g_python.gamemem = NULL;
+	}
+	if (g_python.modgl && g_python.api.Py_DecRef) {
+		g_python.api.Py_DecRef(g_python.modgl);
+		g_python.modgl = NULL;
 	}
 
 #if defined(WIN32) && !defined(HX_DOS)
@@ -1507,6 +1693,7 @@ void DOSBoxPython_Shutdown(void)
 	g_python.mods_dir.clear();
 	g_python.venv_dir.clear();
 	g_python.python_dll.clear();
+	g_python.gl_state = {};
 }
 
 bool DOSBoxPython_LoadModInitConfigs(std::vector<ModExecutableConfig> *configs)
@@ -1524,6 +1711,7 @@ bool DOSBoxPython_LoadMods(std::vector<ModPythonHookRegistration> *hooks)
 
 	hooks->clear();
 	clear_registered_hooks();
+	clear_registered_render_callbacks();
 
 	if (g_python.mods_dir.empty() || !directory_exists(g_python.mods_dir))
 		return false;
@@ -1551,10 +1739,17 @@ bool DOSBoxPython_LoadMods(std::vector<ModPythonHookRegistration> *hooks)
 		hooks->push_back(hook);
 	}
 
-	if (hooks->empty())
-		LOG_MSG("MOD: no Python hooks registered");
+	const unsigned int render_callback_count =
+	        (g_python.init_callback.callback ? 1u : 0u) +
+	        (g_python.compositor_callback.callback ? 1u : 0u);
+	if (hooks->empty() && render_callback_count == 0u)
+		LOG_MSG("MOD: no Python hooks or render callbacks registered");
+	else
+		LOG_MSG("MOD: loaded %u hook(s) and %u render callback(s)",
+		        static_cast<unsigned int>(hooks->size()),
+		        render_callback_count);
 
-	return !hooks->empty();
+	return true;
 }
 
 void DOSBoxPython_ResetModRuntimeState(void)
@@ -1619,4 +1814,121 @@ bool DOSBoxPython_InvokeHook(size_t hook_id)
 	}
 
 	return true;
+}
+
+void DOSBoxPython_NotifyOpenGLContextCreated(uint64_t context_generation)
+{
+	g_python.gl_state.context_generation = context_generation;
+	g_python.gl_state.present_count = 0;
+	g_python.initialized_context_generation = 0;
+
+	if (!g_python.initialized || !g_python.modgl)
+		return;
+
+	update_modgl_state_object(g_python.modgl, g_python.gl_state);
+}
+
+static bool invoke_python_render_callback(PythonRenderCallbackRegistration *callback,
+                                          const char *disable_context,
+                                          PyObject *arg0,
+                                          PyObject *arg1,
+                                          PyObject *arg2,
+                                          PyObject *arg3,
+                                          PyObject *arg4,
+                                          PyObject *arg5,
+                                          PyObject *arg6)
+{
+	if (!callback || !callback->enabled || !callback->callback)
+		return false;
+
+	PyOwnedRef result(g_python.api.PyObject_CallFunctionObjArgs(
+	        callback->callback, arg0, arg1, arg2, arg3, arg4, arg5, arg6, NULL));
+	if (!result) {
+		callback->enabled = false;
+		log_python_exception((std::string("disabling render callback after exception: ") +
+		                      disable_context + " -> " + callback->description).c_str());
+		return false;
+	}
+
+	return true;
+}
+
+bool DOSBoxPython_InvokeOpenGLInitCallback(const ModOpenGLState &state)
+{
+	if (!g_python.initialized || !g_python.modstate)
+		return false;
+	if (!g_python.init_callback.callback)
+		return false;
+	if (!ensure_mod_helper_module())
+		return false;
+
+	g_python.gl_state = state;
+	if (!update_modgl_state_object(g_python.modgl, g_python.gl_state))
+		return false;
+	if (g_python.initialized_context_generation == state.context_generation)
+		return false;
+
+	PyOwnedRef viewport_width(
+	        g_python.api.PyLong_FromUnsignedLong(state.mod_viewport_w));
+	PyOwnedRef viewport_height(
+	        g_python.api.PyLong_FromUnsignedLong(state.mod_viewport_h));
+	if (!viewport_width || !viewport_height) {
+		log_python_exception("failed to build init callback viewport arguments");
+		return false;
+	}
+
+	const bool invoked = invoke_python_render_callback(
+	        &g_python.init_callback,
+	        "init",
+	        g_python.modstate,
+	        g_python.modgl,
+	        viewport_width.get(),
+	        viewport_height.get(),
+	        NULL,
+	        NULL,
+	        NULL);
+	if (invoked)
+		g_python.initialized_context_generation = state.context_generation;
+
+	return invoked;
+}
+
+bool DOSBoxPython_InvokeOpenGLCompositorCallback(const ModOpenGLState &state)
+{
+	if (!g_python.initialized || !g_python.modstate)
+		return false;
+	if (!g_python.compositor_callback.callback)
+		return false;
+	if (!ensure_mod_helper_module())
+		return false;
+
+	g_python.gl_state = state;
+	if (!update_modgl_state_object(g_python.modgl, g_python.gl_state))
+		return false;
+
+	PyOwnedRef viewport_x(
+	        g_python.api.PyLong_FromUnsignedLong(state.mod_viewport_x));
+	PyOwnedRef viewport_y(
+	        g_python.api.PyLong_FromUnsignedLong(state.mod_viewport_y));
+	PyOwnedRef viewport_width(
+	        g_python.api.PyLong_FromUnsignedLong(state.mod_viewport_w));
+	PyOwnedRef viewport_height(
+	        g_python.api.PyLong_FromUnsignedLong(state.mod_viewport_h));
+	PyOwnedRef backbuffer_framebuffer(g_python.api.PyLong_FromUnsignedLong(
+	        state.backbuffer_framebuffer));
+	if (!viewport_x || !viewport_y || !viewport_width || !viewport_height ||
+	    !backbuffer_framebuffer) {
+		log_python_exception("failed to build compositor callback arguments");
+		return false;
+	}
+
+	return invoke_python_render_callback(&g_python.compositor_callback,
+	                                     "compositor",
+	                                     g_python.modstate,
+	                                     g_python.modgl,
+	                                     viewport_x.get(),
+	                                     viewport_y.get(),
+	                                     viewport_width.get(),
+	                                     viewport_height.get(),
+	                                     backbuffer_framebuffer.get());
 }

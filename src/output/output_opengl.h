@@ -31,6 +31,16 @@ typedef GLvoid* (APIENTRYP PFNGLMAPBUFFERARBPROC) (GLenum target, GLenum access)
 typedef GLboolean(APIENTRYP PFNGLUNMAPBUFFERARBPROC) (GLenum target);
 #endif
 
+#ifndef GL_FRAMEBUFFER
+#define GL_FRAMEBUFFER 0x8D40
+#endif
+#ifndef GL_ARRAY_BUFFER
+#define GL_ARRAY_BUFFER 0x8892
+#endif
+#ifndef GL_ELEMENT_ARRAY_BUFFER
+#define GL_ELEMENT_ARRAY_BUFFER 0x8893
+#endif
+
 extern PFNGLGENBUFFERSARBPROC glGenBuffersARB;
 extern PFNGLBINDBUFFERARBPROC glBindBufferARB;
 extern PFNGLDELETEBUFFERSARBPROC glDeleteBuffersARB;
@@ -62,6 +72,9 @@ typedef void (APIENTRYP PFNGLUNIFORM2FPROC) (GLint location, GLfloat v0, GLfloat
 typedef void (APIENTRYP PFNGLUNIFORM1IPROC) (GLint location, GLint v0);
 typedef void (APIENTRYP PFNGLUSEPROGRAMPROC) (GLuint program);
 typedef void (APIENTRYP PFNGLVERTEXATTRIBPOINTERPROC) (GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride, const GLvoid *pointer);
+typedef void (APIENTRYP PFNGLACTIVETEXTUREPROC) (GLenum texture);
+typedef void (APIENTRYP PFNGLBINDFRAMEBUFFERPROC) (GLenum target, GLuint framebuffer);
+typedef void (APIENTRYP PFNGLBINDVERTEXARRAYPROC) (GLuint array);
 
 
 #if defined(C_SDL2)
@@ -95,7 +108,13 @@ struct SDL_OpenGL {
         GLint frame_count;
     } ruby;
     GLuint actual_frame_count;
+    uint64_t mod_present_count;
     GLfloat vertex_data[2*4];
+    Bitu input_width;
+    Bitu input_height;
+    Bitu texture_size;
+    GLint position_attrib;
+    uint64_t context_generation;
 #if defined(C_SDL2)
     SDL_GLContext context;
 #endif
@@ -132,6 +151,8 @@ Bitu OUTPUT_OPENGL_SetSize();
 bool OUTPUT_OPENGL_StartUpdate(uint8_t* &pixels, Bitu &pitch);
 void OUTPUT_OPENGL_EndUpdate(const uint16_t *changedLines);
 void OUTPUT_OPENGL_Shutdown();
+bool OUTPUT_OPENGL_CycleModRenderViewMode(Bitu *target_width, Bitu *target_height);
+const char *OUTPUT_OPENGL_GetModRenderViewModeName(void);
 
 #endif //C_OPENGL
 

@@ -25,6 +25,35 @@ struct ModFrameState {
 	double frame_delta_seconds = 0.0;
 };
 
+enum ModRenderViewMode {
+	MOD_RENDER_VIEW_GAME_ONLY = 0,
+	MOD_RENDER_VIEW_MOD_ONLY = 1,
+	MOD_RENDER_VIEW_SIDE_BY_SIDE = 2,
+};
+
+struct ModOpenGLState {
+	uint64_t context_generation = 0;
+	uint64_t present_count = 0;
+	uint32_t backbuffer_width = 0;
+	uint32_t backbuffer_height = 0;
+	uint32_t backbuffer_framebuffer = 0;
+	uint32_t draw_width = 0;
+	uint32_t draw_height = 0;
+	uint32_t view_mode = MOD_RENDER_VIEW_SIDE_BY_SIDE;
+	uint32_t clip_x = 0;
+	uint32_t clip_y = 0;
+	uint32_t clip_w = 0;
+	uint32_t clip_h = 0;
+	uint32_t game_viewport_x = 0;
+	uint32_t game_viewport_y = 0;
+	uint32_t game_viewport_w = 0;
+	uint32_t game_viewport_h = 0;
+	uint32_t mod_viewport_x = 0;
+	uint32_t mod_viewport_y = 0;
+	uint32_t mod_viewport_w = 0;
+	uint32_t mod_viewport_h = 0;
+};
+
 struct ModPythonHookRegistration {
 	size_t hook_id = 0;
 	std::string exe_name_upper = {};

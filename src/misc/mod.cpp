@@ -448,7 +448,7 @@ void MOD_OnOpenFile(const char *name, unsigned short handle)
 		    g_mod.active_executable_index == i) {
 			g_mod.active_executable_valid = false;
 			update_fast_enabled();
-			DOSBoxPython_ResetModStateTiming();
+			DOSBoxPython_ResetModRuntimeState();
 		}
 		LOG_MSG("MOD: armed %s on handle %u",
 		        runtime.config.name.c_str(), static_cast<unsigned int>(handle));

@@ -359,6 +359,20 @@ static std::string build_mod_helper_bootstrap(void)
 	return script.str();
 }
 
+static std::string build_modstate_reset_script(void)
+{
+	std::ostringstream script;
+	script
+		<< "import mod\n"
+		<< "class _DOSBoxModState(object):\n"
+		<< "    pass\n"
+		<< "mod.modstate = _DOSBoxModState()\n"
+		<< "mod.modstate.frame = 0\n"
+		<< "mod.modstate.time = 0.0\n"
+		<< "mod.modstate.frame_delta = 0.0\n";
+	return script.str();
+}
+
 static std::string build_mod_loader_script(const std::string &mods_dir)
 {
 	const std::string escaped_mods_dir = escape_python_string(mods_dir);
@@ -981,6 +995,25 @@ static bool ensure_mod_helper_module(void)
 	return true;
 }
 
+static bool refresh_modstate_reference(void)
+{
+	if (!g_python.mod_module)
+		return false;
+
+	PyOwnedRef modstate(
+	        g_python.api.PyObject_GetAttrString(g_python.mod_module, "modstate"));
+	if (!modstate) {
+		log_python_exception("failed to resolve refreshed mod.modstate");
+		return false;
+	}
+
+	if (g_python.modstate && g_python.api.Py_DecRef)
+		g_python.api.Py_DecRef(g_python.modstate);
+
+	g_python.modstate = modstate.release();
+	return true;
+}
+
 static bool load_mod_init_config(const std::string &mods_dir,
                                  std::vector<ModExecutableConfig> *configs)
 {
@@ -1468,6 +1501,27 @@ bool DOSBoxPython_LoadMods(std::vector<ModPythonHookRegistration> *hooks)
 		LOG_MSG("MOD: no Python hooks registered");
 
 	return !hooks->empty();
+}
+
+void DOSBoxPython_ResetModRuntimeState(void)
+{
+	if (!g_python.initialized)
+		return;
+
+	if (!ensure_mod_helper_module())
+		return;
+
+	const std::string reset_script = build_modstate_reset_script();
+	if (g_python.api.PyRun_SimpleStringFlags(reset_script.c_str(), NULL) != 0) {
+		log_python_exception("failed to recreate Python modstate");
+		return;
+	}
+
+	if (!refresh_modstate_reference())
+		return;
+
+	for (size_t i = 0; i < g_python.hooks.size(); ++i)
+		g_python.hooks[i].enabled = true;
 }
 
 void DOSBoxPython_ResetModStateTiming(void)

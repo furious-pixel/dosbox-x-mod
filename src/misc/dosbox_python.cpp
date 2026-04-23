@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
@@ -29,6 +30,9 @@
 
 namespace {
 
+struct PyObject;
+typedef intptr_t Py_ssize_t;
+
 struct PythonAPI {
 #if defined(WIN32) && !defined(HX_DOS)
 	HMODULE dll = NULL;
@@ -38,15 +42,34 @@ struct PythonAPI {
 	int (*Py_IsInitialized)(void) = NULL;
 	const char *(*Py_GetVersion)(void) = NULL;
 	int (*PyRun_SimpleStringFlags)(const char *, void *) = NULL;
+	PyObject *(*PyImport_ImportModule)(const char *) = NULL;
+	PyObject *(*PyObject_GetAttrString)(PyObject *, const char *) = NULL;
+	PyObject *(*PyObject_CallFunctionObjArgs)(PyObject *, ...) = NULL;
+	PyObject *(*PyMapping_GetItemString)(PyObject *, const char *) = NULL;
+	int (*PyMapping_HasKeyString)(PyObject *, const char *) = NULL;
+	Py_ssize_t (*PySequence_Size)(PyObject *) = NULL;
+	PyObject *(*PySequence_GetItem)(PyObject *, Py_ssize_t) = NULL;
+	PyObject *(*PyUnicode_FromString)(const char *) = NULL;
+	const char *(*PyUnicode_AsUTF8)(PyObject *) = NULL;
+	unsigned long (*PyLong_AsUnsignedLong)(PyObject *) = NULL;
+	void (*Py_DecRef)(PyObject *) = NULL;
 	void *(*PyErr_Occurred)(void) = NULL;
+	void (*PyErr_Clear)(void) = NULL;
 	void (*PyErr_Print)(void) = NULL;
 	int (*Py_FinalizeEx)(void) = NULL;
 
 	bool loaded(void) const
 	{
 		return Py_SetProgramName && Py_Initialize && Py_IsInitialized &&
-		       Py_GetVersion && PyRun_SimpleStringFlags && PyErr_Occurred &&
-		       PyErr_Print && Py_FinalizeEx;
+		       Py_GetVersion && PyRun_SimpleStringFlags &&
+		       PyImport_ImportModule && PyObject_GetAttrString &&
+		       PyObject_CallFunctionObjArgs && PyMapping_GetItemString &&
+		       PyMapping_HasKeyString && PySequence_Size &&
+		       PySequence_GetItem && PyUnicode_FromString &&
+		       PyUnicode_AsUTF8 && PyLong_AsUnsignedLong &&
+		       Py_DecRef &&
+		       PyErr_Occurred && PyErr_Clear && PyErr_Print &&
+		       Py_FinalizeEx;
 	}
 };
 
@@ -76,6 +99,44 @@ struct PythonRuntime {
 };
 
 PythonRuntime g_python = {};
+
+struct PyOwnedRef {
+	explicit PyOwnedRef(PyObject *obj = NULL) : object(obj) {}
+	~PyOwnedRef()
+	{
+		reset();
+	}
+
+	PyObject *get(void) const
+	{
+		return object;
+	}
+
+	void reset(PyObject *obj = NULL)
+	{
+		if (object && g_python.api.Py_DecRef)
+			g_python.api.Py_DecRef(object);
+		object = obj;
+	}
+
+	PyObject *release(void)
+	{
+		PyObject *result = object;
+		object = NULL;
+		return result;
+	}
+
+	operator bool(void) const
+	{
+		return object != NULL;
+	}
+
+private:
+	PyOwnedRef(const PyOwnedRef &);
+	PyOwnedRef &operator=(const PyOwnedRef &);
+
+	PyObject *object = NULL;
+};
 
 static std::string trim_copy(const std::string &value)
 {
@@ -260,295 +321,112 @@ static std::string build_python_bootstrap(const std::string &mods_dir)
 	return script.str();
 }
 
-static std::string strip_python_comments(const std::string &text)
+static void clear_python_error(void)
 {
-	std::string result;
-	result.reserve(text.size());
-
-	bool in_string = false;
-	char quote = '\0';
-	bool escaped = false;
-
-	for (size_t i = 0; i < text.size(); ++i) {
-		const char ch = text[i];
-		if (in_string) {
-			result.push_back(ch);
-			if (escaped) {
-				escaped = false;
-			} else if (ch == '\\') {
-				escaped = true;
-			} else if (ch == quote) {
-				in_string = false;
-			}
-			continue;
-		}
-
-		if (ch == '\'' || ch == '"') {
-			in_string = true;
-			quote = ch;
-			escaped = false;
-			result.push_back(ch);
-			continue;
-		}
-
-		if (ch == '#') {
-			while (i < text.size() && text[i] != '\n')
-				++i;
-			if (i < text.size())
-				result.push_back(text[i]);
-			continue;
-		}
-
-		result.push_back(ch);
-	}
-
-	return result;
+	if (g_python.api.PyErr_Clear)
+		g_python.api.PyErr_Clear();
 }
 
-static size_t skip_whitespace(const std::string &text, size_t pos)
+static void log_python_exception(const char *context)
 {
-	while (pos < text.size() &&
-	       std::isspace(static_cast<unsigned char>(text[pos])) != 0) {
-		++pos;
+	if (context && *context)
+		LOG_MSG("MOD ERROR: %s", context);
+
+	if (g_python.api.PyErr_Occurred && g_python.api.PyErr_Occurred() != NULL) {
+		if (g_python.api.PyErr_Print)
+			g_python.api.PyErr_Print();
+		else
+			clear_python_error();
 	}
-	return pos;
 }
 
-static bool parse_python_string(const std::string &text,
-                                size_t start,
-                                size_t *next_pos,
+static std::string append_context_index(const std::string &context, size_t index)
+{
+	std::ostringstream stream;
+	stream << context << "[" << static_cast<unsigned int>(index) << "]";
+	return stream.str();
+}
+
+static PyObject *get_required_mapping_item(PyObject *mapping,
+                                           const char *key,
+                                           const std::string &context)
+{
+	const int has_key = g_python.api.PyMapping_HasKeyString(mapping, key);
+	if (has_key == 1)
+		return g_python.api.PyMapping_GetItemString(mapping, key);
+
+	if (has_key == 0) {
+		LOG_MSG("MOD ERROR: %s is missing key '%s'", context.c_str(), key);
+		return NULL;
+	}
+
+	log_python_exception((context + " failed key lookup").c_str());
+	return NULL;
+}
+
+static PyObject *get_optional_mapping_item(PyObject *mapping,
+                                           const char *key,
+                                           const std::string &context)
+{
+	const int has_key = g_python.api.PyMapping_HasKeyString(mapping, key);
+	if (has_key == 1)
+		return g_python.api.PyMapping_GetItemString(mapping, key);
+
+	if (has_key < 0)
+		log_python_exception((context + " failed optional key lookup").c_str());
+
+	return NULL;
+}
+
+static bool py_object_to_string(PyObject *object,
+                                const std::string &context,
                                 std::string *value)
 {
-	if (start >= text.size() || (text[start] != '\'' && text[start] != '"'))
+	const char *utf8 = g_python.api.PyUnicode_AsUTF8(object);
+	if (!utf8) {
+		log_python_exception((context + " expected a string").c_str());
 		return false;
-
-	const char quote = text[start];
-	std::string result;
-	bool escaped = false;
-	size_t pos = start + 1;
-
-	while (pos < text.size()) {
-		const char ch = text[pos++];
-		if (escaped) {
-			switch (ch) {
-			case 'n': result.push_back('\n'); break;
-			case 'r': result.push_back('\r'); break;
-			case 't': result.push_back('\t'); break;
-			default: result.push_back(ch); break;
-			}
-			escaped = false;
-			continue;
-		}
-
-		if (ch == '\\') {
-			escaped = true;
-			continue;
-		}
-
-		if (ch == quote) {
-			if (next_pos)
-				*next_pos = pos;
-			if (value)
-				*value = result;
-			return true;
-		}
-
-		result.push_back(ch);
 	}
 
-	return false;
+	*value = utf8;
+	return true;
 }
 
-static bool find_key_value_start(const std::string &text,
-                                 const std::string &key,
-                                 size_t start,
-                                 size_t *value_start)
+static bool py_object_to_uint32(PyObject *object,
+                                const std::string &context,
+                                uint32_t *value)
 {
-	size_t pos = start;
-	while (pos < text.size()) {
-		if (text[pos] != '\'' && text[pos] != '"') {
-			++pos;
-			continue;
-		}
-
-		size_t next = pos;
-		std::string parsed_key;
-		if (!parse_python_string(text, pos, &next, &parsed_key))
-			return false;
-
-		pos = next;
-		const size_t colon = skip_whitespace(text, pos);
-		if (parsed_key == key && colon < text.size() && text[colon] == ':') {
-			*value_start = skip_whitespace(text, colon + 1);
-			return true;
-		}
+	clear_python_error();
+	const unsigned long parsed = g_python.api.PyLong_AsUnsignedLong(object);
+	if (g_python.api.PyErr_Occurred && g_python.api.PyErr_Occurred() != NULL) {
+		log_python_exception((context + " expected an integer").c_str());
+		return false;
 	}
-
-	return false;
-}
-
-static bool extract_bracketed_block(const std::string &text,
-                                    size_t start,
-                                    char open_char,
-                                    char close_char,
-                                    std::string *block)
-{
-	if (start >= text.size() || text[start] != open_char)
-		return false;
-
-	size_t depth = 0;
-	bool in_string = false;
-	char quote = '\0';
-	bool escaped = false;
-
-	for (size_t pos = start; pos < text.size(); ++pos) {
-		const char ch = text[pos];
-		if (in_string) {
-			if (escaped) {
-				escaped = false;
-			} else if (ch == '\\') {
-				escaped = true;
-			} else if (ch == quote) {
-				in_string = false;
-			}
-			continue;
-		}
-
-		if (ch == '\'' || ch == '"') {
-			in_string = true;
-			quote = ch;
-			escaped = false;
-			continue;
-		}
-
-		if (ch == open_char) {
-			++depth;
-			continue;
-		}
-
-		if (ch == close_char) {
-			if (depth == 0)
-				return false;
-			--depth;
-			if (depth == 0) {
-				*block = text.substr(start, pos - start + 1);
-				return true;
-			}
-		}
-	}
-
-	return false;
-}
-
-static bool extract_named_block(const std::string &text,
-                                const std::string &key,
-                                char open_char,
-                                char close_char,
-                                std::string *block)
-{
-	size_t value_start = 0;
-	if (!find_key_value_start(text, key, 0, &value_start))
-		return false;
-	return extract_bracketed_block(text, value_start, open_char, close_char, block);
-}
-
-static bool extract_string_field(const std::string &text,
-                                 const std::string &key,
-                                 std::string *value)
-{
-	size_t value_start = 0;
-	if (!find_key_value_start(text, key, 0, &value_start))
-		return false;
-	return parse_python_string(text, value_start, NULL, value);
-}
-
-static bool extract_uint32_field(const std::string &text,
-                                 const std::string &key,
-                                 uint32_t *value)
-{
-	size_t value_start = 0;
-	if (!find_key_value_start(text, key, 0, &value_start))
-		return false;
-
-	size_t end = value_start;
-	if (end < text.size() && (text[end] == '+' || text[end] == '-'))
-		++end;
-
-	while (end < text.size()) {
-		const char ch = text[end];
-		const bool hex_digit = (ch >= '0' && ch <= '9') ||
-		                       (ch >= 'a' && ch <= 'f') ||
-		                       (ch >= 'A' && ch <= 'F') ||
-		                       ch == 'x' || ch == 'X';
-		if (!hex_digit)
-			break;
-		++end;
-	}
-
-	if (end == value_start)
-		return false;
-
-	const std::string token = text.substr(value_start, end - value_start);
-	char *parse_end = NULL;
-	const unsigned long parsed = std::strtoul(token.c_str(), &parse_end, 0);
-	if (!parse_end || *parse_end != '\0')
-		return false;
 
 	*value = static_cast<uint32_t>(parsed);
 	return true;
 }
 
-static std::vector<std::string> split_top_level_dicts(const std::string &list_block)
+static bool ensure_mods_dir_on_sys_path(const std::string &mods_dir)
 {
-	std::vector<std::string> blocks;
-	if (list_block.size() < 2 || list_block.front() != '[' || list_block.back() != ']')
-		return blocks;
+	if (mods_dir.empty())
+		return true;
 
-	size_t object_start = std::string::npos;
-	size_t depth = 0;
-	bool in_string = false;
-	char quote = '\0';
-	bool escaped = false;
+	const std::string escaped_mods_dir = escape_python_string(mods_dir);
+	std::ostringstream script;
+	script
+	        << "import pathlib\n"
+	        << "import sys\n"
+	        << "_dosbox_mods_dir = str(pathlib.Path('" << escaped_mods_dir << "').resolve())\n"
+	        << "if _dosbox_mods_dir not in sys.path:\n"
+	        << "    sys.path.insert(0, _dosbox_mods_dir)\n";
 
-	for (size_t pos = 1; pos + 1 < list_block.size(); ++pos) {
-		const char ch = list_block[pos];
-		if (in_string) {
-			if (escaped) {
-				escaped = false;
-			} else if (ch == '\\') {
-				escaped = true;
-			} else if (ch == quote) {
-				in_string = false;
-			}
-			continue;
-		}
-
-		if (ch == '\'' || ch == '"') {
-			in_string = true;
-			quote = ch;
-			escaped = false;
-			continue;
-		}
-
-		if (ch == '{') {
-			if (depth == 0)
-				object_start = pos;
-			++depth;
-			continue;
-		}
-
-		if (ch == '}') {
-			if (depth == 0)
-				continue;
-			--depth;
-			if (depth == 0 && object_start != std::string::npos) {
-				blocks.push_back(list_block.substr(object_start, pos - object_start + 1));
-				object_start = std::string::npos;
-			}
-		}
+	if (g_python.api.PyRun_SimpleStringFlags(script.str().c_str(), NULL) != 0) {
+		log_python_exception("failed to add mods directory to sys.path");
+		return false;
 	}
 
-	return blocks;
+	return true;
 }
 
 static bool load_mod_init_config(const std::string &mods_dir)
@@ -565,42 +443,98 @@ static bool load_mod_init_config(const std::string &mods_dir)
 	if (!path_exists(mod_init_path))
 		return false;
 
-	std::ifstream input(mod_init_path.c_str(), std::ios::in | std::ios::binary);
-	if (!input) {
-		LOG_MSG("MOD ERROR: failed to read %s", mod_init_path.c_str());
+	if (!ensure_mods_dir_on_sys_path(mods_dir))
+		return false;
+
+	PyOwnedRef runpy_module(g_python.api.PyImport_ImportModule("runpy"));
+	if (!runpy_module) {
+		log_python_exception("failed to import runpy for mod_init.py");
 		return false;
 	}
 
-	std::ostringstream buffer;
-	buffer << input.rdbuf();
-	const std::string source = strip_python_comments(buffer.str());
-
-	std::string executables_block;
-	if (!extract_named_block(source, "executables", '[', ']', &executables_block)) {
-		LOG_MSG("MOD ERROR: %s is missing MOD_INIT['executables']", mod_init_path.c_str());
+	PyOwnedRef run_path(g_python.api.PyObject_GetAttrString(runpy_module.get(), "run_path"));
+	if (!run_path) {
+		log_python_exception("failed to resolve runpy.run_path");
 		return false;
 	}
 
-	const std::vector<std::string> executable_blocks = split_top_level_dicts(executables_block);
-	for (size_t i = 0; i < executable_blocks.size(); ++i) {
-		const std::string &block = executable_blocks[i];
+	PyOwnedRef mod_init_path_obj(g_python.api.PyUnicode_FromString(mod_init_path.c_str()));
+	if (!mod_init_path_obj) {
+		log_python_exception("failed to convert mod_init.py path to Python string");
+		return false;
+	}
+
+	PyOwnedRef mod_globals(g_python.api.PyObject_CallFunctionObjArgs(
+	        run_path.get(), mod_init_path_obj.get(), NULL));
+	if (!mod_globals) {
+		log_python_exception(("failed to execute " + mod_init_path).c_str());
+		return false;
+	}
+
+	PyOwnedRef mod_init(get_required_mapping_item(mod_globals.get(), "MOD_INIT", mod_init_path));
+	if (!mod_init)
+		return false;
+
+	PyOwnedRef executables(
+	        get_required_mapping_item(mod_init.get(), "executables", "MOD_INIT"));
+	if (!executables)
+		return false;
+
+	clear_python_error();
+	const Py_ssize_t executable_count =
+	        g_python.api.PySequence_Size(executables.get());
+	if (g_python.api.PyErr_Occurred && g_python.api.PyErr_Occurred() != NULL) {
+		log_python_exception("MOD_INIT['executables'] must be a sequence");
+		return false;
+	}
+
+	for (Py_ssize_t i = 0; i < executable_count; ++i) {
+		const std::string entry_context = append_context_index("MOD_INIT['executables']", static_cast<size_t>(i));
 		PythonRuntime::ExecutableConfig config = {};
-		std::string landmark_block;
-		std::string scan_range_block;
+		PyOwnedRef executable(g_python.api.PySequence_GetItem(executables.get(), i));
+		if (!executable) {
+			log_python_exception((entry_context + " could not be read").c_str());
+			continue;
+		}
 
-		if (!extract_string_field(block, "name", &config.name) ||
-		    !extract_named_block(block, "landmark", '{', '}', &landmark_block) ||
-		    !extract_string_field(landmark_block, "string", &config.landmark_string) ||
-		    !extract_uint32_field(landmark_block, "reloc", &config.landmark_reloc)) {
-			LOG_MSG("MOD ERROR: invalid executable entry %u in %s",
-			        static_cast<unsigned int>(i + 1), mod_init_path.c_str());
+		PyOwnedRef name(get_required_mapping_item(executable.get(), "name", entry_context));
+		PyOwnedRef landmark(get_required_mapping_item(executable.get(), "landmark", entry_context));
+		if (!name || !landmark)
+			continue;
+
+		PyOwnedRef landmark_string(
+		        get_required_mapping_item(landmark.get(), "string", entry_context + "['landmark']"));
+		PyOwnedRef landmark_reloc(
+		        get_required_mapping_item(landmark.get(), "reloc", entry_context + "['landmark']"));
+		if (!landmark_string || !landmark_reloc)
+			continue;
+
+		if (!py_object_to_string(name.get(), entry_context + "['name']", &config.name) ||
+		    !py_object_to_string(landmark_string.get(),
+		                         entry_context + "['landmark']['string']",
+		                         &config.landmark_string) ||
+		    !py_object_to_uint32(landmark_reloc.get(),
+		                         entry_context + "['landmark']['reloc']",
+		                         &config.landmark_reloc)) {
 			continue;
 		}
 
 		config.name_upper = uppercase_ascii_copy(config.name);
-		if (extract_named_block(block, "scan_range", '{', '}', &scan_range_block)) {
-			if (extract_uint32_field(scan_range_block, "start", &config.scan_start) &&
-			    extract_uint32_field(scan_range_block, "end", &config.scan_end)) {
+
+		PyOwnedRef scan_range(
+		        get_optional_mapping_item(executable.get(), "scan_range", entry_context));
+		if (scan_range) {
+			PyOwnedRef scan_start(
+			        get_required_mapping_item(scan_range.get(), "start", entry_context + "['scan_range']"));
+			PyOwnedRef scan_end(
+			        get_required_mapping_item(scan_range.get(), "end", entry_context + "['scan_range']"));
+			if (scan_start && scan_end &&
+			    py_object_to_uint32(scan_start.get(),
+			                        entry_context + "['scan_range']['start']",
+			                        &config.scan_start) &&
+			    py_object_to_uint32(scan_end.get(),
+			                        entry_context + "['scan_range']['end']",
+			                        &config.scan_end)) {
 				config.has_scan_range = true;
 			} else {
 				LOG_MSG("MOD ERROR: invalid scan_range for %s in %s",
@@ -790,9 +724,45 @@ static bool load_python_api(const std::string &dll_path)
 	g_python.api.PyRun_SimpleStringFlags =
 	        reinterpret_cast<int (*)(const char *, void *)>(
 	                resolve_symbol(g_python.api.dll, "PyRun_SimpleStringFlags"));
+	g_python.api.PyImport_ImportModule =
+	        reinterpret_cast<PyObject *(*)(const char *)>(
+	                resolve_symbol(g_python.api.dll, "PyImport_ImportModule"));
+	g_python.api.PyObject_GetAttrString =
+	        reinterpret_cast<PyObject *(*)(PyObject *, const char *)>(
+	                resolve_symbol(g_python.api.dll, "PyObject_GetAttrString"));
+	g_python.api.PyObject_CallFunctionObjArgs =
+	        reinterpret_cast<PyObject *(*)(PyObject *, ...)>(
+	                resolve_symbol(g_python.api.dll, "PyObject_CallFunctionObjArgs"));
+	g_python.api.PyMapping_GetItemString =
+	        reinterpret_cast<PyObject *(*)(PyObject *, const char *)>(
+	                resolve_symbol(g_python.api.dll, "PyMapping_GetItemString"));
+	g_python.api.PyMapping_HasKeyString =
+	        reinterpret_cast<int (*)(PyObject *, const char *)>(
+	                resolve_symbol(g_python.api.dll, "PyMapping_HasKeyString"));
+	g_python.api.PySequence_Size =
+	        reinterpret_cast<Py_ssize_t (*)(PyObject *)>(
+	                resolve_symbol(g_python.api.dll, "PySequence_Size"));
+	g_python.api.PySequence_GetItem =
+	        reinterpret_cast<PyObject *(*)(PyObject *, Py_ssize_t)>(
+	                resolve_symbol(g_python.api.dll, "PySequence_GetItem"));
+	g_python.api.PyUnicode_FromString =
+	        reinterpret_cast<PyObject *(*)(const char *)>(
+	                resolve_symbol(g_python.api.dll, "PyUnicode_FromString"));
+	g_python.api.PyUnicode_AsUTF8 =
+	        reinterpret_cast<const char *(*)(PyObject *)>(
+	                resolve_symbol(g_python.api.dll, "PyUnicode_AsUTF8"));
+	g_python.api.PyLong_AsUnsignedLong =
+	        reinterpret_cast<unsigned long (*)(PyObject *)>(
+	                resolve_symbol(g_python.api.dll, "PyLong_AsUnsignedLong"));
+	g_python.api.Py_DecRef =
+	        reinterpret_cast<void (*)(PyObject *)>(
+	                resolve_symbol(g_python.api.dll, "Py_DecRef"));
 	g_python.api.PyErr_Occurred =
 	        reinterpret_cast<void *(*)(void)>(
 	                resolve_symbol(g_python.api.dll, "PyErr_Occurred"));
+	g_python.api.PyErr_Clear =
+	        reinterpret_cast<void (*)(void)>(
+	                resolve_symbol(g_python.api.dll, "PyErr_Clear"));
 	g_python.api.PyErr_Print =
 	        reinterpret_cast<void (*)(void)>(
 	                resolve_symbol(g_python.api.dll, "PyErr_Print"));

@@ -360,6 +360,9 @@ static std::string build_mod_helper_bootstrap(void)
 		<< "mod.modstate.time = 0.0\n"
 		<< "mod.modstate.frame_delta = 0.0\n"
 		<< "class _DOSBoxGameMemory(object):\n"
+		<< "    @property\n"
+		<< "    def delta(self):\n"
+		<< "        return mod._get_delta()\n"
 		<< "    def read_u8(self, addr):\n"
 		<< "        return mod._read_u8(addr)\n"
 		<< "    def read_u16(self, addr):\n"
@@ -370,6 +373,18 @@ static std::string build_mod_helper_bootstrap(void)
 		<< "        return mod._read_i32(addr)\n"
 		<< "    def read_bytes(self, addr, size):\n"
 		<< "        return mod._read_bytes(addr, size)\n"
+		<< "    def read_reloced_ptr(self, addr):\n"
+		<< "        return mod._read_reloced_ptr(addr)\n"
+		<< "    def read_runtime_u8(self, addr):\n"
+		<< "        return mod._read_runtime_u8(addr)\n"
+		<< "    def read_runtime_u16(self, addr):\n"
+		<< "        return mod._read_runtime_u16(addr)\n"
+		<< "    def read_runtime_u32(self, addr):\n"
+		<< "        return mod._read_runtime_u32(addr)\n"
+		<< "    def read_runtime_i32(self, addr):\n"
+		<< "        return mod._read_runtime_i32(addr)\n"
+		<< "    def read_runtime_bytes(self, addr, size):\n"
+		<< "        return mod._read_runtime_bytes(addr, size)\n"
 		<< "    def write_u8(self, addr, value):\n"
 		<< "        return mod._write_u8(addr, value)\n"
 		<< "    def write_u16(self, addr, value):\n"
@@ -969,6 +984,32 @@ static PyObject *py_get_modjoystick_axes(PyObject *, PyObject *args)
 	return axis_tuple.release();
 }
 
+static PyObject *py_get_delta(PyObject *, PyObject *args)
+{
+	if (g_python.api.PyTuple_Size(args) != 0) {
+		set_python_error(g_python.api.PyExc_TypeError, "get_delta expects ()");
+		return NULL;
+	}
+
+	int64_t delta = 0;
+	if (!MOD_GetActiveDelta(&delta)) {
+		set_python_error(g_python.api.PyExc_RuntimeError, "get_delta failed");
+		return NULL;
+	}
+
+	if (delta >= 0) {
+		return g_python.api.PyLong_FromUnsignedLongLong(
+		        static_cast<unsigned long long>(delta));
+	}
+	if (delta < static_cast<int64_t>(LONG_MIN)) {
+		set_python_error(g_python.api.PyExc_OverflowError,
+		                 "negative delta is too small");
+		return NULL;
+	}
+
+	return g_python.api.PyLong_FromLong(static_cast<long>(delta));
+}
+
 static PyObject *py_read_u8(PyObject *, PyObject *args)
 {
 	if (g_python.api.PyTuple_Size(args) != 1) {
@@ -1076,6 +1117,154 @@ static PyObject *py_read_bytes(PyObject *, PyObject *args)
 	                         data.empty() ? NULL : data.data(),
 	                         data.size())) {
 		set_python_error(g_python.api.PyExc_RuntimeError, "read_bytes failed");
+		return NULL;
+	}
+
+	return g_python.api.PyBytes_FromStringAndSize(
+	        data.empty() ? "" : reinterpret_cast<const char *>(data.data()),
+	        static_cast<Py_ssize_t>(data.size()));
+}
+
+static PyObject *py_read_reloced_ptr(PyObject *, PyObject *args)
+{
+	if (g_python.api.PyTuple_Size(args) != 1) {
+		set_python_error(g_python.api.PyExc_TypeError,
+		                 "read_reloced_ptr expects (addr)");
+		return NULL;
+	}
+
+	unsigned long reloc_addr = 0;
+	if (!py_tuple_get_uint32_arg(args, 0, &reloc_addr))
+		return NULL;
+
+	uint32_t reloc_pointer = 0;
+	if (!MOD_ReadRelocedPointer(static_cast<uint32_t>(reloc_addr),
+	                            &reloc_pointer)) {
+		set_python_error(g_python.api.PyExc_RuntimeError,
+		                 "read_reloced_ptr failed");
+		return NULL;
+	}
+
+	return g_python.api.PyLong_FromUnsignedLong(
+	        static_cast<unsigned long>(reloc_pointer));
+}
+
+static PyObject *py_read_runtime_u8(PyObject *, PyObject *args)
+{
+	if (g_python.api.PyTuple_Size(args) != 1) {
+		set_python_error(g_python.api.PyExc_TypeError,
+		                 "read_runtime_u8 expects (addr)");
+		return NULL;
+	}
+
+	unsigned long linear_addr = 0;
+	if (!py_tuple_get_uint32_arg(args, 0, &linear_addr))
+		return NULL;
+
+	uint8_t value = 0;
+	if (!MOD_ReadRuntimeMemoryU8(static_cast<uint32_t>(linear_addr), &value)) {
+		set_python_error(g_python.api.PyExc_RuntimeError,
+		                 "read_runtime_u8 failed");
+		return NULL;
+	}
+
+	return g_python.api.PyLong_FromUnsignedLong(static_cast<unsigned long>(value));
+}
+
+static PyObject *py_read_runtime_u16(PyObject *, PyObject *args)
+{
+	if (g_python.api.PyTuple_Size(args) != 1) {
+		set_python_error(g_python.api.PyExc_TypeError,
+		                 "read_runtime_u16 expects (addr)");
+		return NULL;
+	}
+
+	unsigned long linear_addr = 0;
+	if (!py_tuple_get_uint32_arg(args, 0, &linear_addr))
+		return NULL;
+
+	uint16_t value = 0;
+	if (!MOD_ReadRuntimeMemoryU16(static_cast<uint32_t>(linear_addr), &value)) {
+		set_python_error(g_python.api.PyExc_RuntimeError,
+		                 "read_runtime_u16 failed");
+		return NULL;
+	}
+
+	return g_python.api.PyLong_FromUnsignedLong(static_cast<unsigned long>(value));
+}
+
+static PyObject *py_read_runtime_u32(PyObject *, PyObject *args)
+{
+	if (g_python.api.PyTuple_Size(args) != 1) {
+		set_python_error(g_python.api.PyExc_TypeError,
+		                 "read_runtime_u32 expects (addr)");
+		return NULL;
+	}
+
+	unsigned long linear_addr = 0;
+	if (!py_tuple_get_uint32_arg(args, 0, &linear_addr))
+		return NULL;
+
+	uint32_t value = 0;
+	if (!MOD_ReadRuntimeMemoryU32(static_cast<uint32_t>(linear_addr), &value)) {
+		set_python_error(g_python.api.PyExc_RuntimeError,
+		                 "read_runtime_u32 failed");
+		return NULL;
+	}
+
+	return g_python.api.PyLong_FromUnsignedLong(static_cast<unsigned long>(value));
+}
+
+static PyObject *py_read_runtime_i32(PyObject *, PyObject *args)
+{
+	if (g_python.api.PyTuple_Size(args) != 1) {
+		set_python_error(g_python.api.PyExc_TypeError,
+		                 "read_runtime_i32 expects (addr)");
+		return NULL;
+	}
+
+	unsigned long linear_addr = 0;
+	if (!py_tuple_get_uint32_arg(args, 0, &linear_addr))
+		return NULL;
+
+	int32_t value = 0;
+	if (!MOD_ReadRuntimeMemoryI32(static_cast<uint32_t>(linear_addr), &value)) {
+		set_python_error(g_python.api.PyExc_RuntimeError,
+		                 "read_runtime_i32 failed");
+		return NULL;
+	}
+
+	return g_python.api.PyLong_FromLong(static_cast<long>(value));
+}
+
+static PyObject *py_read_runtime_bytes(PyObject *, PyObject *args)
+{
+	if (g_python.api.PyTuple_Size(args) != 2) {
+		set_python_error(g_python.api.PyExc_TypeError,
+		                 "read_runtime_bytes expects (addr, size)");
+		return NULL;
+	}
+
+	unsigned long linear_addr = 0;
+	unsigned long size_value = 0;
+	if (!py_tuple_get_uint32_arg(args, 0, &linear_addr) ||
+	    !py_tuple_get_uint32_arg(args, 1, &size_value)) {
+		return NULL;
+	}
+
+	if (size_value > static_cast<unsigned long>(INT32_MAX)) {
+		set_python_error(g_python.api.PyExc_OverflowError,
+		                 "read_runtime_bytes size is too large");
+		return NULL;
+	}
+
+	const size_t size = static_cast<size_t>(size_value);
+	std::vector<uint8_t> data(size);
+	if (!MOD_ReadRuntimeMemoryBlock(static_cast<uint32_t>(linear_addr),
+	                                data.empty() ? NULL : data.data(),
+	                                data.size())) {
+		set_python_error(g_python.api.PyExc_RuntimeError,
+		                 "read_runtime_bytes failed");
 		return NULL;
 	}
 
@@ -1221,6 +1410,8 @@ static bool ensure_mod_helper_module(void)
 	        DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef get_modjoystick_axes_method = {
 	        "_get_modjoystick_axes", py_get_modjoystick_axes, DOSBOX_PY_METH_VARARGS, NULL};
+	static PyMethodDef get_delta_method = {
+	        "_get_delta", py_get_delta, DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef read_u8_method = {
 	        "_read_u8", py_read_u8, DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef read_u16_method = {
@@ -1231,6 +1422,18 @@ static bool ensure_mod_helper_module(void)
 	        "_read_i32", py_read_i32, DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef read_bytes_method = {
 	        "_read_bytes", py_read_bytes, DOSBOX_PY_METH_VARARGS, NULL};
+	static PyMethodDef read_reloced_ptr_method = {
+	        "_read_reloced_ptr", py_read_reloced_ptr, DOSBOX_PY_METH_VARARGS, NULL};
+	static PyMethodDef read_runtime_u8_method = {
+	        "_read_runtime_u8", py_read_runtime_u8, DOSBOX_PY_METH_VARARGS, NULL};
+	static PyMethodDef read_runtime_u16_method = {
+	        "_read_runtime_u16", py_read_runtime_u16, DOSBOX_PY_METH_VARARGS, NULL};
+	static PyMethodDef read_runtime_u32_method = {
+	        "_read_runtime_u32", py_read_runtime_u32, DOSBOX_PY_METH_VARARGS, NULL};
+	static PyMethodDef read_runtime_i32_method = {
+	        "_read_runtime_i32", py_read_runtime_i32, DOSBOX_PY_METH_VARARGS, NULL};
+	static PyMethodDef read_runtime_bytes_method = {
+	        "_read_runtime_bytes", py_read_runtime_bytes, DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef write_u8_method = {
 	        "_write_u8", py_write_u8, DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef write_u16_method = {
@@ -1247,11 +1450,25 @@ static bool ensure_mod_helper_module(void)
 	                            &register_render_callback_method) ||
 	    !attach_module_function(mod_module.get(), "_get_modjoystick_axes",
 	                            &get_modjoystick_axes_method) ||
+	    !attach_module_function(mod_module.get(), "_get_delta",
+	                            &get_delta_method) ||
 	    !attach_module_function(mod_module.get(), "_read_u8", &read_u8_method) ||
 	    !attach_module_function(mod_module.get(), "_read_u16", &read_u16_method) ||
 	    !attach_module_function(mod_module.get(), "_read_u32", &read_u32_method) ||
 	    !attach_module_function(mod_module.get(), "_read_i32", &read_i32_method) ||
 	    !attach_module_function(mod_module.get(), "_read_bytes", &read_bytes_method) ||
+	    !attach_module_function(mod_module.get(), "_read_reloced_ptr",
+	                            &read_reloced_ptr_method) ||
+	    !attach_module_function(mod_module.get(), "_read_runtime_u8",
+	                            &read_runtime_u8_method) ||
+	    !attach_module_function(mod_module.get(), "_read_runtime_u16",
+	                            &read_runtime_u16_method) ||
+	    !attach_module_function(mod_module.get(), "_read_runtime_u32",
+	                            &read_runtime_u32_method) ||
+	    !attach_module_function(mod_module.get(), "_read_runtime_i32",
+	                            &read_runtime_i32_method) ||
+	    !attach_module_function(mod_module.get(), "_read_runtime_bytes",
+	                            &read_runtime_bytes_method) ||
 	    !attach_module_function(mod_module.get(), "_write_u8", &write_u8_method) ||
 	    !attach_module_function(mod_module.get(), "_write_u16", &write_u16_method) ||
 	    !attach_module_function(mod_module.get(), "_write_u32", &write_u32_method) ||

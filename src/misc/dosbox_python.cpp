@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <climits>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -75,6 +76,7 @@ struct PythonAPI {
 	PyObject *(*PyFloat_FromDouble)(double) = NULL;
 	PyObject *(*PyTuple_New)(Py_ssize_t) = NULL;
 	int (*PyTuple_SetItem)(PyObject *, Py_ssize_t, PyObject *) = NULL;
+	PyObject *(*PyBytes_FromStringAndSize)(const char *, Py_ssize_t) = NULL;
 	void (*Py_IncRef)(PyObject *) = NULL;
 	void (*Py_DecRef)(PyObject *) = NULL;
 	void *(*PyErr_Occurred)(void) = NULL;
@@ -103,7 +105,7 @@ struct PythonAPI {
 		       PyLong_FromUnsignedLong &&
 		       PyLong_FromUnsignedLongLong && PyLong_FromLong &&
 		       PyFloat_FromDouble && PyTuple_New && PyTuple_SetItem &&
-		       Py_IncRef && Py_DecRef &&
+		       PyBytes_FromStringAndSize && Py_IncRef && Py_DecRef &&
 		       PyErr_Occurred && PyErr_Clear && PyErr_Print &&
 		       PyErr_SetString && Py_FinalizeEx &&
 		       PyExc_RuntimeError && PyExc_TypeError &&
@@ -117,6 +119,7 @@ struct PythonHookRegistration {
 	uint32_t reloc_eip = 0;
 	std::string kind = {};
 	std::string description = {};
+	bool render_aware = false;
 	bool enabled = true;
 	PyObject *callback = NULL;
 };
@@ -365,6 +368,8 @@ static std::string build_mod_helper_bootstrap(void)
 		<< "        return mod._read_u32(addr)\n"
 		<< "    def read_i32(self, addr):\n"
 		<< "        return mod._read_i32(addr)\n"
+		<< "    def read_bytes(self, addr, size):\n"
+		<< "        return mod._read_bytes(addr, size)\n"
 		<< "    def write_u8(self, addr, value):\n"
 		<< "        return mod._write_u8(addr, value)\n"
 		<< "    def write_u16(self, addr, value):\n"
@@ -407,6 +412,12 @@ static std::string build_mod_helper_bootstrap(void)
 		<< "        return mod._register_hook(exe_name, eip, kind, func)\n"
 		<< "    return decorator\n"
 		<< "mod.modhook = modhook\n";
+	script
+		<< "def modrenderhook(exe_name, eip, kind):\n"
+		<< "    def decorator(func):\n"
+		<< "        return mod._register_render_hook(exe_name, eip, kind, func)\n"
+		<< "    return decorator\n"
+		<< "mod.modrenderhook = modrenderhook\n";
 	script
 		<< "def modrender(kind):\n"
 		<< "    def decorator(func):\n"
@@ -776,11 +787,14 @@ static bool py_tuple_get_int32_arg(PyObject *args,
 	return true;
 }
 
-static PyObject *py_register_hook(PyObject *, PyObject *args)
+static PyObject *py_register_hook_common(PyObject *args,
+                                         bool render_aware,
+                                         const char *api_name)
 {
 	if (g_python.api.PyTuple_Size(args) != 4) {
-		set_python_error(g_python.api.PyExc_TypeError,
-		                 "_register_hook expects (exe_name, eip, kind, func)");
+		const std::string message =
+		        std::string(api_name) + " expects (exe_name, eip, kind, func)";
+		set_python_error(g_python.api.PyExc_TypeError, message.c_str());
 		return NULL;
 	}
 
@@ -833,15 +847,28 @@ static PyObject *py_register_hook(PyObject *, PyObject *args)
 	hook.description = get_callable_description(callable_obj,
 	                                            hook.exe_name_upper,
 	                                            hook.reloc_eip);
+	hook.render_aware = render_aware;
 	hook.enabled = true;
 	hook.callback = callable_obj;
 	g_python.api.Py_IncRef(hook.callback);
 	g_python.hooks.push_back(hook);
 
-	LOG_MSG("MOD: registered hook %s", hook.description.c_str());
+	LOG_MSG("MOD: registered %s%s",
+	        render_aware ? "render hook " : "hook ",
+	        hook.description.c_str());
 
 	g_python.api.Py_IncRef(callable_obj);
 	return callable_obj;
+}
+
+static PyObject *py_register_hook(PyObject *, PyObject *args)
+{
+	return py_register_hook_common(args, false, "_register_hook");
+}
+
+static PyObject *py_register_render_hook(PyObject *, PyObject *args)
+{
+	return py_register_hook_common(args, true, "_register_render_hook");
 }
 
 static PyObject *py_register_render_callback(PyObject *, PyObject *args)
@@ -1022,6 +1049,41 @@ static PyObject *py_read_i32(PyObject *, PyObject *args)
 	return g_python.api.PyLong_FromLong(static_cast<long>(value));
 }
 
+static PyObject *py_read_bytes(PyObject *, PyObject *args)
+{
+	if (g_python.api.PyTuple_Size(args) != 2) {
+		set_python_error(g_python.api.PyExc_TypeError,
+		                 "read_bytes expects (addr, size)");
+		return NULL;
+	}
+
+	unsigned long reloc_addr = 0;
+	unsigned long size_value = 0;
+	if (!py_tuple_get_uint32_arg(args, 0, &reloc_addr) ||
+	    !py_tuple_get_uint32_arg(args, 1, &size_value)) {
+		return NULL;
+	}
+
+	if (size_value > static_cast<unsigned long>(INT32_MAX)) {
+		set_python_error(g_python.api.PyExc_OverflowError,
+		                 "read_bytes size is too large");
+		return NULL;
+	}
+
+	const size_t size = static_cast<size_t>(size_value);
+	std::vector<uint8_t> data(size);
+	if (!MOD_ReadMemoryBlock(static_cast<uint32_t>(reloc_addr),
+	                         data.empty() ? NULL : data.data(),
+	                         data.size())) {
+		set_python_error(g_python.api.PyExc_RuntimeError, "read_bytes failed");
+		return NULL;
+	}
+
+	return g_python.api.PyBytes_FromStringAndSize(
+	        data.empty() ? "" : reinterpret_cast<const char *>(data.data()),
+	        static_cast<Py_ssize_t>(data.size()));
+}
+
 static PyObject *py_write_u8(PyObject *, PyObject *args)
 {
 	if (g_python.api.PyTuple_Size(args) != 2) {
@@ -1152,6 +1214,8 @@ static bool ensure_mod_helper_module(void)
 
 	static PyMethodDef register_hook_method = {
 	        "_register_hook", py_register_hook, DOSBOX_PY_METH_VARARGS, NULL};
+	static PyMethodDef register_render_hook_method = {
+	        "_register_render_hook", py_register_render_hook, DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef register_render_callback_method = {
 	        "_register_render_callback", py_register_render_callback,
 	        DOSBOX_PY_METH_VARARGS, NULL};
@@ -1165,6 +1229,8 @@ static bool ensure_mod_helper_module(void)
 	        "_read_u32", py_read_u32, DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef read_i32_method = {
 	        "_read_i32", py_read_i32, DOSBOX_PY_METH_VARARGS, NULL};
+	static PyMethodDef read_bytes_method = {
+	        "_read_bytes", py_read_bytes, DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef write_u8_method = {
 	        "_write_u8", py_write_u8, DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef write_u16_method = {
@@ -1175,6 +1241,8 @@ static bool ensure_mod_helper_module(void)
 	        "_write_i32", py_write_i32, DOSBOX_PY_METH_VARARGS, NULL};
 
 	if (!attach_module_function(mod_module.get(), "_register_hook", &register_hook_method) ||
+	    !attach_module_function(mod_module.get(), "_register_render_hook",
+	                            &register_render_hook_method) ||
 	    !attach_module_function(mod_module.get(), "_register_render_callback",
 	                            &register_render_callback_method) ||
 	    !attach_module_function(mod_module.get(), "_get_modjoystick_axes",
@@ -1183,6 +1251,7 @@ static bool ensure_mod_helper_module(void)
 	    !attach_module_function(mod_module.get(), "_read_u16", &read_u16_method) ||
 	    !attach_module_function(mod_module.get(), "_read_u32", &read_u32_method) ||
 	    !attach_module_function(mod_module.get(), "_read_i32", &read_i32_method) ||
+	    !attach_module_function(mod_module.get(), "_read_bytes", &read_bytes_method) ||
 	    !attach_module_function(mod_module.get(), "_write_u8", &write_u8_method) ||
 	    !attach_module_function(mod_module.get(), "_write_u16", &write_u16_method) ||
 	    !attach_module_function(mod_module.get(), "_write_u32", &write_u32_method) ||
@@ -1515,6 +1584,9 @@ static bool load_python_api(const std::string &dll_path)
 	g_python.api.PyTuple_SetItem =
 	        reinterpret_cast<int (*)(PyObject *, Py_ssize_t, PyObject *)>(
 	                resolve_symbol(g_python.api.dll, "PyTuple_SetItem"));
+	g_python.api.PyBytes_FromStringAndSize =
+	        reinterpret_cast<PyObject *(*)(const char *, Py_ssize_t)>(
+	                resolve_symbol(g_python.api.dll, "PyBytes_FromStringAndSize"));
 	g_python.api.Py_IncRef =
 	        reinterpret_cast<void (*)(PyObject *)>(
 	                resolve_symbol(g_python.api.dll, "Py_IncRef"));
@@ -1736,6 +1808,7 @@ bool DOSBoxPython_LoadMods(std::vector<ModPythonHookRegistration> *hooks)
 		hook.reloc_eip = registered.reloc_eip;
 		hook.kind = registered.kind;
 		hook.description = registered.description;
+		hook.render_aware = registered.render_aware;
 		hooks->push_back(hook);
 	}
 
@@ -1768,6 +1841,8 @@ void DOSBoxPython_ResetModRuntimeState(void)
 
 	if (!refresh_modstate_reference())
 		return;
+
+	g_python.initialized_context_generation = 0;
 
 	for (size_t i = 0; i < g_python.hooks.size(); ++i)
 		g_python.hooks[i].enabled = true;
@@ -1805,8 +1880,25 @@ bool DOSBoxPython_InvokeHook(size_t hook_id)
 	if (!hook.enabled || !hook.callback)
 		return false;
 
-	PyOwnedRef result(g_python.api.PyObject_CallFunctionObjArgs(
-	        hook.callback, g_python.modstate, g_python.gamemem, NULL));
+	if (hook.render_aware) {
+		if (!g_python.modgl)
+			return false;
+		if (!update_modgl_state_object(g_python.modgl, g_python.gl_state))
+			return false;
+	}
+
+	PyOwnedRef result(hook.render_aware
+	                         ? g_python.api.PyObject_CallFunctionObjArgs(
+	                                   hook.callback,
+	                                   g_python.modstate,
+	                                   g_python.gamemem,
+	                                   g_python.modgl,
+	                                   NULL)
+	                         : g_python.api.PyObject_CallFunctionObjArgs(
+	                                   hook.callback,
+	                                   g_python.modstate,
+	                                   g_python.gamemem,
+	                                   NULL));
 	if (!result) {
 		hook.enabled = false;
 		log_python_exception(("disabling hook after exception: " + hook.description).c_str());

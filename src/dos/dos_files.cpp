@@ -906,6 +906,7 @@ bool DOS_CloseFile(uint16_t entry, bool fcb, uint8_t * refcnt) {
 		Files[handle]=nullptr;
 	}
 	if (refcnt!=NULL) *refcnt=static_cast<uint8_t>(refs+1);
+	MOD_OnCloseFile(entry);
 	return true;
 }
 

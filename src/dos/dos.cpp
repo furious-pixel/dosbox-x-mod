@@ -1999,7 +1999,6 @@ static Bitu DOS_21Handler(void) {
             uint8_t drive = (handle != 0xff && Files[handle]) ? Files[handle]->GetDrive() : DOS_DRIVES;
             unmask_irq0 |= disk_io_unmask_irq0;
             if (DOS_CloseFile(reg_bx, false, &reg_al)) {
-                MOD_OnCloseFile(reg_bx);
 #if defined(USE_TTF)
                 if (ttf.inUse&&reg_bx == WPvga512CHMhandle)
                     WPvga512CHMhandle = -1;

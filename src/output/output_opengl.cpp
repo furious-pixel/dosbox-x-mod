@@ -16,6 +16,7 @@ extern "C" {
 #include "dosbox_python.h"
 #include "logging.h"
 #include "menudef.h"
+#include "mod.h"
 #include "../ints/int10.h"
 #include <output/output_opengl.h>
 #include <output/output_tools.h>
@@ -1395,8 +1396,10 @@ static void FinishOpenGLPresentation(void)
     const OpenGLPresentationLayout layout = BuildOpenGLPresentationLayout();
     ModOpenGLState mod_state = BuildModOpenGLState(layout);
     mod_state.present_count = ++sdl_opengl.mod_present_count;
+    const bool mod_render_active = MOD_RenderActive();
 
-    DOSBoxPython_InvokeOpenGLInitCallback(mod_state);
+    if (mod_render_active)
+        DOSBoxPython_InvokeOpenGLInitCallback(mod_state);
 
     if (mod_render_view_mode != MOD_RENDER_VIEW_GAME_ONLY)
         ClearOpenGLBackbuffer();
@@ -1404,7 +1407,7 @@ static void FinishOpenGLPresentation(void)
     CheckManagement();
     DrawDOSBoxTextureToViewport(layout, layout.game);
 
-    if (mod_render_view_mode != MOD_RENDER_VIEW_GAME_ONLY)
+    if (mod_render_view_mode != MOD_RENDER_VIEW_GAME_ONLY && mod_render_active)
         DOSBoxPython_InvokeOpenGLCompositorCallback(mod_state);
 
     RestoreOpenGLPresentationState(layout);

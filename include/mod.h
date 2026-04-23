@@ -60,19 +60,24 @@ struct ModPythonHookRegistration {
 	uint32_t reloc_eip = 0;
 	std::string kind = {};
 	std::string description = {};
+	bool render_aware = false;
 };
 
 bool MOD_Init(const Config& config);
 void MOD_Shutdown(void);
 void MOD_OnOpenFile(const char *name, unsigned short handle);
 void MOD_OnCloseFile(unsigned short handle);
+void MOD_OnExecutableStarted(const char *name, uint16_t pspseg);
+void MOD_OnTerminatePSP(uint16_t pspseg, bool tsr, uint8_t exitcode);
 bool MOD_FastEnabled(void);
+bool MOD_RenderActive(void);
 void MOD_OnCallsite(uint32_t linear_eip);
 
 bool MOD_ReadMemoryU8(uint32_t reloc_addr, uint8_t *value);
 bool MOD_ReadMemoryU16(uint32_t reloc_addr, uint16_t *value);
 bool MOD_ReadMemoryU32(uint32_t reloc_addr, uint32_t *value);
 bool MOD_ReadMemoryI32(uint32_t reloc_addr, int32_t *value);
+bool MOD_ReadMemoryBlock(uint32_t reloc_addr, uint8_t *data, size_t size);
 bool MOD_WriteMemoryU8(uint32_t reloc_addr, uint8_t value);
 bool MOD_WriteMemoryU16(uint32_t reloc_addr, uint16_t value);
 bool MOD_WriteMemoryU32(uint32_t reloc_addr, uint32_t value);

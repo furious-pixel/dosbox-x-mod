@@ -48,6 +48,10 @@ struct ModExecutableRuntime {
 	Uint64 frame_counter_start = 0;
 	Uint64 frame_counter_last = 0;
 	ModFrameState frame_state = {};
+	bool process_active = false;
+	uint16_t process_psp = 0;
+	bool process_start_pending = false;
+	uint16_t process_start_psp = 0;
 	std::vector<ModHookRuntime> hooks = {};
 	std::unordered_map<uint32_t, std::vector<size_t> > hooks_by_linear = {};
 };
@@ -199,6 +203,8 @@ static bool get_active_runtime(ModExecutableRuntime **runtime)
 
 	ModExecutableRuntime &active = g_mod.executables[g_mod.active_executable_index];
 	if (!active.delta_ready)
+		return false;
+	if (!active.process_active)
 		return false;
 
 	*runtime = &active;
@@ -360,6 +366,25 @@ static void log_delta_change(const ModExecutableRuntime &runtime,
 	}
 }
 
+static void activate_runtime_process(ModExecutableRuntime &runtime,
+                                     size_t runtime_index,
+                                     uint16_t pspseg)
+{
+	runtime.process_start_pending = false;
+	runtime.process_start_psp = 0;
+	runtime.process_active = true;
+	runtime.process_psp = pspseg;
+	g_mod.active_executable_index = runtime_index;
+	g_mod.active_executable_valid = true;
+	reset_runtime_frame_state(runtime);
+	update_fast_enabled();
+	refresh_dynamic_cpu_cache();
+
+	LOG_MSG("MOD: %s active on PSP 0x%04X",
+	        runtime.config.name.c_str(),
+	        static_cast<unsigned int>(pspseg));
+}
+
 static void run_pending_scan(ModExecutableRuntime &runtime, size_t runtime_index)
 {
 	uint32_t found_address = 0;
@@ -369,7 +394,10 @@ static void run_pending_scan(ModExecutableRuntime &runtime, size_t runtime_index
 		if (g_mod.active_executable_valid &&
 		    g_mod.active_executable_index == runtime_index) {
 			g_mod.active_executable_valid = false;
+			runtime.process_active = false;
+			runtime.process_psp = 0;
 			update_fast_enabled();
+			refresh_dynamic_cpu_cache();
 			DOSBoxPython_ResetModStateTiming();
 		}
 		return;
@@ -377,11 +405,15 @@ static void run_pending_scan(ModExecutableRuntime &runtime, size_t runtime_index
 
 	const int64_t previous_delta = runtime.delta;
 	const bool had_previous_delta = runtime.delta_ready;
+	const bool had_pending_start = runtime.process_start_pending;
+	const uint16_t pending_start_psp = runtime.process_start_psp;
 	const int64_t new_delta = static_cast<int64_t>(found_address) -
 	                          static_cast<int64_t>(runtime.config.landmark_reloc);
 
 	runtime.delta = new_delta;
 	runtime.delta_ready = true;
+	runtime.process_active = false;
+	runtime.process_psp = 0;
 	rebuild_runtime_hooks(runtime);
 	reset_runtime_frame_state(runtime);
 	refresh_dynamic_cpu_cache();
@@ -402,6 +434,9 @@ static void run_pending_scan(ModExecutableRuntime &runtime, size_t runtime_index
 
 	if (had_previous_delta && previous_delta != new_delta)
 		log_delta_change(runtime, previous_delta, new_delta);
+
+	if (had_pending_start)
+		activate_runtime_process(runtime, runtime_index, pending_start_psp);
 }
 
 static bool update_frame_timing(ModExecutableRuntime &runtime)
@@ -497,6 +532,23 @@ static void attach_python_hooks(const std::vector<ModPythonHookRegistration> &ho
 	}
 }
 
+static bool find_executable_runtime_by_name(const char *name, size_t *runtime_index)
+{
+	if (!name || !runtime_index)
+		return false;
+
+	const std::string basename_upper = uppercase_ascii_copy(basename_of(name));
+	for (size_t i = 0; i < g_mod.executables.size(); ++i) {
+		if (basename_upper != g_mod.executables[i].config.name_upper)
+			continue;
+
+		*runtime_index = i;
+		return true;
+	}
+
+	return false;
+}
+
 } // namespace
 
 bool MOD_Init(const Config& config)
@@ -543,25 +595,19 @@ void MOD_OnOpenFile(const char *name, unsigned short handle)
 	if (!g_mod.initialized || !name || g_mod.executables.empty())
 		return;
 
-	const std::string basename_upper = uppercase_ascii_copy(basename_of(name));
-	for (size_t i = 0; i < g_mod.executables.size(); ++i) {
-		ModExecutableRuntime &runtime = g_mod.executables[i];
-		if (basename_upper != runtime.config.name_upper)
-			continue;
-
-		g_mod.pending_scan = true;
-		g_mod.pending_scan_handle = handle;
-		g_mod.pending_scan_index = i;
-		if (g_mod.active_executable_valid &&
-		    g_mod.active_executable_index == i) {
-			g_mod.active_executable_valid = false;
-			update_fast_enabled();
-			DOSBoxPython_ResetModRuntimeState();
-		}
-		LOG_MSG("MOD: armed %s on handle %u",
-		        runtime.config.name.c_str(), static_cast<unsigned int>(handle));
+	size_t runtime_index = 0;
+	if (!find_executable_runtime_by_name(name, &runtime_index))
 		return;
-	}
+
+	ModExecutableRuntime &runtime = g_mod.executables[runtime_index];
+	if (runtime.process_active)
+		return;
+
+	g_mod.pending_scan = true;
+	g_mod.pending_scan_handle = handle;
+	g_mod.pending_scan_index = runtime_index;
+	LOG_MSG("MOD: armed %s on handle %u",
+	        runtime.config.name.c_str(), static_cast<unsigned int>(handle));
 }
 
 void MOD_OnCloseFile(unsigned short handle)
@@ -582,9 +628,91 @@ void MOD_OnCloseFile(unsigned short handle)
 	                g_mod.pending_scan_index);
 }
 
+void MOD_OnExecutableStarted(const char *name, uint16_t pspseg)
+{
+	if (!g_mod.initialized || !name || g_mod.executables.empty())
+		return;
+
+	size_t runtime_index = 0;
+	if (!find_executable_runtime_by_name(name, &runtime_index))
+		return;
+
+	ModExecutableRuntime &runtime = g_mod.executables[runtime_index];
+	if (!runtime.delta_ready) {
+		runtime.process_start_pending = true;
+		runtime.process_start_psp = pspseg;
+		g_mod.active_executable_index = runtime_index;
+		g_mod.active_executable_valid = true;
+		LOG_MSG("MOD: %s start pending landmark scan on PSP 0x%04X",
+		        runtime.config.name.c_str(),
+		        static_cast<unsigned int>(pspseg));
+		return;
+	}
+
+	activate_runtime_process(runtime, runtime_index, pspseg);
+}
+
+void MOD_OnTerminatePSP(uint16_t pspseg, bool tsr, uint8_t exitcode)
+{
+	if (!g_mod.initialized)
+		return;
+
+	if (g_mod.active_executable_valid &&
+	    g_mod.active_executable_index < g_mod.executables.size()) {
+		ModExecutableRuntime &runtime =
+		        g_mod.executables[g_mod.active_executable_index];
+		if (runtime.process_active && runtime.process_psp == pspseg) {
+			runtime.process_active = false;
+			runtime.process_psp = 0;
+			runtime.process_start_pending = false;
+			runtime.process_start_psp = 0;
+			g_mod.active_executable_valid = false;
+			reset_runtime_frame_state(runtime);
+			update_fast_enabled();
+			refresh_dynamic_cpu_cache();
+			DOSBoxPython_ResetModRuntimeState();
+
+			LOG_MSG("MOD: %s exited PSP 0x%04X with code %u%s",
+			        runtime.config.name.c_str(),
+			        static_cast<unsigned int>(pspseg),
+			        static_cast<unsigned int>(exitcode),
+			        tsr ? " as TSR" : "");
+			return;
+		}
+	}
+
+	for (size_t i = 0; i < g_mod.executables.size(); ++i) {
+		ModExecutableRuntime &runtime = g_mod.executables[i];
+		if (!runtime.process_start_pending ||
+		    runtime.process_start_psp != pspseg) {
+			continue;
+		}
+
+		runtime.process_start_pending = false;
+		runtime.process_start_psp = 0;
+		if (g_mod.active_executable_valid &&
+		    g_mod.active_executable_index == i) {
+			g_mod.active_executable_valid = false;
+			update_fast_enabled();
+			refresh_dynamic_cpu_cache();
+		}
+
+		LOG_MSG("MOD: %s exited PSP 0x%04X before landmark scan completed",
+		        runtime.config.name.c_str(),
+		        static_cast<unsigned int>(pspseg));
+		return;
+	}
+}
+
 bool MOD_FastEnabled(void)
 {
 	return g_mod.fast_enabled;
+}
+
+bool MOD_RenderActive(void)
+{
+	ModExecutableRuntime *runtime = NULL;
+	return get_active_runtime(&runtime);
 }
 
 void MOD_OnCallsite(uint32_t linear_eip)
@@ -644,6 +772,27 @@ bool MOD_ReadMemoryI32(uint32_t reloc_addr, int32_t *value)
 		return false;
 
 	*value = static_cast<int32_t>(raw);
+	return true;
+}
+
+bool MOD_ReadMemoryBlock(uint32_t reloc_addr, uint8_t *data, size_t size)
+{
+	uint32_t linear_addr = 0;
+	if ((!data && size != 0) || !translate_reloc_address(reloc_addr, &linear_addr))
+		return false;
+	if (size == 0)
+		return true;
+	if (static_cast<uint64_t>(linear_addr) + static_cast<uint64_t>(size) - 1u >
+	    0xffffffffull)
+		return false;
+
+	for (size_t i = 0; i < size; ++i) {
+		if (mem_readb_checked(linear_addr + static_cast<uint32_t>(i),
+		                      &data[i])) {
+			return false;
+		}
+	}
+
 	return true;
 }
 

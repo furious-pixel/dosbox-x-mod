@@ -30,6 +30,7 @@
 #include "cpu.h"
 #include "menu.h"
 #include "crc32.h"
+#include "mod.h"
 
 extern bool xms_init;
 extern bool a20_off_if_loading_low;
@@ -104,6 +105,7 @@ void DOS_Terminate(uint16_t pspseg,bool tsr,uint8_t exitcode) {
 	
 	DOS_PSP curpsp(pspseg);
 	if (pspseg==curpsp.GetParent()) return;
+	MOD_OnTerminatePSP(pspseg, tsr, exitcode);
 	/* Free Files owned by process */
 	if (!tsr) curpsp.CloseFiles();
 	
@@ -290,6 +292,7 @@ bool DOS_Execute(const char* name, PhysPt block_pt, uint8_t flags) {
 	DOS_ParamBlock block(block_pt);
 	uint32_t checksum = 0;
 	uint32_t checksum_bytes = 0;
+	const char *execute_name = name;
 
 	block.LoadData();
 	//Remove the loadhigh flag for the moment!
@@ -605,6 +608,7 @@ bool DOS_Execute(const char* name, PhysPt block_pt, uint8_t flags) {
 		/* Started from debug.com, then set breakpoint at start */
 		DEBUG_CheckExecuteBreakpoint(RealSeg(csip),RealOff(csip));
 #endif
+		MOD_OnExecutableStarted(execute_name, pspseg);
 		return true;
 	}
 	return false;

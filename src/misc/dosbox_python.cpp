@@ -9,8 +9,10 @@
 
 #include "control.h"
 #include "logging.h"
+#include "mem.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
@@ -49,12 +51,28 @@ struct PythonAPI {
 };
 
 struct PythonRuntime {
+	struct ExecutableConfig {
+		std::string name = {};
+		std::string name_upper = {};
+		std::string landmark_string = {};
+		uint32_t landmark_reloc = 0;
+		bool has_scan_range = false;
+		uint32_t scan_start = 0;
+		uint32_t scan_end = 0;
+		bool delta_ready = false;
+		int64_t delta = 0;
+	};
+
 	PythonAPI api = {};
 	bool initialized = false;
 	std::string working_dir = {};
 	std::string mods_dir = {};
 	std::string venv_dir = {};
 	std::string python_dll = {};
+	std::vector<ExecutableConfig> executable_configs = {};
+	bool pending_scan = false;
+	uint16_t pending_scan_handle = 0;
+	size_t pending_scan_index = 0;
 };
 
 PythonRuntime g_python = {};
@@ -88,6 +106,14 @@ static std::string dirname_of(const std::string &path)
 	if (pos == std::string::npos)
 		return {};
 	return path.substr(0, pos);
+}
+
+static std::string basename_of(const std::string &path)
+{
+	const size_t pos = path.find_last_of("/\\");
+	if (pos == std::string::npos)
+		return path;
+	return path.substr(pos + 1);
 }
 
 static std::string join_path(const std::string &lhs, const std::string &rhs)
@@ -148,6 +174,14 @@ static std::string read_pyvenv_home(const std::string &pyvenv_cfg_path)
 static std::string read_pyvenv_version_info(const std::string &pyvenv_cfg_path)
 {
 	return read_pyvenv_value(pyvenv_cfg_path, "version_info");
+}
+
+static std::string uppercase_ascii_copy(std::string value)
+{
+	std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+		return static_cast<char>(std::toupper(ch));
+	});
+	return value;
 }
 
 static std::string versioned_python_dll_name(const std::string &version_info)
@@ -216,12 +250,483 @@ static std::string build_python_bootstrap(const std::string &mods_dir)
 		<< "    for mod_path in sorted(mods_dir.glob('*.py')):\n"
 		<< "        if mod_path.name.startswith('_'):\n"
 		<< "            continue\n"
+		<< "        if mod_path.name.lower() == 'mod_init.py':\n"
+		<< "            continue\n"
 		<< "        print(f'PYTHON: loading mod {mod_path.name}', flush=True)\n"
 		<< "        runpy.run_path(str(mod_path), run_name=f'dosbox_mod_{mod_path.stem}')\n"
 		<< "else:\n"
 		<< "    print(f'PYTHON: mods directory not found: {mods_dir}', flush=True)\n"
 		<< "sys.stdout.flush()\n";
 	return script.str();
+}
+
+static std::string strip_python_comments(const std::string &text)
+{
+	std::string result;
+	result.reserve(text.size());
+
+	bool in_string = false;
+	char quote = '\0';
+	bool escaped = false;
+
+	for (size_t i = 0; i < text.size(); ++i) {
+		const char ch = text[i];
+		if (in_string) {
+			result.push_back(ch);
+			if (escaped) {
+				escaped = false;
+			} else if (ch == '\\') {
+				escaped = true;
+			} else if (ch == quote) {
+				in_string = false;
+			}
+			continue;
+		}
+
+		if (ch == '\'' || ch == '"') {
+			in_string = true;
+			quote = ch;
+			escaped = false;
+			result.push_back(ch);
+			continue;
+		}
+
+		if (ch == '#') {
+			while (i < text.size() && text[i] != '\n')
+				++i;
+			if (i < text.size())
+				result.push_back(text[i]);
+			continue;
+		}
+
+		result.push_back(ch);
+	}
+
+	return result;
+}
+
+static size_t skip_whitespace(const std::string &text, size_t pos)
+{
+	while (pos < text.size() &&
+	       std::isspace(static_cast<unsigned char>(text[pos])) != 0) {
+		++pos;
+	}
+	return pos;
+}
+
+static bool parse_python_string(const std::string &text,
+                                size_t start,
+                                size_t *next_pos,
+                                std::string *value)
+{
+	if (start >= text.size() || (text[start] != '\'' && text[start] != '"'))
+		return false;
+
+	const char quote = text[start];
+	std::string result;
+	bool escaped = false;
+	size_t pos = start + 1;
+
+	while (pos < text.size()) {
+		const char ch = text[pos++];
+		if (escaped) {
+			switch (ch) {
+			case 'n': result.push_back('\n'); break;
+			case 'r': result.push_back('\r'); break;
+			case 't': result.push_back('\t'); break;
+			default: result.push_back(ch); break;
+			}
+			escaped = false;
+			continue;
+		}
+
+		if (ch == '\\') {
+			escaped = true;
+			continue;
+		}
+
+		if (ch == quote) {
+			if (next_pos)
+				*next_pos = pos;
+			if (value)
+				*value = result;
+			return true;
+		}
+
+		result.push_back(ch);
+	}
+
+	return false;
+}
+
+static bool find_key_value_start(const std::string &text,
+                                 const std::string &key,
+                                 size_t start,
+                                 size_t *value_start)
+{
+	size_t pos = start;
+	while (pos < text.size()) {
+		if (text[pos] != '\'' && text[pos] != '"') {
+			++pos;
+			continue;
+		}
+
+		size_t next = pos;
+		std::string parsed_key;
+		if (!parse_python_string(text, pos, &next, &parsed_key))
+			return false;
+
+		pos = next;
+		const size_t colon = skip_whitespace(text, pos);
+		if (parsed_key == key && colon < text.size() && text[colon] == ':') {
+			*value_start = skip_whitespace(text, colon + 1);
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static bool extract_bracketed_block(const std::string &text,
+                                    size_t start,
+                                    char open_char,
+                                    char close_char,
+                                    std::string *block)
+{
+	if (start >= text.size() || text[start] != open_char)
+		return false;
+
+	size_t depth = 0;
+	bool in_string = false;
+	char quote = '\0';
+	bool escaped = false;
+
+	for (size_t pos = start; pos < text.size(); ++pos) {
+		const char ch = text[pos];
+		if (in_string) {
+			if (escaped) {
+				escaped = false;
+			} else if (ch == '\\') {
+				escaped = true;
+			} else if (ch == quote) {
+				in_string = false;
+			}
+			continue;
+		}
+
+		if (ch == '\'' || ch == '"') {
+			in_string = true;
+			quote = ch;
+			escaped = false;
+			continue;
+		}
+
+		if (ch == open_char) {
+			++depth;
+			continue;
+		}
+
+		if (ch == close_char) {
+			if (depth == 0)
+				return false;
+			--depth;
+			if (depth == 0) {
+				*block = text.substr(start, pos - start + 1);
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
+static bool extract_named_block(const std::string &text,
+                                const std::string &key,
+                                char open_char,
+                                char close_char,
+                                std::string *block)
+{
+	size_t value_start = 0;
+	if (!find_key_value_start(text, key, 0, &value_start))
+		return false;
+	return extract_bracketed_block(text, value_start, open_char, close_char, block);
+}
+
+static bool extract_string_field(const std::string &text,
+                                 const std::string &key,
+                                 std::string *value)
+{
+	size_t value_start = 0;
+	if (!find_key_value_start(text, key, 0, &value_start))
+		return false;
+	return parse_python_string(text, value_start, NULL, value);
+}
+
+static bool extract_uint32_field(const std::string &text,
+                                 const std::string &key,
+                                 uint32_t *value)
+{
+	size_t value_start = 0;
+	if (!find_key_value_start(text, key, 0, &value_start))
+		return false;
+
+	size_t end = value_start;
+	if (end < text.size() && (text[end] == '+' || text[end] == '-'))
+		++end;
+
+	while (end < text.size()) {
+		const char ch = text[end];
+		const bool hex_digit = (ch >= '0' && ch <= '9') ||
+		                       (ch >= 'a' && ch <= 'f') ||
+		                       (ch >= 'A' && ch <= 'F') ||
+		                       ch == 'x' || ch == 'X';
+		if (!hex_digit)
+			break;
+		++end;
+	}
+
+	if (end == value_start)
+		return false;
+
+	const std::string token = text.substr(value_start, end - value_start);
+	char *parse_end = NULL;
+	const unsigned long parsed = std::strtoul(token.c_str(), &parse_end, 0);
+	if (!parse_end || *parse_end != '\0')
+		return false;
+
+	*value = static_cast<uint32_t>(parsed);
+	return true;
+}
+
+static std::vector<std::string> split_top_level_dicts(const std::string &list_block)
+{
+	std::vector<std::string> blocks;
+	if (list_block.size() < 2 || list_block.front() != '[' || list_block.back() != ']')
+		return blocks;
+
+	size_t object_start = std::string::npos;
+	size_t depth = 0;
+	bool in_string = false;
+	char quote = '\0';
+	bool escaped = false;
+
+	for (size_t pos = 1; pos + 1 < list_block.size(); ++pos) {
+		const char ch = list_block[pos];
+		if (in_string) {
+			if (escaped) {
+				escaped = false;
+			} else if (ch == '\\') {
+				escaped = true;
+			} else if (ch == quote) {
+				in_string = false;
+			}
+			continue;
+		}
+
+		if (ch == '\'' || ch == '"') {
+			in_string = true;
+			quote = ch;
+			escaped = false;
+			continue;
+		}
+
+		if (ch == '{') {
+			if (depth == 0)
+				object_start = pos;
+			++depth;
+			continue;
+		}
+
+		if (ch == '}') {
+			if (depth == 0)
+				continue;
+			--depth;
+			if (depth == 0 && object_start != std::string::npos) {
+				blocks.push_back(list_block.substr(object_start, pos - object_start + 1));
+				object_start = std::string::npos;
+			}
+		}
+	}
+
+	return blocks;
+}
+
+static bool load_mod_init_config(const std::string &mods_dir)
+{
+	g_python.executable_configs.clear();
+	g_python.pending_scan = false;
+	g_python.pending_scan_handle = 0;
+	g_python.pending_scan_index = 0;
+
+	if (mods_dir.empty() || !directory_exists(mods_dir))
+		return false;
+
+	const std::string mod_init_path = join_path(mods_dir, "mod_init.py");
+	if (!path_exists(mod_init_path))
+		return false;
+
+	std::ifstream input(mod_init_path.c_str(), std::ios::in | std::ios::binary);
+	if (!input) {
+		LOG_MSG("MOD ERROR: failed to read %s", mod_init_path.c_str());
+		return false;
+	}
+
+	std::ostringstream buffer;
+	buffer << input.rdbuf();
+	const std::string source = strip_python_comments(buffer.str());
+
+	std::string executables_block;
+	if (!extract_named_block(source, "executables", '[', ']', &executables_block)) {
+		LOG_MSG("MOD ERROR: %s is missing MOD_INIT['executables']", mod_init_path.c_str());
+		return false;
+	}
+
+	const std::vector<std::string> executable_blocks = split_top_level_dicts(executables_block);
+	for (size_t i = 0; i < executable_blocks.size(); ++i) {
+		const std::string &block = executable_blocks[i];
+		PythonRuntime::ExecutableConfig config = {};
+		std::string landmark_block;
+		std::string scan_range_block;
+
+		if (!extract_string_field(block, "name", &config.name) ||
+		    !extract_named_block(block, "landmark", '{', '}', &landmark_block) ||
+		    !extract_string_field(landmark_block, "string", &config.landmark_string) ||
+		    !extract_uint32_field(landmark_block, "reloc", &config.landmark_reloc)) {
+			LOG_MSG("MOD ERROR: invalid executable entry %u in %s",
+			        static_cast<unsigned int>(i + 1), mod_init_path.c_str());
+			continue;
+		}
+
+		config.name_upper = uppercase_ascii_copy(config.name);
+		if (extract_named_block(block, "scan_range", '{', '}', &scan_range_block)) {
+			if (extract_uint32_field(scan_range_block, "start", &config.scan_start) &&
+			    extract_uint32_field(scan_range_block, "end", &config.scan_end)) {
+				config.has_scan_range = true;
+			} else {
+				LOG_MSG("MOD ERROR: invalid scan_range for %s in %s",
+				        config.name.c_str(), mod_init_path.c_str());
+			}
+		}
+
+		g_python.executable_configs.push_back(config);
+	}
+
+	if (g_python.executable_configs.empty()) {
+		LOG_MSG("MOD ERROR: no valid executable configs found in %s", mod_init_path.c_str());
+		return false;
+	}
+
+	LOG_MSG("MOD: loaded mod_init.py with %u executable config(s)",
+	        static_cast<unsigned int>(g_python.executable_configs.size()));
+	return true;
+}
+
+static uint32_t clamp_scan_end(uint64_t address)
+{
+	if (address > 0xffffffffull)
+		return 0xffffffffu;
+	return static_cast<uint32_t>(address);
+}
+
+static bool find_landmark_address(const PythonRuntime::ExecutableConfig &config,
+                                  uint32_t *found_address)
+{
+	if (config.landmark_string.empty())
+		return false;
+
+	const uint64_t total_bytes = static_cast<uint64_t>(MEM_TotalPages()) * MEM_PAGESIZE;
+	const uint32_t max_address = clamp_scan_end(total_bytes);
+	if (max_address == 0)
+		return false;
+
+	uint32_t scan_start = 0;
+	uint32_t scan_end = max_address;
+	if (config.has_scan_range) {
+		scan_start = std::min(config.scan_start, max_address);
+		scan_end = std::min(config.scan_end, max_address);
+	}
+
+	if (scan_start >= scan_end)
+		return false;
+
+	const size_t needle_size = config.landmark_string.size();
+	if (needle_size == 0 || static_cast<uint64_t>(scan_start) + needle_size > scan_end)
+		return false;
+
+	for (uint32_t addr = scan_start;
+	     static_cast<uint64_t>(addr) + needle_size <= scan_end;
+	     ++addr) {
+		if (mem_readb(addr) != static_cast<uint8_t>(config.landmark_string[0]))
+			continue;
+
+		bool matched = true;
+		for (size_t i = 1; i < needle_size; ++i) {
+			if (mem_readb(addr + static_cast<uint32_t>(i)) !=
+			    static_cast<uint8_t>(config.landmark_string[i])) {
+				matched = false;
+				break;
+			}
+		}
+
+		if (matched) {
+			*found_address = addr;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static void run_pending_scan(PythonRuntime::ExecutableConfig &config)
+{
+	uint32_t found_address = 0;
+	if (!find_landmark_address(config, &found_address)) {
+		LOG_MSG("MOD ERROR: could not match %s landmark '%s'",
+		        config.name.c_str(), config.landmark_string.c_str());
+		return;
+	}
+
+	const int64_t previous_delta = config.delta;
+	const bool had_previous_delta = config.delta_ready;
+	const int64_t new_delta = static_cast<int64_t>(found_address) -
+	                          static_cast<int64_t>(config.landmark_reloc);
+
+	config.delta = new_delta;
+	config.delta_ready = true;
+
+	if (config.delta >= 0) {
+		LOG_MSG("MOD: %s delta = 0x%08lX",
+		        config.name.c_str(), static_cast<unsigned long>(config.delta));
+	} else {
+		const unsigned long magnitude =
+		        static_cast<unsigned long>(-config.delta);
+		LOG_MSG("MOD: %s delta = -0x%08lX",
+		        config.name.c_str(), magnitude);
+	}
+
+	if (had_previous_delta && previous_delta != new_delta) {
+		if (previous_delta >= 0 && new_delta >= 0) {
+			LOG_MSG("MOD ERROR: %s delta changed from 0x%08lX to 0x%08lX",
+			        config.name.c_str(),
+			        static_cast<unsigned long>(previous_delta),
+			        static_cast<unsigned long>(new_delta));
+		} else if (previous_delta < 0 && new_delta < 0) {
+			LOG_MSG("MOD ERROR: %s delta changed from -0x%08lX to -0x%08lX",
+			        config.name.c_str(),
+			        static_cast<unsigned long>(-previous_delta),
+			        static_cast<unsigned long>(-new_delta));
+		} else if (previous_delta < 0) {
+			LOG_MSG("MOD ERROR: %s delta changed from -0x%08lX to 0x%08lX",
+			        config.name.c_str(),
+			        static_cast<unsigned long>(-previous_delta),
+			        static_cast<unsigned long>(new_delta));
+		} else {
+			LOG_MSG("MOD ERROR: %s delta changed from 0x%08lX to -0x%08lX",
+			        config.name.c_str(),
+			        static_cast<unsigned long>(previous_delta),
+			        static_cast<unsigned long>(-new_delta));
+		}
+	}
 }
 
 #if defined(WIN32) && !defined(HX_DOS)
@@ -395,6 +900,9 @@ bool DOSBoxPython_Init(const Config& config)
 	if (version)
 		LOG_MSG("PYTHON: version %s", version);
 
+	if (!g_python.mods_dir.empty())
+		load_mod_init_config(g_python.mods_dir);
+
 	if (!g_python.mods_dir.empty()) {
 		const std::string bootstrap = build_python_bootstrap(g_python.mods_dir);
 		if (g_python.api.PyRun_SimpleStringFlags(bootstrap.c_str(), NULL) != 0) {
@@ -428,4 +936,46 @@ void DOSBoxPython_Shutdown(void)
 	g_python.mods_dir.clear();
 	g_python.venv_dir.clear();
 	g_python.python_dll.clear();
+	g_python.executable_configs.clear();
+	g_python.pending_scan = false;
+	g_python.pending_scan_handle = 0;
+	g_python.pending_scan_index = 0;
+}
+
+void DOSBoxPython_OnOpenFile(const char *name, unsigned short handle)
+{
+	if (!g_python.initialized || !name || g_python.executable_configs.empty())
+		return;
+
+	const std::string basename_upper = uppercase_ascii_copy(basename_of(name));
+	for (size_t i = 0; i < g_python.executable_configs.size(); ++i) {
+		PythonRuntime::ExecutableConfig &config = g_python.executable_configs[i];
+		if (basename_upper != config.name_upper)
+			continue;
+
+		g_python.pending_scan = true;
+		g_python.pending_scan_handle = handle;
+		g_python.pending_scan_index = i;
+		LOG_MSG("MOD: armed %s on handle %u",
+		        config.name.c_str(), static_cast<unsigned int>(handle));
+		return;
+	}
+}
+
+void DOSBoxPython_OnCloseFile(unsigned short handle)
+{
+	if (!g_python.initialized || !g_python.pending_scan)
+		return;
+
+	if (handle != g_python.pending_scan_handle) {
+		return;
+	}
+
+	g_python.pending_scan = false;
+	g_python.pending_scan_handle = 0;
+
+	if (g_python.pending_scan_index >= g_python.executable_configs.size())
+		return;
+
+	run_pending_scan(g_python.executable_configs[g_python.pending_scan_index]);
 }

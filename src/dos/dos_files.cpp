@@ -34,6 +34,7 @@
 #include "drives.h"
 #include "cross.h"
 #include "control.h"
+#include "dosbox_python.h"
 #include "support.h"
 #include "menu.h"
 #include "cdrom.h"
@@ -1048,6 +1049,8 @@ bool DOS_OpenFile(char const * name,uint8_t flags,uint16_t * entry,bool fcb) {
 		Files[handle]->AddRef();
 		psp.SetFileHandle(*entry,handle);
 		Files[handle]->drive = drive;
+		if (!device)
+			DOSBoxPython_OnOpenFile(name, *entry);
 		return true;
 	} else {
 		//Test if file exists, but opened in read-write mode (and writeprotected)

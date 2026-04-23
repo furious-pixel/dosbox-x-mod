@@ -41,9 +41,11 @@ enum JoystickType {
 	JOY_4AXIS,
 	JOY_4AXIS_2,
 	JOY_FCS,
-	JOY_CH
+	JOY_CH,
+	JOY_MODJOY
 };
 
 extern JoystickType joytype;
 extern bool button_wrapping_enabled;
+extern bool modjoy_rawvalue_log;
 #endif

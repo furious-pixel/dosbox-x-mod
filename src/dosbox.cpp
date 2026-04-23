@@ -1423,7 +1423,7 @@ void DOSBOX_SetupConfigSections(void) {
     const char* acpisettings[] = { "off", "1.0", "1.0b", "2.0", "2.0a", "2.0b", "2.0c", "3.0", "3.0a", "3.0b", "4.0", "4.0a", "5.0", "5.0a", "6.0", nullptr };
     const char* guspantables[] = { "old", "accurate", "default", nullptr };
     const char *sidbaseno[] = { "240", "220", "260", "280", "2a0", "2c0", "2e0", "300", nullptr };
-    const char* joytypes[] = { "auto", "2axis", "4axis", "4axis_2", "fcs", "ch", "none", nullptr};
+    const char* joytypes[] = { "auto", "2axis", "4axis", "4axis_2", "fcs", "ch", "modjoy", "none", nullptr};
 //    const char* joydeadzone[] = { "0.26", nullptr };
 //    const char* joyresponse[] = { "1.0", nullptr };
     const char* iosgus[] = { "240", "220", "260", "280", "2a0", "2c0", "2e0", "300", "210", "230", "250", nullptr };
@@ -4190,7 +4190,8 @@ void DOSBOX_SetupConfigSections(void) {
         "2axis (supports two joysticks),\n"
         "4axis (supports one joystick, first joystick used),\n"
         "4axis_2 (supports one joystick, second joystick used),\n"
-        "fcs (Thrustmaster), ch (CH Flightstick).\n"
+        "fcs (Thrustmaster), ch (CH Flightstick),\n"
+        "modjoy (uses raw joystick values for mods; normal joystick emulation settings are ignored).\n"
         "auto chooses emulation depending on real joystick(s).\n"
         "(Remember to reset DOSBox-X's mapperfile if you saved it earlier)");
     Pstring->SetBasic(true);
@@ -4209,6 +4210,10 @@ void DOSBOX_SetupConfigSections(void) {
 
     Pbool = secprop->Add_bool("buttonwrap",Property::Changeable::WhenIdle,false);
     Pbool->Set_help("enable button wrapping at the number of emulated buttons.");
+    Pbool->SetBasic(true);
+
+    Pbool = secprop->Add_bool("modjoy_rawvalue_log",Property::Changeable::WhenIdle,false);
+    Pbool->Set_help("log raw SDL joystick axis values for all detected joysticks when joysticktype=modjoy.");
     Pbool->SetBasic(true);
 
 	/*improved joystick

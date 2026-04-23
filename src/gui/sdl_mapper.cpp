@@ -1999,7 +1999,6 @@ public:
                 old_button_state[i]=button_pressed[i];
             }
         }
-        
         int* axis_map = stick == 0 ? &joy1axes[0] : &joy2axes[0];
         for (i=0; i<axes; i++) {
             int i1 = axis_map[i];
@@ -4207,6 +4206,7 @@ static void CreateLayout(void) {
     switch(joytype)
     {
     case JOY_NONE:
+    case JOY_MODJOY:
         (new CTextButton(PX(XO + 0), PY(YO + 0) - CY, BU(3), BV(1), "Disabled"))->SetCanClick(false);
         (new CTextButton(PX(XO + 4), PY(YO + 0) - CY, BU(3), BV(1), "Disabled"))->SetCanClick(false);
         (new CTextButton(PX(XO + 8), PY(YO + 0) - CY, BU(3), BV(1), "Disabled"))->SetCanClick(false);
@@ -5233,7 +5233,7 @@ static void CreateBindGroups(void) {
 #else
     new CKeyBindGroup(SDLK_LAST);
 #endif
-    if (joytype != JOY_NONE) {
+    if (joytype != JOY_NONE && joytype != JOY_MODJOY) {
 #if defined (REDUCE_JOYSTICK_POLLING)
         // direct access to the SDL joystick, thus removed from the event handling
         if (mapper.sticks.num) SDL_JoystickEventState(SDL_DISABLE);
@@ -5276,7 +5276,72 @@ static void CreateBindGroups(void) {
 }
 
 #if defined (REDUCE_JOYSTICK_POLLING)
+static void LogAllSdlJoystickAxes()
+{
+    static constexpr uint32_t raw_axis_report_interval_ms = 4000;
+    static constexpr int raw_axis_count = 4;
+    static uint32_t next_raw_axis_report_tick = 0;
+
+    if (joytype != JOY_MODJOY || !modjoy_rawvalue_log)
+        return;
+
+    const uint32_t now = SDL_GetTicks();
+    if (now < next_raw_axis_report_tick)
+        return;
+
+    const int joystick_count = SDL_NumJoysticks();
+    struct RawJoystickLogEntry {
+        std::string name = {};
+        Sint16 axis_values[raw_axis_count] = {};
+    };
+    std::vector<RawJoystickLogEntry> entries = {};
+    entries.reserve(static_cast<size_t>(joystick_count));
+    size_t longest_name_len = 0;
+
+    for (int joystick_index = 0; joystick_index < joystick_count; joystick_index++) {
+        SDL_Joystick* joystick = SDL_JoystickOpen(joystick_index);
+        if (joystick == nullptr) {
+            LOG_MSG("Raw joystick %d unavailable: %s", joystick_index, SDL_GetError());
+            continue;
+        }
+
+#if defined(C_SDL2)
+        const char* joystick_name = SDL_JoystickNameForIndex(joystick_index);
+#else
+        const char* joystick_name = SDL_JoystickName(joystick_index);
+#endif
+        if (joystick_name == nullptr)
+            joystick_name = "[unknown joystick]";
+
+        RawJoystickLogEntry entry = {};
+        entry.name = joystick_name;
+        longest_name_len = std::max(longest_name_len, entry.name.size());
+
+        const int axis_count = SDL_JoystickNumAxes(joystick);
+        const int tracked_axes = std::min(raw_axis_count, axis_count);
+        for (int axis_index = 0; axis_index < tracked_axes; axis_index++) {
+            entry.axis_values[axis_index] = SDL_JoystickGetAxis(joystick, axis_index);
+        }
+
+        SDL_JoystickClose(joystick);
+        entries.push_back(entry);
+    }
+
+    for (const auto& entry : entries) {
+        LOG_MSG("\"%-*s\" SDL axes: [0]=%6d [1]=%6d [2]=%6d [3]=%6d",
+                static_cast<int>(longest_name_len),
+                entry.name.c_str(),
+                entry.axis_values[0],
+                entry.axis_values[1],
+                entry.axis_values[2],
+                entry.axis_values[3]);
+    }
+
+    next_raw_axis_report_tick = now + raw_axis_report_interval_ms;
+}
+
 void MAPPER_UpdateJoysticks(void) {
+    LogAllSdlJoystickAxes();
     for (Bitu i=0; i<mapper.sticks.num_groups; i++) {
         mapper.sticks.stick[i]->UpdateJoystick();
     }

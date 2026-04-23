@@ -49,6 +49,7 @@ static uint32_t last_write = 0;
 static bool write_active = false;
 static bool swap34 = false;
 bool button_wrapping_enabled = true;
+bool modjoy_rawvalue_log = false;
 
 extern bool autofire; //sdl_mapper.cpp
 extern int joy1axes[]; //sdl_mapper.cpp
@@ -253,11 +254,13 @@ void JOYSTICK_Init() {
 		else if (!strcasecmp(type,"4axis_2")) joytype = JOY_4AXIS_2;
 		else if (!strcasecmp(type,"fcs"))   joytype = JOY_FCS;
 		else if (!strcasecmp(type,"ch"))    joytype = JOY_CH;
+		else if (!strcasecmp(type,"modjoy")) joytype = JOY_MODJOY;
 		else joytype = JOY_AUTO;
 
 		autofire = section->Get_bool("autofire");
 		swap34 = section->Get_bool("swap34");
 		button_wrapping_enabled = section->Get_bool("buttonwrap");
+		modjoy_rawvalue_log = section->Get_bool("modjoy_rawvalue_log");
 		stick[0].enabled = false;
 		stick[1].enabled = false;
 		stick[0].xtick = stick[0].ytick = stick[1].xtick =
@@ -304,6 +307,7 @@ public:
         registerPOD(write_active);
         registerPOD(swap34);
         registerPOD(button_wrapping_enabled);
+        registerPOD(modjoy_rawvalue_log);
         registerPOD(autofire);
     }
 } dummy;

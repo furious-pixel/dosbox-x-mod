@@ -145,7 +145,7 @@ static bool GetConfiguredWindowSize(Bitu *width, Bitu *height)
     return true;
 }
 
-static bool GetSideBySideWindowSize(Bitu *target_width, Bitu *target_height)
+static bool GetSideBySideBaseWindowSize(Bitu *target_width, Bitu *target_height)
 {
     Bitu base_width = 0;
     Bitu base_height = 0;
@@ -163,9 +163,24 @@ static bool GetSideBySideWindowSize(Bitu *target_width, Bitu *target_height)
         return false;
 
     if (target_width)
-        *target_width = ClampOpenGLWindowDimension(base_width * 2u);
+        *target_width = ClampOpenGLWindowDimension(base_width);
     if (target_height)
         *target_height = ClampOpenGLWindowDimension(base_height);
+    return true;
+}
+
+static bool GetSideBySideWindowSize(Bitu *target_width, Bitu *target_height)
+{
+    Bitu base_width = 0;
+    Bitu base_height = 0;
+
+    if (!GetSideBySideBaseWindowSize(&base_width, &base_height))
+        return false;
+
+    if (target_width)
+        *target_width = ClampOpenGLWindowDimension(base_width * 2u);
+    if (target_height)
+        *target_height = base_height;
     return true;
 }
 
@@ -229,6 +244,7 @@ static SDL_Surface* SetupSurfaceScaledOpenGL(uint32_t sdl_flags, uint32_t bpp)
     uint16_t fixedHeight;
     uint16_t windowWidth;
     uint16_t windowHeight;
+    bool side_by_side_resize_override = false;
 
 retry:
 #if defined(C_SDL2)
@@ -251,19 +267,20 @@ retry:
     }
     else 
     {
-        Bitu side_by_side_width = 0;
-        Bitu side_by_side_height = 0;
-        const bool side_by_side_resize_override =
+        Bitu side_by_side_base_width = 0;
+        Bitu side_by_side_base_height = 0;
+        side_by_side_resize_override =
                 mod_render_view_mode == MOD_RENDER_VIEW_SIDE_BY_SIDE &&
-                GetSideBySideWindowSize(&side_by_side_width, &side_by_side_height);
+                GetSideBySideBaseWindowSize(&side_by_side_base_width,
+                                            &side_by_side_base_height);
 
         // Side-by-side is the one presentation mode where we intentionally
-        // override windowresolution: the configured window size becomes one
-        // side, and the actual SDL window widens to hold game + compositor.
+        // treat windowresolution as one side. DOSBox-X/OpenGLPP computes its
+        // usual clip inside that side; we widen the SDL window after scaling.
         fixedWidth = side_by_side_resize_override ?
-                (uint16_t)side_by_side_width : sdl.desktop.window.width;
+                (uint16_t)side_by_side_base_width : sdl.desktop.window.width;
         fixedHeight = side_by_side_resize_override ?
-                (uint16_t)side_by_side_height : sdl.desktop.window.height;
+                (uint16_t)side_by_side_base_height : sdl.desktop.window.height;
 #if !defined(C_SDL2)
         sdl_flags |= (unsigned int)SDL_HWSURFACE;
 #endif
@@ -330,6 +347,9 @@ retry:
             if (render.aspect) aspectCorrectExtend(windowWidth, windowHeight);
             sdl.clip.w = windowWidth; sdl.clip.h = windowHeight;
         }
+
+    if (side_by_side_resize_override)
+        windowWidth = (uint16_t)ClampOpenGLWindowDimension((Bitu)windowWidth * 2u);
 
     LOG(LOG_MISC, LOG_DEBUG)("GFX_SetSize OpenGL window=%ux%u clip=x,y,w,h=%d,%d,%d,%d",
         (unsigned int)windowWidth,
@@ -1214,10 +1234,7 @@ static OpenGLPresentationLayout BuildOpenGLPresentationLayout(void)
         break;
     case MOD_RENDER_VIEW_SIDE_BY_SIDE: {
         const uint32_t half_width = layout.backbuffer_width / 2u;
-        layout.game.x = 0;
-        layout.game.y = 0;
-        layout.game.w = (GLsizei)half_width;
-        layout.game.h = (GLsizei)layout.backbuffer_height;
+        layout.game = layout.natural_game;
 
         layout.mod.x = (GLint)half_width;
         layout.mod.y = 0;

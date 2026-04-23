@@ -137,7 +137,7 @@ char* revert_escape_newlines(const char* aMessage);
 #include "callback.h"
 #include "support.h"
 #include "debug.h"
-#include "dosbox_python.h"
+#include "mod.h"
 #include "ide.h"
 #include "bitop.h"
 #include "ptrop.h"
@@ -9162,7 +9162,7 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
 
         /* -- initialize logging first, so that higher level inits can report problems to the log file */
         LOG::Init();
-        DOSBoxPython_Init(*control);
+        MOD_Init(*control);
 
 #if defined(C_HAVE_DUKTAPE)
 	LOG(LOG_MISC,LOG_NORMAL)("Initializing ECMA heap");
@@ -10430,7 +10430,7 @@ fresh_boot:
 	}
 #endif
 
-        DOSBoxPython_Shutdown();
+        MOD_Shutdown();
         LOG::Exit();
 
 #if DOSBOXMENU_TYPE == DOSBOXMENU_HMENU && defined(WIN32) && !defined(HX_DOS) && (!defined(C_SDL2) && defined(SDL_DOSBOX_X_SPECIAL) || defined(C_SDL2))

@@ -9,7 +9,6 @@
 
 #include "control.h"
 #include "logging.h"
-#include "mem.h"
 
 #include <algorithm>
 #include <cctype>
@@ -74,28 +73,12 @@ struct PythonAPI {
 };
 
 struct PythonRuntime {
-	struct ExecutableConfig {
-		std::string name = {};
-		std::string name_upper = {};
-		std::string landmark_string = {};
-		uint32_t landmark_reloc = 0;
-		bool has_scan_range = false;
-		uint32_t scan_start = 0;
-		uint32_t scan_end = 0;
-		bool delta_ready = false;
-		int64_t delta = 0;
-	};
-
 	PythonAPI api = {};
 	bool initialized = false;
 	std::string working_dir = {};
 	std::string mods_dir = {};
 	std::string venv_dir = {};
 	std::string python_dll = {};
-	std::vector<ExecutableConfig> executable_configs = {};
-	bool pending_scan = false;
-	uint16_t pending_scan_handle = 0;
-	size_t pending_scan_index = 0;
 };
 
 PythonRuntime g_python = {};
@@ -167,14 +150,6 @@ static std::string dirname_of(const std::string &path)
 	if (pos == std::string::npos)
 		return {};
 	return path.substr(0, pos);
-}
-
-static std::string basename_of(const std::string &path)
-{
-	const size_t pos = path.find_last_of("/\\");
-	if (pos == std::string::npos)
-		return path;
-	return path.substr(pos + 1);
 }
 
 static std::string join_path(const std::string &lhs, const std::string &rhs)
@@ -429,12 +404,10 @@ static bool ensure_mods_dir_on_sys_path(const std::string &mods_dir)
 	return true;
 }
 
-static bool load_mod_init_config(const std::string &mods_dir)
+static bool load_mod_init_config(const std::string &mods_dir,
+                                 std::vector<ModExecutableConfig> *configs)
 {
-	g_python.executable_configs.clear();
-	g_python.pending_scan = false;
-	g_python.pending_scan_handle = 0;
-	g_python.pending_scan_index = 0;
+	configs->clear();
 
 	if (mods_dir.empty() || !directory_exists(mods_dir))
 		return false;
@@ -490,7 +463,7 @@ static bool load_mod_init_config(const std::string &mods_dir)
 
 	for (Py_ssize_t i = 0; i < executable_count; ++i) {
 		const std::string entry_context = append_context_index("MOD_INIT['executables']", static_cast<size_t>(i));
-		PythonRuntime::ExecutableConfig config = {};
+		ModExecutableConfig config = {};
 		PyOwnedRef executable(g_python.api.PySequence_GetItem(executables.get(), i));
 		if (!executable) {
 			log_python_exception((entry_context + " could not be read").c_str());
@@ -542,125 +515,17 @@ static bool load_mod_init_config(const std::string &mods_dir)
 			}
 		}
 
-		g_python.executable_configs.push_back(config);
+		configs->push_back(config);
 	}
 
-	if (g_python.executable_configs.empty()) {
+	if (configs->empty()) {
 		LOG_MSG("MOD ERROR: no valid executable configs found in %s", mod_init_path.c_str());
 		return false;
 	}
 
 	LOG_MSG("MOD: loaded mod_init.py with %u executable config(s)",
-	        static_cast<unsigned int>(g_python.executable_configs.size()));
+	        static_cast<unsigned int>(configs->size()));
 	return true;
-}
-
-static uint32_t clamp_scan_end(uint64_t address)
-{
-	if (address > 0xffffffffull)
-		return 0xffffffffu;
-	return static_cast<uint32_t>(address);
-}
-
-static bool find_landmark_address(const PythonRuntime::ExecutableConfig &config,
-                                  uint32_t *found_address)
-{
-	if (config.landmark_string.empty())
-		return false;
-
-	const uint64_t total_bytes = static_cast<uint64_t>(MEM_TotalPages()) * MEM_PAGESIZE;
-	const uint32_t max_address = clamp_scan_end(total_bytes);
-	if (max_address == 0)
-		return false;
-
-	uint32_t scan_start = 0;
-	uint32_t scan_end = max_address;
-	if (config.has_scan_range) {
-		scan_start = std::min(config.scan_start, max_address);
-		scan_end = std::min(config.scan_end, max_address);
-	}
-
-	if (scan_start >= scan_end)
-		return false;
-
-	const size_t needle_size = config.landmark_string.size();
-	if (needle_size == 0 || static_cast<uint64_t>(scan_start) + needle_size > scan_end)
-		return false;
-
-	for (uint32_t addr = scan_start;
-	     static_cast<uint64_t>(addr) + needle_size <= scan_end;
-	     ++addr) {
-		if (mem_readb(addr) != static_cast<uint8_t>(config.landmark_string[0]))
-			continue;
-
-		bool matched = true;
-		for (size_t i = 1; i < needle_size; ++i) {
-			if (mem_readb(addr + static_cast<uint32_t>(i)) !=
-			    static_cast<uint8_t>(config.landmark_string[i])) {
-				matched = false;
-				break;
-			}
-		}
-
-		if (matched) {
-			*found_address = addr;
-			return true;
-		}
-	}
-
-	return false;
-}
-
-static void run_pending_scan(PythonRuntime::ExecutableConfig &config)
-{
-	uint32_t found_address = 0;
-	if (!find_landmark_address(config, &found_address)) {
-		LOG_MSG("MOD ERROR: could not match %s landmark '%s'",
-		        config.name.c_str(), config.landmark_string.c_str());
-		return;
-	}
-
-	const int64_t previous_delta = config.delta;
-	const bool had_previous_delta = config.delta_ready;
-	const int64_t new_delta = static_cast<int64_t>(found_address) -
-	                          static_cast<int64_t>(config.landmark_reloc);
-
-	config.delta = new_delta;
-	config.delta_ready = true;
-
-	if (config.delta >= 0) {
-		LOG_MSG("MOD: %s delta = 0x%08lX",
-		        config.name.c_str(), static_cast<unsigned long>(config.delta));
-	} else {
-		const unsigned long magnitude =
-		        static_cast<unsigned long>(-config.delta);
-		LOG_MSG("MOD: %s delta = -0x%08lX",
-		        config.name.c_str(), magnitude);
-	}
-
-	if (had_previous_delta && previous_delta != new_delta) {
-		if (previous_delta >= 0 && new_delta >= 0) {
-			LOG_MSG("MOD ERROR: %s delta changed from 0x%08lX to 0x%08lX",
-			        config.name.c_str(),
-			        static_cast<unsigned long>(previous_delta),
-			        static_cast<unsigned long>(new_delta));
-		} else if (previous_delta < 0 && new_delta < 0) {
-			LOG_MSG("MOD ERROR: %s delta changed from -0x%08lX to -0x%08lX",
-			        config.name.c_str(),
-			        static_cast<unsigned long>(-previous_delta),
-			        static_cast<unsigned long>(-new_delta));
-		} else if (previous_delta < 0) {
-			LOG_MSG("MOD ERROR: %s delta changed from -0x%08lX to 0x%08lX",
-			        config.name.c_str(),
-			        static_cast<unsigned long>(-previous_delta),
-			        static_cast<unsigned long>(new_delta));
-		} else {
-			LOG_MSG("MOD ERROR: %s delta changed from 0x%08lX to -0x%08lX",
-			        config.name.c_str(),
-			        static_cast<unsigned long>(previous_delta),
-			        static_cast<unsigned long>(-new_delta));
-		}
-	}
 }
 
 #if defined(WIN32) && !defined(HX_DOS)
@@ -870,9 +735,6 @@ bool DOSBoxPython_Init(const Config& config)
 	if (version)
 		LOG_MSG("PYTHON: version %s", version);
 
-	if (!g_python.mods_dir.empty())
-		load_mod_init_config(g_python.mods_dir);
-
 	if (!g_python.mods_dir.empty()) {
 		const std::string bootstrap = build_python_bootstrap(g_python.mods_dir);
 		if (g_python.api.PyRun_SimpleStringFlags(bootstrap.c_str(), NULL) != 0) {
@@ -906,46 +768,12 @@ void DOSBoxPython_Shutdown(void)
 	g_python.mods_dir.clear();
 	g_python.venv_dir.clear();
 	g_python.python_dll.clear();
-	g_python.executable_configs.clear();
-	g_python.pending_scan = false;
-	g_python.pending_scan_handle = 0;
-	g_python.pending_scan_index = 0;
 }
 
-void DOSBoxPython_OnOpenFile(const char *name, unsigned short handle)
+bool DOSBoxPython_LoadModInitConfigs(std::vector<ModExecutableConfig> *configs)
 {
-	if (!g_python.initialized || !name || g_python.executable_configs.empty())
-		return;
+	if (!configs || !g_python.initialized)
+		return false;
 
-	const std::string basename_upper = uppercase_ascii_copy(basename_of(name));
-	for (size_t i = 0; i < g_python.executable_configs.size(); ++i) {
-		PythonRuntime::ExecutableConfig &config = g_python.executable_configs[i];
-		if (basename_upper != config.name_upper)
-			continue;
-
-		g_python.pending_scan = true;
-		g_python.pending_scan_handle = handle;
-		g_python.pending_scan_index = i;
-		LOG_MSG("MOD: armed %s on handle %u",
-		        config.name.c_str(), static_cast<unsigned int>(handle));
-		return;
-	}
-}
-
-void DOSBoxPython_OnCloseFile(unsigned short handle)
-{
-	if (!g_python.initialized || !g_python.pending_scan)
-		return;
-
-	if (handle != g_python.pending_scan_handle) {
-		return;
-	}
-
-	g_python.pending_scan = false;
-	g_python.pending_scan_handle = 0;
-
-	if (g_python.pending_scan_index >= g_python.executable_configs.size())
-		return;
-
-	run_pending_scan(g_python.executable_configs[g_python.pending_scan_index]);
+	return load_mod_init_config(g_python.mods_dir, configs);
 }

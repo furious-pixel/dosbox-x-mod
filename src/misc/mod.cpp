@@ -500,21 +500,6 @@ static bool translate_reloc_address(uint32_t reloc_addr, uint32_t *linear_addr)
 	return apply_delta(reloc_addr, runtime->delta, linear_addr);
 }
 
-static bool translate_linear_address_to_reloc(uint32_t linear_addr,
-                                              uint32_t *reloc_addr)
-{
-	ModExecutableRuntime *runtime = NULL;
-	if (!reloc_addr || !get_active_runtime(&runtime))
-		return false;
-
-	const int64_t value = static_cast<int64_t>(linear_addr) - runtime->delta;
-	if (value < 0 || value > 0xffffffffll)
-		return false;
-
-	*reloc_addr = static_cast<uint32_t>(value);
-	return true;
-}
-
 static void attach_python_hooks(const std::vector<ModPythonHookRegistration> &hooks)
 {
 	for (size_t i = 0; i < hooks.size(); ++i) {
@@ -801,13 +786,7 @@ bool MOD_ReadMemoryBlock(uint32_t reloc_addr, uint8_t *data, size_t size)
 	    0xffffffffull)
 		return false;
 
-	for (size_t i = 0; i < size; ++i) {
-		if (mem_readb_checked(linear_addr + static_cast<uint32_t>(i),
-		                      &data[i])) {
-			return false;
-		}
-	}
-
+	MEM_BlockRead(linear_addr, data, static_cast<Bitu>(size));
 	return true;
 }
 
@@ -819,20 +798,6 @@ bool MOD_GetActiveDelta(int64_t *delta)
 
 	*delta = runtime->delta;
 	return true;
-}
-
-bool MOD_ReadRelocedPointer(uint32_t reloc_addr, uint32_t *reloc_pointer)
-{
-	uint32_t linear_pointer = 0;
-	if (!reloc_pointer || !MOD_ReadMemoryU32(reloc_addr, &linear_pointer))
-		return false;
-
-	if (linear_pointer == 0) {
-		*reloc_pointer = 0;
-		return true;
-	}
-
-	return translate_linear_address_to_reloc(linear_pointer, reloc_pointer);
 }
 
 bool MOD_ReadRuntimeMemoryU8(uint32_t linear_addr, uint8_t *value)
@@ -879,13 +844,7 @@ bool MOD_ReadRuntimeMemoryBlock(uint32_t linear_addr, uint8_t *data, size_t size
 	    0xffffffffull)
 		return false;
 
-	for (size_t i = 0; i < size; ++i) {
-		if (mem_readb_checked(linear_addr + static_cast<uint32_t>(i),
-		                      &data[i])) {
-			return false;
-		}
-	}
-
+	MEM_BlockRead(linear_addr, data, static_cast<Bitu>(size));
 	return true;
 }
 

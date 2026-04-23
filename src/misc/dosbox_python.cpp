@@ -363,18 +363,26 @@ static std::string build_mod_helper_bootstrap(void)
 		<< "    @property\n"
 		<< "    def delta(self):\n"
 		<< "        return mod._get_delta()\n"
-		<< "    def read_u8(self, addr):\n"
+		<< "    def read_reloc_u8(self, addr):\n"
 		<< "        return mod._read_u8(addr)\n"
-		<< "    def read_u16(self, addr):\n"
+		<< "    def read_reloc_u16(self, addr):\n"
 		<< "        return mod._read_u16(addr)\n"
-		<< "    def read_u32(self, addr):\n"
+		<< "    def read_reloc_u32(self, addr):\n"
 		<< "        return mod._read_u32(addr)\n"
-		<< "    def read_i32(self, addr):\n"
+		<< "    def read_reloc_i32(self, addr):\n"
 		<< "        return mod._read_i32(addr)\n"
-		<< "    def read_bytes(self, addr, size):\n"
+		<< "    def read_reloc_bytes(self, addr, size):\n"
 		<< "        return mod._read_bytes(addr, size)\n"
-		<< "    def read_reloced_ptr(self, addr):\n"
-		<< "        return mod._read_reloced_ptr(addr)\n"
+		<< "    def read_u8(self, addr):\n"
+		<< "        return self.read_reloc_u8(addr)\n"
+		<< "    def read_u16(self, addr):\n"
+		<< "        return self.read_reloc_u16(addr)\n"
+		<< "    def read_u32(self, addr):\n"
+		<< "        return self.read_reloc_u32(addr)\n"
+		<< "    def read_i32(self, addr):\n"
+		<< "        return self.read_reloc_i32(addr)\n"
+		<< "    def read_bytes(self, addr, size):\n"
+		<< "        return self.read_reloc_bytes(addr, size)\n"
 		<< "    def read_runtime_u8(self, addr):\n"
 		<< "        return mod._read_runtime_u8(addr)\n"
 		<< "    def read_runtime_u16(self, addr):\n"
@@ -385,14 +393,22 @@ static std::string build_mod_helper_bootstrap(void)
 		<< "        return mod._read_runtime_i32(addr)\n"
 		<< "    def read_runtime_bytes(self, addr, size):\n"
 		<< "        return mod._read_runtime_bytes(addr, size)\n"
-		<< "    def write_u8(self, addr, value):\n"
+		<< "    def write_reloc_u8(self, addr, value):\n"
 		<< "        return mod._write_u8(addr, value)\n"
-		<< "    def write_u16(self, addr, value):\n"
+		<< "    def write_reloc_u16(self, addr, value):\n"
 		<< "        return mod._write_u16(addr, value)\n"
-		<< "    def write_u32(self, addr, value):\n"
+		<< "    def write_reloc_u32(self, addr, value):\n"
 		<< "        return mod._write_u32(addr, value)\n"
-		<< "    def write_i32(self, addr, value):\n"
+		<< "    def write_reloc_i32(self, addr, value):\n"
 		<< "        return mod._write_i32(addr, value)\n"
+		<< "    def write_u8(self, addr, value):\n"
+		<< "        return self.write_reloc_u8(addr, value)\n"
+		<< "    def write_u16(self, addr, value):\n"
+		<< "        return self.write_reloc_u16(addr, value)\n"
+		<< "    def write_u32(self, addr, value):\n"
+		<< "        return self.write_reloc_u32(addr, value)\n"
+		<< "    def write_i32(self, addr, value):\n"
+		<< "        return self.write_reloc_i32(addr, value)\n"
 		<< "if not hasattr(mod, 'gamemem'):\n"
 		<< "    mod.gamemem = _DOSBoxGameMemory()\n"
 		<< "class _DOSBoxOpenGL(object):\n"
@@ -1125,30 +1141,6 @@ static PyObject *py_read_bytes(PyObject *, PyObject *args)
 	        static_cast<Py_ssize_t>(data.size()));
 }
 
-static PyObject *py_read_reloced_ptr(PyObject *, PyObject *args)
-{
-	if (g_python.api.PyTuple_Size(args) != 1) {
-		set_python_error(g_python.api.PyExc_TypeError,
-		                 "read_reloced_ptr expects (addr)");
-		return NULL;
-	}
-
-	unsigned long reloc_addr = 0;
-	if (!py_tuple_get_uint32_arg(args, 0, &reloc_addr))
-		return NULL;
-
-	uint32_t reloc_pointer = 0;
-	if (!MOD_ReadRelocedPointer(static_cast<uint32_t>(reloc_addr),
-	                            &reloc_pointer)) {
-		set_python_error(g_python.api.PyExc_RuntimeError,
-		                 "read_reloced_ptr failed");
-		return NULL;
-	}
-
-	return g_python.api.PyLong_FromUnsignedLong(
-	        static_cast<unsigned long>(reloc_pointer));
-}
-
 static PyObject *py_read_runtime_u8(PyObject *, PyObject *args)
 {
 	if (g_python.api.PyTuple_Size(args) != 1) {
@@ -1422,8 +1414,6 @@ static bool ensure_mod_helper_module(void)
 	        "_read_i32", py_read_i32, DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef read_bytes_method = {
 	        "_read_bytes", py_read_bytes, DOSBOX_PY_METH_VARARGS, NULL};
-	static PyMethodDef read_reloced_ptr_method = {
-	        "_read_reloced_ptr", py_read_reloced_ptr, DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef read_runtime_u8_method = {
 	        "_read_runtime_u8", py_read_runtime_u8, DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef read_runtime_u16_method = {
@@ -1457,8 +1447,6 @@ static bool ensure_mod_helper_module(void)
 	    !attach_module_function(mod_module.get(), "_read_u32", &read_u32_method) ||
 	    !attach_module_function(mod_module.get(), "_read_i32", &read_i32_method) ||
 	    !attach_module_function(mod_module.get(), "_read_bytes", &read_bytes_method) ||
-	    !attach_module_function(mod_module.get(), "_read_reloced_ptr",
-	                            &read_reloced_ptr_method) ||
 	    !attach_module_function(mod_module.get(), "_read_runtime_u8",
 	                            &read_runtime_u8_method) ||
 	    !attach_module_function(mod_module.get(), "_read_runtime_u16",

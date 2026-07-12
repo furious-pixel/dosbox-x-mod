@@ -1257,6 +1257,15 @@ static OpenGLPresentationLayout BuildOpenGLPresentationLayout(void)
     return layout;
 }
 
+static GLViewport BuildInactiveModFallbackViewport(
+        const OpenGLPresentationLayout &layout)
+{
+    GLViewport viewport = layout.natural_game;
+    if (mod_render_view_mode == MOD_RENDER_VIEW_SIDE_BY_SIDE)
+        viewport.x += layout.mod.x;
+    return viewport;
+}
+
 static void PrepareOpenGLPresentationState(const OpenGLPresentationLayout &layout,
                                            const GLViewport &viewport)
 {
@@ -1416,9 +1425,11 @@ static void ClearOpenGLViewport(const GLViewport &viewport)
 
 static void DrainInactiveModRenderBuffers(const OpenGLPresentationLayout &layout)
 {
+    const GLViewport fallback = BuildInactiveModFallbackViewport(layout);
     for (int i = 0; i < MOD_RENDER_INACTIVE_POST_SWAP_CLEARS; ++i) {
         ClearOpenGLViewport(layout.mod);
         DrawDOSBoxTextureToViewport(layout, layout.game);
+        DrawDOSBoxTextureToViewport(layout, fallback);
         RestoreOpenGLPresentationState(layout);
 
         if (i + 1 < MOD_RENDER_INACTIVE_POST_SWAP_CLEARS)
@@ -1428,10 +1439,11 @@ static void DrainInactiveModRenderBuffers(const OpenGLPresentationLayout &layout
 
 static void FinishOpenGLPresentation(void)
 {
+    const bool mod_render_active = MOD_RenderActive();
     const OpenGLPresentationLayout layout = BuildOpenGLPresentationLayout();
+    const GLViewport fallback = BuildInactiveModFallbackViewport(layout);
     ModOpenGLState mod_state = BuildModOpenGLState(layout);
     mod_state.present_count = ++sdl_opengl.mod_present_count;
-    const bool mod_render_active = MOD_RenderActive();
     const bool drain_inactive_buffers =
             mod_render_view_mode != MOD_RENDER_VIEW_GAME_ONLY &&
             mod_render_was_active && !mod_render_active;
@@ -1445,8 +1457,13 @@ static void FinishOpenGLPresentation(void)
     CheckManagement();
     DrawDOSBoxTextureToViewport(layout, layout.game);
 
-    if (mod_render_view_mode != MOD_RENDER_VIEW_GAME_ONLY && mod_render_active)
+    if (mod_render_active &&
+        mod_render_view_mode != MOD_RENDER_VIEW_GAME_ONLY) {
         DOSBoxPython_InvokeOpenGLCompositorCallback(mod_state);
+    } else if (!mod_render_active &&
+               mod_render_view_mode != MOD_RENDER_VIEW_GAME_ONLY) {
+        DrawDOSBoxTextureToViewport(layout, fallback);
+    }
 
     RestoreOpenGLPresentationState(layout);
     SDL_GL_SwapBuffers();

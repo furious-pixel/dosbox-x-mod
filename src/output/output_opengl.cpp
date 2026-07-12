@@ -1209,16 +1209,16 @@ static OpenGLPresentationLayout BuildOpenGLPresentationLayout(void)
     if (surface_height == 0u)
         surface_height = layout.backbuffer_height;
 
-    layout.natural_game.x = (GLint)ScaleSurfaceCoordinate((uint32_t)std::max(0, sdl.clip.x),
+    layout.natural_game.x = (GLint)ScaleSurfaceCoordinate((uint32_t)std::max<int>(0, sdl.clip.x),
                                                           surface_width,
                                                           layout.backbuffer_width);
-    layout.natural_game.y = (GLint)ScaleSurfaceCoordinate((uint32_t)std::max(0, sdl.clip.y),
+    layout.natural_game.y = (GLint)ScaleSurfaceCoordinate((uint32_t)std::max<int>(0, sdl.clip.y),
                                                           surface_height,
                                                           layout.backbuffer_height);
-    layout.natural_game.w = (GLsizei)ScaleSurfaceCoordinate((uint32_t)std::max(0, sdl.clip.w),
+    layout.natural_game.w = (GLsizei)ScaleSurfaceCoordinate((uint32_t)std::max<int>(0, sdl.clip.w),
                                                             surface_width,
                                                             layout.backbuffer_width);
-    layout.natural_game.h = (GLsizei)ScaleSurfaceCoordinate((uint32_t)std::max(0, sdl.clip.h),
+    layout.natural_game.h = (GLsizei)ScaleSurfaceCoordinate((uint32_t)std::max<int>(0, sdl.clip.h),
                                                             surface_height,
                                                             layout.backbuffer_height);
 

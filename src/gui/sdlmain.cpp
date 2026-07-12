@@ -3343,8 +3343,10 @@ void GFX_EndUpdate(const uint16_t *changedLines) {
 #if C_EMSCRIPTEN
     emscripten_sleep(0);
 #endif
+    bool mod_presentation_required = false;
 #if C_OPENGL
     bool actually_updating = false;
+    mod_presentation_required = OUTPUT_OPENGL_ModPresentationRequired();
 #endif
     /* don't present our output if 3Dfx is in OpenGL mode */
     if (sdl.desktop.prevent_fullscreen)
@@ -3361,7 +3363,10 @@ void GFX_EndUpdate(const uint16_t *changedLines) {
     if (d3d && d3d->getForceUpdate());
     else
 #endif
-    if (((sdl.desktop.type != SCREEN_OPENGL) || !RENDER_GetForceUpdate()) && !sdl.updating)
+    if (((sdl.desktop.type != SCREEN_OPENGL) ||
+         (!RENDER_GetForceUpdate() &&
+          !mod_presentation_required)) &&
+        !sdl.updating)
         return;
 #if C_OPENGL
     actually_updating = sdl.updating;
@@ -3386,6 +3391,10 @@ switch_type:
             // Clear drawing area. Some drivers (on Linux) have more than 2 buffers and the screen might
             // be dirty because of other programs.
             if (!actually_updating) {
+                if (mod_presentation_required) {
+                    OUTPUT_OPENGL_PresentModFrame();
+                    return;
+                }
                 /* Don't really update; Just increase the frame counter.
                  * If we tried to update it may have not worked so well
                  * with VSync...

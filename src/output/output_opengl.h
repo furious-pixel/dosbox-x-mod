@@ -150,6 +150,8 @@ Bitu OUTPUT_OPENGL_GetBestMode(Bitu flags);
 Bitu OUTPUT_OPENGL_SetSize();
 bool OUTPUT_OPENGL_StartUpdate(uint8_t* &pixels, Bitu &pitch);
 void OUTPUT_OPENGL_EndUpdate(const uint16_t *changedLines);
+bool OUTPUT_OPENGL_ModPresentationRequired(void);
+void OUTPUT_OPENGL_PresentModFrame(void);
 void OUTPUT_OPENGL_Shutdown();
 bool OUTPUT_OPENGL_CycleModRenderViewMode(Bitu *target_width, Bitu *target_height);
 const char *OUTPUT_OPENGL_GetModRenderViewModeName(void);

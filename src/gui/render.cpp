@@ -517,9 +517,10 @@ void RENDER_EndUpdate( bool abort ) {
                 total += render.frameskip.hadSkip[i];
             LOG_MSG( "Skipped frame %d %d", PIC_Ticks, (total * 100) / RENDER_SKIP_CACHE );
 #endif
-            // Force output to update the screen even if nothing changed...
-            // works only with Direct3D output (GFX_StartUpdate() was probably not even called)
-            if (RENDER_GetForceUpdate()) GFX_EndUpdate(nullptr);
+            // Let outputs that require presentation independently of guest
+            // framebuffer changes present their existing texture. Outputs
+            // without such a requirement retain their normal early-out.
+            GFX_EndUpdate(nullptr);
         }
     }
     render.frameskip.index = (render.frameskip.index + 1) & (RENDER_SKIP_CACHE - 1);

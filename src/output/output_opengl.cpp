@@ -1474,6 +1474,22 @@ static void FinishOpenGLPresentation(void)
     mod_render_was_active = mod_render_active;
 }
 
+bool OUTPUT_OPENGL_ModPresentationRequired(void)
+{
+    return mod_render_view_mode != MOD_RENDER_VIEW_GAME_ONLY &&
+           (MOD_RenderActive() || mod_render_was_active);
+}
+
+void OUTPUT_OPENGL_PresentModFrame(void)
+{
+    if (!OUTPUT_OPENGL_ModPresentationRequired())
+        return;
+
+    FinishOpenGLPresentation();
+    if (!menu.hidecycles && !sdl.desktop.fullscreen)
+        frames++;
+}
+
 void OUTPUT_OPENGL_EndUpdate(const uint16_t *changedLines)
 {
     if (!(sdl.must_redraw_all && changedLines == NULL)) 

@@ -40,6 +40,9 @@ typedef PyObject *(*PyCFunction)(PyObject *, PyObject *);
 
 #define DOSBOX_PY_METH_VARARGS 0x0001
 
+const size_t MAX_MEMORY_BLOCK_RANGES = 8192;
+const size_t MAX_MEMORY_BLOCK_BYTES = 64u * 1024u * 1024u;
+
 struct PyMethodDef {
 	const char *ml_name;
 	PyCFunction ml_meth;
@@ -398,6 +401,8 @@ static std::string build_mod_helper_bootstrap(void)
 		<< "        return mod._read_runtime_i32(addr)\n"
 		<< "    def read_runtime_bytes(self, addr, size):\n"
 		<< "        return mod._read_runtime_bytes(addr, size)\n"
+		<< "    def read_runtime_blocks(self, ranges):\n"
+		<< "        return mod._read_runtime_blocks(ranges)\n"
 		<< "    def write_reloc_u8(self, addr, value):\n"
 		<< "        return mod._write_u8(addr, value)\n"
 		<< "    def write_reloc_u16(self, addr, value):\n"
@@ -1131,6 +1136,107 @@ static PyObject *py_read_i32(PyObject *, PyObject *args)
 
 typedef bool (*MemoryBlockReader)(uint32_t, uint8_t *, size_t);
 
+struct MemoryBlockRange {
+	uint32_t address = 0;
+	size_t size = 0;
+	size_t destination_offset = 0;
+};
+
+static bool py_sequence_get_uint32(PyObject *sequence,
+	                               Py_ssize_t index,
+	                               const std::string &context,
+	                               uint32_t *value)
+{
+	PyOwnedRef item(g_python.api.PySequence_GetItem(sequence, index));
+	if (!item) {
+		set_python_error(g_python.api.PyExc_TypeError,
+		                 (context + " must be an integer").c_str());
+		return false;
+	}
+
+	clear_python_error();
+	const unsigned long parsed = g_python.api.PyLong_AsUnsignedLong(item.get());
+	if (g_python.api.PyErr_Occurred && g_python.api.PyErr_Occurred() != NULL)
+		return false;
+	if (static_cast<uint64_t>(parsed) > UINT32_MAX) {
+		set_python_error(g_python.api.PyExc_OverflowError,
+		                 (context + " exceeds uint32").c_str());
+		return false;
+	}
+
+	*value = static_cast<uint32_t>(parsed);
+	return true;
+}
+
+static bool parse_memory_block_ranges(PyObject *range_sequence,
+	                                  std::vector<MemoryBlockRange> *ranges,
+	                                  size_t *total_size)
+{
+	clear_python_error();
+	const Py_ssize_t range_count = g_python.api.PySequence_Size(range_sequence);
+	if (range_count < 0) {
+		set_python_error(g_python.api.PyExc_TypeError,
+		                 "read_runtime_blocks ranges must be a sequence");
+		return false;
+	}
+	if (static_cast<size_t>(range_count) > MAX_MEMORY_BLOCK_RANGES) {
+		set_python_error(g_python.api.PyExc_ValueError,
+		                 "read_runtime_blocks has too many ranges");
+		return false;
+	}
+
+	ranges->clear();
+	ranges->reserve(static_cast<size_t>(range_count));
+	*total_size = 0;
+	for (Py_ssize_t index = 0; index < range_count; ++index) {
+		PyOwnedRef range(g_python.api.PySequence_GetItem(range_sequence, index));
+		if (!range) {
+			set_python_error(g_python.api.PyExc_TypeError,
+			                 "read_runtime_blocks range must be a sequence");
+			return false;
+		}
+
+		clear_python_error();
+		const Py_ssize_t field_count = g_python.api.PySequence_Size(range.get());
+		if (field_count != 2) {
+			set_python_error(g_python.api.PyExc_TypeError,
+			                 "read_runtime_blocks range must contain (address, size)");
+			return false;
+		}
+
+		const std::string prefix =
+		        "read_runtime_blocks range " + std::to_string(index);
+		uint32_t address = 0;
+		uint32_t range_size = 0;
+		if (!py_sequence_get_uint32(range.get(), 0, prefix + " address", &address) ||
+		    !py_sequence_get_uint32(range.get(), 1, prefix + " size", &range_size)) {
+			return false;
+		}
+
+		if (range_size != 0 &&
+		    static_cast<uint64_t>(address) + static_cast<uint64_t>(range_size) >
+		            static_cast<uint64_t>(UINT32_MAX) + 1u) {
+			set_python_error(g_python.api.PyExc_OverflowError,
+			                 (prefix + " wraps the runtime address space").c_str());
+			return false;
+		}
+		if (static_cast<size_t>(range_size) > MAX_MEMORY_BLOCK_BYTES - *total_size) {
+			set_python_error(g_python.api.PyExc_OverflowError,
+			                 "read_runtime_blocks total size exceeds 64 MiB");
+			return false;
+		}
+
+		MemoryBlockRange parsed_range = {};
+		parsed_range.address = address;
+		parsed_range.size = static_cast<size_t>(range_size);
+		parsed_range.destination_offset = *total_size;
+		ranges->push_back(parsed_range);
+		*total_size += parsed_range.size;
+	}
+
+	return true;
+}
+
 static PyObject *read_memory_bytes(uint32_t address,
 	                               size_t size,
 	                               MemoryBlockReader reader,
@@ -1152,6 +1258,39 @@ static PyObject *read_memory_bytes(uint32_t address,
 	if (!reader(address, destination, size)) {
 		set_python_error(g_python.api.PyExc_RuntimeError, error_message);
 		return NULL;
+	}
+
+	return data.release();
+}
+
+static PyObject *read_memory_blocks(const std::vector<MemoryBlockRange> &ranges,
+	                                size_t total_size,
+	                                MemoryBlockReader reader,
+	                                const char *error_prefix)
+{
+	PyOwnedRef data(g_python.api.PyBytes_FromStringAndSize(
+	        NULL, static_cast<Py_ssize_t>(total_size)));
+	if (!data)
+		return NULL;
+
+	uint8_t *destination = NULL;
+	if (total_size != 0) {
+		char *bytes = g_python.api.PyBytes_AsString(data.get());
+		if (!bytes)
+			return NULL;
+		destination = reinterpret_cast<uint8_t *>(bytes);
+	}
+
+	for (size_t index = 0; index < ranges.size(); ++index) {
+		const MemoryBlockRange &range = ranges[index];
+		uint8_t *range_destination =
+		        range.size == 0 ? NULL : destination + range.destination_offset;
+		if (!reader(range.address, range_destination, range.size)) {
+			const std::string message = std::string(error_prefix) +
+			                            " failed at range " + std::to_string(index);
+			set_python_error(g_python.api.PyExc_RuntimeError, message.c_str());
+			return NULL;
+		}
 	}
 
 	return data.release();
@@ -1297,6 +1436,32 @@ static PyObject *py_read_runtime_bytes(PyObject *, PyObject *args)
 	                         static_cast<size_t>(size_value),
 	                         MOD_ReadRuntimeMemoryBlock,
 	                         "read_runtime_bytes failed");
+}
+
+static PyObject *py_read_runtime_blocks(PyObject *, PyObject *args)
+{
+	if (g_python.api.PyTuple_Size(args) != 1) {
+		set_python_error(g_python.api.PyExc_TypeError,
+		                 "read_runtime_blocks expects (ranges)");
+		return NULL;
+	}
+
+	PyObject *range_sequence = g_python.api.PyTuple_GetItem(args, 0);
+	if (!range_sequence) {
+		set_python_error(g_python.api.PyExc_RuntimeError,
+		                 "read_runtime_blocks failed to read ranges");
+		return NULL;
+	}
+
+	std::vector<MemoryBlockRange> ranges = {};
+	size_t total_size = 0;
+	if (!parse_memory_block_ranges(range_sequence, &ranges, &total_size))
+		return NULL;
+
+	return read_memory_blocks(ranges,
+	                          total_size,
+	                          MOD_ReadRuntimeMemoryBlock,
+	                          "read_runtime_blocks");
 }
 
 static PyObject *py_write_u8(PyObject *, PyObject *args)
@@ -1461,6 +1626,9 @@ static bool ensure_mod_helper_module(void)
 	        "_read_runtime_i32", py_read_runtime_i32, DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef read_runtime_bytes_method = {
 	        "_read_runtime_bytes", py_read_runtime_bytes, DOSBOX_PY_METH_VARARGS, NULL};
+	static PyMethodDef read_runtime_blocks_method = {
+	        "_read_runtime_blocks", py_read_runtime_blocks,
+	        DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef write_u8_method = {
 	        "_write_u8", py_write_u8, DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef write_u16_method = {
@@ -1496,6 +1664,8 @@ static bool ensure_mod_helper_module(void)
 	                            &read_runtime_i32_method) ||
 	    !attach_module_function(mod_module.get(), "_read_runtime_bytes",
 	                            &read_runtime_bytes_method) ||
+	    !attach_module_function(mod_module.get(), "_read_runtime_blocks",
+	                            &read_runtime_blocks_method) ||
 	    !attach_module_function(mod_module.get(), "_write_u8", &write_u8_method) ||
 	    !attach_module_function(mod_module.get(), "_write_u16", &write_u16_method) ||
 	    !attach_module_function(mod_module.get(), "_write_u32", &write_u32_method) ||

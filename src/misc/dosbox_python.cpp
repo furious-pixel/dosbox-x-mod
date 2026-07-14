@@ -77,6 +77,7 @@ struct PythonAPI {
 	PyObject *(*PyTuple_New)(Py_ssize_t) = NULL;
 	int (*PyTuple_SetItem)(PyObject *, Py_ssize_t, PyObject *) = NULL;
 	PyObject *(*PyBytes_FromStringAndSize)(const char *, Py_ssize_t) = NULL;
+	char *(*PyBytes_AsString)(PyObject *) = NULL;
 	void (*Py_IncRef)(PyObject *) = NULL;
 	void (*Py_DecRef)(PyObject *) = NULL;
 	void *(*PyErr_Occurred)(void) = NULL;
@@ -105,7 +106,8 @@ struct PythonAPI {
 		       PyLong_FromUnsignedLong &&
 		       PyLong_FromUnsignedLongLong && PyLong_FromLong &&
 		       PyFloat_FromDouble && PyTuple_New && PyTuple_SetItem &&
-		       PyBytes_FromStringAndSize && Py_IncRef && Py_DecRef &&
+		       PyBytes_FromStringAndSize && PyBytes_AsString &&
+		       Py_IncRef && Py_DecRef &&
 		       PyErr_Occurred && PyErr_Clear && PyErr_Print &&
 		       PyErr_SetString && Py_FinalizeEx &&
 		       PyExc_RuntimeError && PyExc_TypeError &&
@@ -1106,6 +1108,34 @@ static PyObject *py_read_i32(PyObject *, PyObject *args)
 	return g_python.api.PyLong_FromLong(static_cast<long>(value));
 }
 
+typedef bool (*MemoryBlockReader)(uint32_t, uint8_t *, size_t);
+
+static PyObject *read_memory_bytes(uint32_t address,
+	                               size_t size,
+	                               MemoryBlockReader reader,
+	                               const char *error_message)
+{
+	PyOwnedRef data(g_python.api.PyBytes_FromStringAndSize(
+	        NULL, static_cast<Py_ssize_t>(size)));
+	if (!data)
+		return NULL;
+
+	uint8_t *destination = NULL;
+	if (size != 0) {
+		char *bytes = g_python.api.PyBytes_AsString(data.get());
+		if (!bytes)
+			return NULL;
+		destination = reinterpret_cast<uint8_t *>(bytes);
+	}
+
+	if (!reader(address, destination, size)) {
+		set_python_error(g_python.api.PyExc_RuntimeError, error_message);
+		return NULL;
+	}
+
+	return data.release();
+}
+
 static PyObject *py_read_bytes(PyObject *, PyObject *args)
 {
 	if (g_python.api.PyTuple_Size(args) != 2) {
@@ -1127,18 +1157,10 @@ static PyObject *py_read_bytes(PyObject *, PyObject *args)
 		return NULL;
 	}
 
-	const size_t size = static_cast<size_t>(size_value);
-	std::vector<uint8_t> data(size);
-	if (!MOD_ReadMemoryBlock(static_cast<uint32_t>(reloc_addr),
-	                         data.empty() ? NULL : data.data(),
-	                         data.size())) {
-		set_python_error(g_python.api.PyExc_RuntimeError, "read_bytes failed");
-		return NULL;
-	}
-
-	return g_python.api.PyBytes_FromStringAndSize(
-	        data.empty() ? "" : reinterpret_cast<const char *>(data.data()),
-	        static_cast<Py_ssize_t>(data.size()));
+	return read_memory_bytes(static_cast<uint32_t>(reloc_addr),
+	                         static_cast<size_t>(size_value),
+	                         MOD_ReadMemoryBlock,
+	                         "read_bytes failed");
 }
 
 static PyObject *py_read_runtime_u8(PyObject *, PyObject *args)
@@ -1250,19 +1272,10 @@ static PyObject *py_read_runtime_bytes(PyObject *, PyObject *args)
 		return NULL;
 	}
 
-	const size_t size = static_cast<size_t>(size_value);
-	std::vector<uint8_t> data(size);
-	if (!MOD_ReadRuntimeMemoryBlock(static_cast<uint32_t>(linear_addr),
-	                                data.empty() ? NULL : data.data(),
-	                                data.size())) {
-		set_python_error(g_python.api.PyExc_RuntimeError,
-		                 "read_runtime_bytes failed");
-		return NULL;
-	}
-
-	return g_python.api.PyBytes_FromStringAndSize(
-	        data.empty() ? "" : reinterpret_cast<const char *>(data.data()),
-	        static_cast<Py_ssize_t>(data.size()));
+	return read_memory_bytes(static_cast<uint32_t>(linear_addr),
+	                         static_cast<size_t>(size_value),
+	                         MOD_ReadRuntimeMemoryBlock,
+	                         "read_runtime_bytes failed");
 }
 
 static PyObject *py_write_u8(PyObject *, PyObject *args)
@@ -1792,6 +1805,9 @@ static bool load_python_api(const std::string &dll_path)
 	g_python.api.PyBytes_FromStringAndSize =
 	        reinterpret_cast<PyObject *(*)(const char *, Py_ssize_t)>(
 	                resolve_symbol(g_python.api.dll, "PyBytes_FromStringAndSize"));
+	g_python.api.PyBytes_AsString =
+	        reinterpret_cast<char *(*)(PyObject *)>(
+	                resolve_symbol(g_python.api.dll, "PyBytes_AsString"));
 	g_python.api.Py_IncRef =
 	        reinterpret_cast<void (*)(PyObject *)>(
 	                resolve_symbol(g_python.api.dll, "Py_IncRef"));

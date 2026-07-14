@@ -9,6 +9,7 @@
 #include "timer.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdio>
 #include <unordered_map>
@@ -38,6 +39,20 @@ struct ModHookRuntime {
 	std::string description = {};
 };
 
+struct ModNativeCallEventRuntime {
+	uint32_t target_reloc = 0;
+	uint32_t target_linear = 0;
+	uint8_t operation = 0;
+};
+
+static const size_t MOD_NATIVE_CALL_EVENT_CAPACITY = 4096u;
+static const size_t MOD_NO_NATIVE_CALL_EVENT = static_cast<size_t>(-1);
+
+struct ModCallsiteRuntime {
+	std::vector<size_t> python_hook_indices = {};
+	size_t native_call_event_index = MOD_NO_NATIVE_CALL_EVENT;
+};
+
 struct ModExecutableRuntime {
 	ModExecutableConfig config = {};
 	bool delta_ready = false;
@@ -53,7 +68,12 @@ struct ModExecutableRuntime {
 	bool process_start_pending = false;
 	uint16_t process_start_psp = 0;
 	std::vector<ModHookRuntime> hooks = {};
-	std::unordered_map<uint32_t, std::vector<size_t> > hooks_by_linear = {};
+	std::unordered_map<uint32_t, ModCallsiteRuntime> callsites = {};
+	std::vector<ModNativeCallEventRuntime> native_call_event_targets = {};
+	std::array<ModNativeCallEvent, MOD_NATIVE_CALL_EVENT_CAPACITY>
+	        native_call_event_buffer = {};
+	size_t native_call_event_count = 0;
+	uint64_t native_call_event_dropped = 0;
 };
 
 struct ModRuntime {
@@ -225,7 +245,13 @@ static void update_fast_enabled(void)
 		return;
 	}
 
-	g_mod.fast_enabled = runtime->frame_start_ready || !runtime->hooks_by_linear.empty();
+	g_mod.fast_enabled = runtime->frame_start_ready || !runtime->callsites.empty();
+}
+
+static void reset_native_call_events(ModExecutableRuntime &runtime)
+{
+	runtime.native_call_event_count = 0;
+	runtime.native_call_event_dropped = 0;
 }
 
 static void reset_runtime_frame_state(ModExecutableRuntime &runtime)
@@ -259,7 +285,9 @@ static void rebuild_runtime_hooks(ModExecutableRuntime &runtime)
 {
 	runtime.frame_start_ready = false;
 	runtime.frame_start_linear = 0;
-	runtime.hooks_by_linear.clear();
+	runtime.callsites.clear();
+	runtime.native_call_event_targets.clear();
+	reset_native_call_events(runtime);
 
 	if (!runtime.delta_ready)
 		return;
@@ -286,8 +314,76 @@ static void rebuild_runtime_hooks(ModExecutableRuntime &runtime)
 		}
 
 		hook.linear_eip = linear_eip;
-		runtime.hooks_by_linear[linear_eip].push_back(i);
+		runtime.callsites[linear_eip].python_hook_indices.push_back(i);
 	}
+
+	if (!runtime.config.has_native_call_event_scan_range ||
+	    runtime.config.native_call_events.empty()) {
+		return;
+	}
+
+	for (size_t i = 0; i < runtime.config.native_call_events.size(); ++i) {
+		const ModNativeCallEventConfig &config =
+		        runtime.config.native_call_events[i];
+		uint32_t target_linear = 0;
+		if (!apply_delta(config.target_reloc, runtime.delta, &target_linear)) {
+			LOG_MSG("MOD ERROR: native call event target 0x%08lX is invalid with delta",
+			        static_cast<unsigned long>(config.target_reloc));
+			continue;
+		}
+
+		ModNativeCallEventRuntime target = {};
+		target.target_reloc = config.target_reloc;
+		target.target_linear = target_linear;
+		target.operation = config.operation;
+		runtime.native_call_event_targets.push_back(target);
+	}
+
+	uint32_t scan_start = 0;
+	uint32_t scan_end = 0;
+	if (!apply_delta(runtime.config.native_call_event_scan_start,
+	                 runtime.delta,
+	                 &scan_start) ||
+	    !apply_delta(runtime.config.native_call_event_scan_end,
+	                 runtime.delta,
+	                 &scan_end) ||
+	    scan_start >= scan_end || scan_end - scan_start < 5u) {
+		LOG_MSG("MOD ERROR: native call event scan range is invalid with delta");
+		return;
+	}
+
+	size_t discovered_native_sites = 0;
+	for (uint32_t callsite = scan_start; callsite <= scan_end - 5u; ++callsite) {
+		uint8_t opcode = 0;
+		if (mem_readb_checked(callsite, &opcode) || opcode != 0xe8u)
+			continue;
+
+		uint32_t raw_displacement = 0;
+		if (mem_readd_checked(callsite + 1u, &raw_displacement))
+			continue;
+
+		const int64_t target_value =
+		        static_cast<int64_t>(callsite) + 5ll +
+		        static_cast<int64_t>(static_cast<int32_t>(raw_displacement));
+		if (target_value < 0 || target_value > 0xffffffffll)
+			continue;
+
+		const uint32_t target_linear = static_cast<uint32_t>(target_value);
+		for (size_t i = 0; i < runtime.native_call_event_targets.size(); ++i) {
+			if (runtime.native_call_event_targets[i].target_linear != target_linear)
+				continue;
+			ModCallsiteRuntime &callsite_runtime = runtime.callsites[callsite];
+			if (callsite_runtime.native_call_event_index ==
+			    MOD_NO_NATIVE_CALL_EVENT) {
+				discovered_native_sites += 1;
+			}
+			callsite_runtime.native_call_event_index = i;
+			break;
+		}
+	}
+
+	LOG_MSG("MOD: discovered %u native call event site(s)",
+	        static_cast<unsigned int>(discovered_native_sites));
 }
 
 static bool find_landmark_address(const ModExecutableConfig &config,
@@ -377,6 +473,7 @@ static void activate_runtime_process(ModExecutableRuntime &runtime,
 	g_mod.active_executable_index = runtime_index;
 	g_mod.active_executable_valid = true;
 	reset_runtime_frame_state(runtime);
+	reset_native_call_events(runtime);
 	update_fast_enabled();
 	refresh_dynamic_cpu_cache();
 
@@ -668,6 +765,7 @@ void MOD_OnTerminatePSP(uint16_t pspseg, bool tsr, uint8_t exitcode)
 			runtime.process_start_psp = 0;
 			g_mod.active_executable_valid = false;
 			reset_runtime_frame_state(runtime);
+			reset_native_call_events(runtime);
 			update_fast_enabled();
 			refresh_dynamic_cpu_cache();
 			DOSBoxPython_ResetModRuntimeState();
@@ -724,13 +822,29 @@ void MOD_OnCallsite(uint32_t linear_eip)
 	if (runtime->frame_start_ready && linear_eip == runtime->frame_start_linear)
 		update_frame_timing(*runtime);
 
-	const std::unordered_map<uint32_t, std::vector<size_t> >::const_iterator it =
-	        runtime->hooks_by_linear.find(linear_eip);
-	if (it == runtime->hooks_by_linear.end())
+	const std::unordered_map<uint32_t, ModCallsiteRuntime>::const_iterator it =
+	        runtime->callsites.find(linear_eip);
+	if (it == runtime->callsites.end())
 		return;
 
-	for (size_t i = 0; i < it->second.size(); ++i) {
-		const size_t hook_index = it->second[i];
+	const size_t native_event_index = it->second.native_call_event_index;
+	if (native_event_index < runtime->native_call_event_targets.size()) {
+		if (runtime->native_call_event_count < MOD_NATIVE_CALL_EVENT_CAPACITY) {
+			const ModNativeCallEventRuntime &target =
+			        runtime->native_call_event_targets[native_event_index];
+			ModNativeCallEvent &event =
+			        runtime->native_call_event_buffer[runtime->native_call_event_count++];
+			event.value = reg_eax;
+			event.source_reloc = static_cast<uint32_t>(
+			        static_cast<int64_t>(linear_eip) - runtime->delta);
+			event.operation = target.operation;
+		} else {
+			runtime->native_call_event_dropped += 1;
+		}
+	}
+
+	for (size_t i = 0; i < it->second.python_hook_indices.size(); ++i) {
+		const size_t hook_index = it->second.python_hook_indices[i];
 		if (hook_index >= runtime->hooks.size())
 			continue;
 
@@ -845,6 +959,24 @@ bool MOD_ReadRuntimeMemoryBlock(uint32_t linear_addr, uint8_t *data, size_t size
 		return false;
 
 	MEM_BlockRead(linear_addr, data, static_cast<Bitu>(size));
+	return true;
+}
+
+bool MOD_DrainNativeCallEvents(std::vector<ModNativeCallEvent> *events,
+                               uint64_t *dropped)
+{
+	if (!events || !dropped)
+		return false;
+
+	ModExecutableRuntime *runtime = NULL;
+	if (!get_active_runtime(&runtime))
+		return false;
+
+	events->assign(runtime->native_call_event_buffer.begin(),
+	               runtime->native_call_event_buffer.begin() +
+	                       runtime->native_call_event_count);
+	*dropped = runtime->native_call_event_dropped;
+	reset_native_call_events(*runtime);
 	return true;
 }
 

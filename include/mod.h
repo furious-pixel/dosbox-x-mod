@@ -4,8 +4,14 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string>
+#include <vector>
 
 class Config;
+
+struct ModNativeCallEventConfig {
+	uint32_t target_reloc = 0;
+	uint8_t operation = 0;
+};
 
 struct ModExecutableConfig {
 	std::string name = {};
@@ -17,6 +23,16 @@ struct ModExecutableConfig {
 	uint32_t scan_end = 0;
 	bool has_frame_start = false;
 	uint32_t frame_start_reloc = 0;
+	bool has_native_call_event_scan_range = false;
+	uint32_t native_call_event_scan_start = 0;
+	uint32_t native_call_event_scan_end = 0;
+	std::vector<ModNativeCallEventConfig> native_call_events = {};
+};
+
+struct ModNativeCallEvent {
+	uint32_t value = 0;
+	uint32_t source_reloc = 0;
+	uint8_t operation = 0;
 };
 
 struct ModFrameState {
@@ -72,6 +88,8 @@ void MOD_OnTerminatePSP(uint16_t pspseg, bool tsr, uint8_t exitcode);
 bool MOD_FastEnabled(void);
 bool MOD_RenderActive(void);
 void MOD_OnCallsite(uint32_t linear_eip);
+bool MOD_DrainNativeCallEvents(std::vector<ModNativeCallEvent> *events,
+                               uint64_t *dropped);
 
 bool MOD_ReadMemoryU8(uint32_t reloc_addr, uint8_t *value);
 bool MOD_ReadMemoryU16(uint32_t reloc_addr, uint16_t *value);

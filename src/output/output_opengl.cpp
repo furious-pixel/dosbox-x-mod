@@ -115,6 +115,22 @@ static Bitu mod_render_saved_window_width = 0;
 static Bitu mod_render_saved_window_height = 0;
 static bool mod_render_was_active = false;
 
+struct ModPresentationMetricsState {
+    uint64_t latest_ready_sequence = 0;
+    uint64_t last_presented_ready_sequence = 0;
+    uint64_t native_count = 0;
+    uint64_t mod_count = 0;
+    uint64_t presentation_count = 0;
+    uint64_t latency_sample_count = 0;
+    double latency_sum_ms = 0.0;
+    double latency_max_ms = 0.0;
+    uint32_t latest_ready_ticks = 0;
+    uint32_t interval_start_ticks = 0;
+    OpenGLModPresentationMetrics snapshot = {};
+};
+
+static ModPresentationMetricsState mod_presentation_metrics = {};
+
 // One normal inactive present clears the current back buffer before swapping.
 // Two post-swap clears drain the other buffers when drivers are effectively
 // triple-buffering behind SDL's back.
@@ -1122,6 +1138,20 @@ static const char *GetModRenderViewModeNameInternal(const ModRenderViewMode mode
     }
 }
 
+static const char *GetModRenderViewModeTitleLabelInternal(
+        const ModRenderViewMode mode)
+{
+    switch (mode) {
+    case MOD_RENDER_VIEW_MOD_ONLY:
+        return "mod";
+    case MOD_RENDER_VIEW_SIDE_BY_SIDE:
+        return "orig+mod";
+    case MOD_RENDER_VIEW_GAME_ONLY:
+    default:
+        return "orig";
+    }
+}
+
 bool OUTPUT_OPENGL_CycleModRenderViewMode(Bitu *target_width, Bitu *target_height)
 {
     if (target_width)
@@ -1177,6 +1207,95 @@ bool OUTPUT_OPENGL_CycleModRenderViewMode(Bitu *target_width, Bitu *target_heigh
 const char *OUTPUT_OPENGL_GetModRenderViewModeName(void)
 {
     return GetModRenderViewModeNameInternal(mod_render_view_mode);
+}
+
+const char *OUTPUT_OPENGL_GetModRenderViewModeTitleLabel(void)
+{
+    return GetModRenderViewModeTitleLabelInternal(mod_render_view_mode);
+}
+
+uint64_t OUTPUT_OPENGL_NotifyModFrameReady(void)
+{
+    ModPresentationMetricsState &metrics = mod_presentation_metrics;
+    const uint32_t now = SDL_GetTicks();
+    if (metrics.interval_start_ticks == 0)
+        metrics.interval_start_ticks = now;
+
+    metrics.latest_ready_sequence++;
+    metrics.latest_ready_ticks = now;
+    metrics.mod_count++;
+    return metrics.latest_ready_sequence;
+}
+
+static void RecordNativeFrame(void)
+{
+    ModPresentationMetricsState &metrics = mod_presentation_metrics;
+    const uint32_t now = SDL_GetTicks();
+    if (metrics.interval_start_ticks == 0)
+        metrics.interval_start_ticks = now;
+    metrics.native_count++;
+}
+
+void OUTPUT_OPENGL_GetModPresentationMetrics(
+        OpenGLModPresentationMetrics *result)
+{
+    if (!result)
+        return;
+
+    ModPresentationMetricsState &metrics = mod_presentation_metrics;
+    const uint32_t now = SDL_GetTicks();
+    if (metrics.interval_start_ticks == 0)
+        metrics.interval_start_ticks = now;
+
+    const uint32_t elapsed_ms = now - metrics.interval_start_ticks;
+    if (elapsed_ms >= 400u) {
+        const uint64_t rounding = elapsed_ms / 2u;
+        metrics.snapshot.native_fps = (uint32_t)(
+                (metrics.native_count * 1000u + rounding) / elapsed_ms);
+        metrics.snapshot.mod_fps = (uint32_t)(
+                (metrics.mod_count * 1000u + rounding) / elapsed_ms);
+        metrics.snapshot.presentation_fps = (uint32_t)(
+                (metrics.presentation_count * 1000u + rounding) / elapsed_ms);
+        metrics.snapshot.latency_valid = metrics.latency_sample_count != 0;
+        if (metrics.snapshot.latency_valid) {
+            metrics.snapshot.average_latency_ms =
+                    metrics.latency_sum_ms / (double)metrics.latency_sample_count;
+            metrics.snapshot.maximum_latency_ms = metrics.latency_max_ms;
+        } else {
+            metrics.snapshot.average_latency_ms = 0.0;
+            metrics.snapshot.maximum_latency_ms = 0.0;
+        }
+
+        metrics.native_count = 0;
+        metrics.mod_count = 0;
+        metrics.presentation_count = 0;
+        metrics.latency_sample_count = 0;
+        metrics.latency_sum_ms = 0.0;
+        metrics.latency_max_ms = 0.0;
+        metrics.interval_start_ticks = now;
+    }
+
+    *result = metrics.snapshot;
+}
+
+static void RecordOpenGLPresentation(const bool compositor_invoked)
+{
+    ModPresentationMetricsState &metrics = mod_presentation_metrics;
+    const uint32_t now = SDL_GetTicks();
+    if (metrics.interval_start_ticks == 0)
+        metrics.interval_start_ticks = now;
+
+    metrics.presentation_count++;
+    if (!compositor_invoked || metrics.latest_ready_sequence == 0 ||
+        metrics.latest_ready_sequence == metrics.last_presented_ready_sequence) {
+        return;
+    }
+
+    metrics.last_presented_ready_sequence = metrics.latest_ready_sequence;
+    const double latency_ms = (double)(now - metrics.latest_ready_ticks);
+    metrics.latency_sum_ms += latency_ms;
+    metrics.latency_sample_count++;
+    metrics.latency_max_ms = std::max(metrics.latency_max_ms, latency_ms);
 }
 
 static OpenGLPresentationLayout BuildOpenGLPresentationLayout(void)
@@ -1447,6 +1566,7 @@ static void FinishOpenGLPresentation(void)
     const bool drain_inactive_buffers =
             mod_render_view_mode != MOD_RENDER_VIEW_GAME_ONLY &&
             mod_render_was_active && !mod_render_active;
+    bool compositor_invoked = false;
 
     if (mod_render_active)
         DOSBoxPython_InvokeOpenGLInitCallback(mod_state);
@@ -1459,7 +1579,8 @@ static void FinishOpenGLPresentation(void)
 
     if (mod_render_active &&
         mod_render_view_mode != MOD_RENDER_VIEW_GAME_ONLY) {
-        DOSBoxPython_InvokeOpenGLCompositorCallback(mod_state);
+        compositor_invoked =
+                DOSBoxPython_InvokeOpenGLCompositorCallback(mod_state);
     } else if (!mod_render_active &&
                mod_render_view_mode != MOD_RENDER_VIEW_GAME_ONLY) {
         DrawDOSBoxTextureToViewport(layout, fallback);
@@ -1467,6 +1588,7 @@ static void FinishOpenGLPresentation(void)
 
     RestoreOpenGLPresentationState(layout);
     SDL_GL_SwapBuffers();
+    RecordOpenGLPresentation(compositor_invoked);
 
     if (drain_inactive_buffers)
         DrainInactiveModRenderBuffers(layout);
@@ -1550,6 +1672,7 @@ void OUTPUT_OPENGL_EndUpdate(const uint16_t *changedLines)
 #endif
                     (uint8_t *)sdl_opengl.framebuf);
             }
+            RecordNativeFrame();
             FinishOpenGLPresentation();
         }
         else
@@ -1572,6 +1695,7 @@ void OUTPUT_OPENGL_EndUpdate(const uint16_t *changedLines)
 #endif
                 (void*)0);
             glBindBufferARB(GL_PIXEL_UNPACK_BUFFER_EXT, 0);
+            RecordNativeFrame();
             //glCallList(sdl_opengl.displaylist);
             //SDL_GL_SwapBuffers();
         }
@@ -1617,6 +1741,7 @@ void OUTPUT_OPENGL_EndUpdate(const uint16_t *changedLines)
                 }
                 index++;
             }
+            RecordNativeFrame();
         } else
             return;
 

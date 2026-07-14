@@ -140,6 +140,15 @@ static char const shader_src_default[] =
 
 extern SDL_OpenGL sdl_opengl;
 
+struct OpenGLModPresentationMetrics {
+    uint32_t native_fps;
+    uint32_t mod_fps;
+    uint32_t presentation_fps;
+    bool latency_valid;
+    double average_latency_ms;
+    double maximum_latency_ms;
+};
+
 // output API
 void OUTPUT_OPENGL_Initialize();
 /* Anton Shepelev: the GLKind parameter violates the generality of the API, */
@@ -152,9 +161,12 @@ bool OUTPUT_OPENGL_StartUpdate(uint8_t* &pixels, Bitu &pitch);
 void OUTPUT_OPENGL_EndUpdate(const uint16_t *changedLines);
 bool OUTPUT_OPENGL_ModPresentationRequired(void);
 void OUTPUT_OPENGL_PresentModFrame(void);
+uint64_t OUTPUT_OPENGL_NotifyModFrameReady(void);
+void OUTPUT_OPENGL_GetModPresentationMetrics(OpenGLModPresentationMetrics *metrics);
 void OUTPUT_OPENGL_Shutdown();
 bool OUTPUT_OPENGL_CycleModRenderViewMode(Bitu *target_width, Bitu *target_height);
 const char *OUTPUT_OPENGL_GetModRenderViewModeName(void);
+const char *OUTPUT_OPENGL_GetModRenderViewModeTitleLabel(void);
 
 #endif //C_OPENGL
 

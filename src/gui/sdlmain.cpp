@@ -1103,7 +1103,16 @@ void GFX_SetTitle(int32_t cycles, int frameskip, Bits timing, bool paused) {
 //  static Bits internal_frameskip=0;
     static int32_t internal_cycles=0;
 //  static Bits internal_timing=0;
-    char title[250] = {0};
+    char title[350] = {0};
+    char mod_view_suffix[24] = {0};
+
+#if C_OPENGL
+    if (sdl.desktop.want_type == SCREEN_OPENGL ||
+        sdl.desktop.type == SCREEN_OPENGL) {
+        sprintf(mod_view_suffix, " [%s]",
+                OUTPUT_OPENGL_GetModRenderViewModeTitleLabel());
+    }
+#endif
 
     Section_prop *section = static_cast<Section_prop *>(control->GetSection("SDL"));
     assert(section != NULL);
@@ -1115,7 +1124,7 @@ void GFX_SetTitle(int32_t cycles, int frameskip, Bits timing, bool paused) {
 
     bool showbasic = section->Get_bool("showbasic");
     if (showbasic) {
-        sprintf(title,"%s%sDOSBox-X %s", dosbox_title.c_str(),dosbox_title.empty()?"":" - ", VERSION);
+        sprintf(title,"%s%sDOSBox-X %s%s", dosbox_title.c_str(),dosbox_title.empty()?"":" - ", VERSION, mod_view_suffix);
 
         const char *what = RunningProgram;
         if (what != NULL && *what != 0) {
@@ -1130,12 +1139,29 @@ void GFX_SetTitle(int32_t cycles, int frameskip, Bits timing, bool paused) {
         else
             sprintf(p,"%d cycles/ms", (int)internal_cycles);
     } else
-        sprintf(title,"%s%sDOSBox-X", dosbox_title.c_str(),dosbox_title.empty()?"":" - ");
+        sprintf(title,"%s%sDOSBox-X%s", dosbox_title.c_str(),dosbox_title.empty()?"":" - ", mod_view_suffix);
 
     if (!menu.hidecycles) {
         char *p = title + strlen(title); // append to end of string
-
-        sprintf(p,", FPS %2d",(int)frames);
+#if C_OPENGL
+        if ((sdl.desktop.want_type == SCREEN_OPENGL ||
+             sdl.desktop.type == SCREEN_OPENGL) &&
+            strcmp(OUTPUT_OPENGL_GetModRenderViewModeTitleLabel(), "orig") != 0) {
+            OpenGLModPresentationMetrics metrics = {};
+            OUTPUT_OPENGL_GetModPresentationMetrics(&metrics);
+            sprintf(p, ", native %u FPS, mod %u FPS, present %u FPS",
+                    metrics.native_fps,
+                    metrics.mod_fps,
+                    metrics.presentation_fps);
+            if (metrics.latency_valid) {
+                p = title + strlen(title);
+                sprintf(p, ", latency %.1f/%.1f ms",
+                        metrics.average_latency_ms,
+                        metrics.maximum_latency_ms);
+            }
+        } else
+#endif
+            sprintf(p,", FPS %2d",(int)frames);
     }
 
     if (menu.showrt) {
@@ -3182,6 +3208,7 @@ static void CycleModRenderView(bool pressed)
     const bool resize_window =
             OUTPUT_OPENGL_CycleModRenderViewMode(&target_width, &target_height);
     LOG_MSG("MOD: render view -> %s", OUTPUT_OPENGL_GetModRenderViewModeName());
+    GFX_SetTitle(-1, -1, -1, false);
 
 #if defined(C_SDL2)
     if (resize_window && !sdl.desktop.fullscreen && sdl.window &&

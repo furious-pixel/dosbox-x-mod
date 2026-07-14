@@ -10,6 +10,9 @@
 #include "control.h"
 #include "joystick.h"
 #include "logging.h"
+#if C_OPENGL
+#include <output/output_opengl.h>
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -414,6 +417,8 @@ static std::string build_mod_helper_bootstrap(void)
 		<< "if not hasattr(mod, 'gamemem'):\n"
 		<< "    mod.gamemem = _DOSBoxGameMemory()\n"
 		<< "class _DOSBoxOpenGL(object):\n"
+		<< "    def notify_frame_ready(self):\n"
+		<< "        return mod._notify_frame_ready()\n"
 		<< "    pass\n"
 		<< "if not hasattr(mod, 'modgl'):\n"
 		<< "    mod.modgl = _DOSBoxOpenGL()\n"
@@ -1002,6 +1007,22 @@ static PyObject *py_get_modjoystick_axes(PyObject *, PyObject *args)
 	return axis_tuple.release();
 }
 
+static PyObject *py_notify_frame_ready(PyObject *, PyObject *args)
+{
+	if (g_python.api.PyTuple_Size(args) != 0) {
+		set_python_error(g_python.api.PyExc_TypeError,
+		                 "_notify_frame_ready expects no arguments");
+		return NULL;
+	}
+
+	uint64_t sequence = 0;
+#if C_OPENGL
+	sequence = OUTPUT_OPENGL_NotifyModFrameReady();
+#endif
+	return g_python.api.PyLong_FromUnsignedLongLong(
+	        static_cast<unsigned long long>(sequence));
+}
+
 static PyObject *py_get_delta(PyObject *, PyObject *args)
 {
 	if (g_python.api.PyTuple_Size(args) != 0) {
@@ -1415,6 +1436,9 @@ static bool ensure_mod_helper_module(void)
 	        DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef get_modjoystick_axes_method = {
 	        "_get_modjoystick_axes", py_get_modjoystick_axes, DOSBOX_PY_METH_VARARGS, NULL};
+	static PyMethodDef notify_frame_ready_method = {
+	        "_notify_frame_ready", py_notify_frame_ready,
+	        DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef get_delta_method = {
 	        "_get_delta", py_get_delta, DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef read_u8_method = {
@@ -1453,6 +1477,8 @@ static bool ensure_mod_helper_module(void)
 	                            &register_render_callback_method) ||
 	    !attach_module_function(mod_module.get(), "_get_modjoystick_axes",
 	                            &get_modjoystick_axes_method) ||
+	    !attach_module_function(mod_module.get(), "_notify_frame_ready",
+	                            &notify_frame_ready_method) ||
 	    !attach_module_function(mod_module.get(), "_get_delta",
 	                            &get_delta_method) ||
 	    !attach_module_function(mod_module.get(), "_read_u8", &read_u8_method) ||

@@ -876,6 +876,8 @@ void MOD_RunPendingSafePoint(void)
 	    g_mod.guest_call_active) {
 		return;
 	}
+	if (!cpu.pmode || !cpu.code.big || !cpu.stack.big)
+		return;
 
 	ModExecutableRuntime *runtime = NULL;
 	if (!get_active_runtime(&runtime)) {

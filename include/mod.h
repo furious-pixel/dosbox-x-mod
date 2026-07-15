@@ -35,6 +35,13 @@ struct ModNativeCallEvent {
 	uint8_t operation = 0;
 };
 
+struct ModGuestCallRegisters {
+	uint32_t eax = 0;
+	uint32_t ebx = 0;
+	uint32_t ecx = 0;
+	uint32_t edx = 0;
+};
+
 struct ModFrameState {
 	uint64_t frame = 0;
 	double time_seconds = 0.0;
@@ -87,7 +94,13 @@ void MOD_OnExecutableStarted(const char *name, uint16_t pspseg);
 void MOD_OnTerminatePSP(uint16_t pspseg, bool tsr, uint8_t exitcode);
 bool MOD_FastEnabled(void);
 bool MOD_RenderActive(void);
+bool MOD_GuestCallActive(void);
 void MOD_OnCallsite(uint32_t linear_eip);
+bool MOD_RequestSafePoint(void);
+void MOD_RunPendingSafePoint(void);
+bool MOD_CallRelocFunction(uint32_t reloc_eip,
+                           const ModGuestCallRegisters& input,
+                           ModGuestCallRegisters *output);
 bool MOD_DrainNativeCallEvents(std::vector<ModNativeCallEvent> *events,
                                uint64_t *dropped);
 

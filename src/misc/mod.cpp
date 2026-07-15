@@ -1,7 +1,9 @@
 #include "mod.h"
 
+#include "callback.h"
 #include "control.h"
 #include "cpu.h"
+#include "dosbox.h"
 #include "dosbox_python.h"
 #include "logging.h"
 #include "mem.h"
@@ -14,6 +16,10 @@
 #include <cstdio>
 #include <unordered_map>
 #include <vector>
+
+Bitu FillFlags(void);
+void DestroyConditionFlags(void);
+void CALLBACK_DeAllocate(Bitu callback);
 
 #if defined(WIN32) && !defined(HX_DOS)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -85,10 +91,42 @@ struct ModRuntime {
 	size_t active_executable_index = 0;
 	bool fast_enabled = false;
 	bool unsupported_core_logged = false;
+	bool safe_point_pending = false;
+	bool safe_point_active = false;
+	bool guest_call_active = false;
+	bool guest_call_stopped = false;
+	Bitu guest_call_stop_callback = 0;
 	std::vector<ModExecutableRuntime> executables = {};
 };
 
 ModRuntime g_mod = {};
+
+static Bitu guest_call_stop_handler(void)
+{
+	if (!g_mod.guest_call_active)
+		return CBRET_NONE;
+
+	g_mod.guest_call_stopped = true;
+	return CBRET_STOP;
+}
+
+static bool ensure_guest_call_stop_callback(void)
+{
+	if (g_mod.guest_call_stop_callback != 0)
+		return true;
+
+	const Bitu callback = CALLBACK_Allocate();
+	if (!CALLBACK_Setup(callback,
+	                    guest_call_stop_handler,
+	                    CB_RETN,
+	                    "mod guest call stop")) {
+		CALLBACK_DeAllocate(callback);
+		return false;
+	}
+
+	g_mod.guest_call_stop_callback = callback;
+	return true;
+}
 
 static std::string uppercase_ascii_copy(std::string value)
 {
@@ -683,6 +721,8 @@ bool MOD_Init(const Config& config)
 
 void MOD_Shutdown(void)
 {
+	if (g_mod.guest_call_stop_callback != 0)
+		CALLBACK_DeAllocate(g_mod.guest_call_stop_callback);
 	g_mod = {};
 	DOSBoxPython_Shutdown();
 }
@@ -759,6 +799,7 @@ void MOD_OnTerminatePSP(uint16_t pspseg, bool tsr, uint8_t exitcode)
 		ModExecutableRuntime &runtime =
 		        g_mod.executables[g_mod.active_executable_index];
 		if (runtime.process_active && runtime.process_psp == pspseg) {
+			g_mod.safe_point_pending = false;
 			runtime.process_active = false;
 			runtime.process_psp = 0;
 			runtime.process_start_pending = false;
@@ -813,8 +854,108 @@ bool MOD_RenderActive(void)
 	return get_active_runtime(&runtime);
 }
 
+bool MOD_GuestCallActive(void)
+{
+	return g_mod.guest_call_active;
+}
+
+bool MOD_RequestSafePoint(void)
+{
+	ModExecutableRuntime *runtime = NULL;
+	if (!get_active_runtime(&runtime) || g_mod.guest_call_active) {
+		return false;
+	}
+
+	g_mod.safe_point_pending = true;
+	return true;
+}
+
+void MOD_RunPendingSafePoint(void)
+{
+	if (!g_mod.safe_point_pending || g_mod.safe_point_active ||
+	    g_mod.guest_call_active) {
+		return;
+	}
+
+	ModExecutableRuntime *runtime = NULL;
+	if (!get_active_runtime(&runtime)) {
+		g_mod.safe_point_pending = false;
+		return;
+	}
+
+	g_mod.safe_point_pending = false;
+	g_mod.safe_point_active = true;
+	DOSBoxPython_InvokeSafePointCallback();
+	g_mod.safe_point_active = false;
+}
+
+bool MOD_CallRelocFunction(uint32_t reloc_eip,
+                           const ModGuestCallRegisters& input,
+                           ModGuestCallRegisters *output)
+{
+	if (!output || !g_mod.safe_point_active || g_mod.guest_call_active ||
+	    !cpu.pmode || !cpu.code.big || !cpu.stack.big ||
+	    !ensure_guest_call_stop_callback()) {
+		return false;
+	}
+
+	uint32_t target_linear = 0;
+	if (!translate_reloc_address(reloc_eip, &target_linear))
+		return false;
+
+	const uint32_t code_base = static_cast<uint32_t>(SegPhys(cs));
+	const uint32_t code_limit = static_cast<uint32_t>(SegLimit(cs));
+	const uint32_t stop_linear = static_cast<uint32_t>(
+	        CALLBACK_PhysPointer(g_mod.guest_call_stop_callback));
+	if (target_linear < code_base || stop_linear < code_base)
+		return false;
+
+	const uint32_t target_eip = target_linear - code_base;
+	const uint32_t stop_eip = stop_linear - code_base;
+	if (target_eip > code_limit || stop_eip > code_limit)
+		return false;
+
+	FillFlags();
+	const CPU_Regs saved_regs = cpu_regs;
+	const Segments saved_segments = Segs;
+	const CPUBlock saved_cpu = cpu;
+	CPU_Decoder * const saved_decoder = cpudecoder;
+
+	CPU_Push32(stop_eip);
+	reg_eax = input.eax;
+	reg_ebx = input.ebx;
+	reg_ecx = input.ecx;
+	reg_edx = input.edx;
+	reg_flags &= ~FLAG_DF;
+	cpu.direction = 1;
+	DestroyConditionFlags();
+	reg_eip = target_eip;
+
+	g_mod.guest_call_stopped = false;
+	g_mod.guest_call_active = true;
+	DOSBOX_RunMachine();
+
+	output->eax = reg_eax;
+	output->ebx = reg_ebx;
+	output->ecx = reg_ecx;
+	output->edx = reg_edx;
+	const bool stopped = g_mod.guest_call_stopped;
+
+	g_mod.guest_call_active = false;
+	g_mod.guest_call_stopped = false;
+	cpu_regs = saved_regs;
+	Segs = saved_segments;
+	cpu = saved_cpu;
+	cpudecoder = saved_decoder;
+	DestroyConditionFlags();
+	return stopped;
+}
+
 void MOD_OnCallsite(uint32_t linear_eip)
 {
+	if (g_mod.guest_call_active)
+		return;
+
 	ModExecutableRuntime *runtime = NULL;
 	if (!get_active_runtime(&runtime))
 		return;

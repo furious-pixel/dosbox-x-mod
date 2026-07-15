@@ -136,6 +136,7 @@ enum PythonRenderCallbackKind {
 	PYTHON_RENDER_CALLBACK_NONE = 0,
 	PYTHON_RENDER_CALLBACK_INIT = 1,
 	PYTHON_RENDER_CALLBACK_COMPOSITOR = 2,
+	PYTHON_RENDER_CALLBACK_SAFE_POINT = 3,
 };
 
 struct PythonRenderCallbackRegistration {
@@ -159,6 +160,7 @@ struct PythonRuntime {
 	std::vector<PythonHookRegistration> hooks = {};
 	PythonRenderCallbackRegistration init_callback = {};
 	PythonRenderCallbackRegistration compositor_callback = {};
+	PythonRenderCallbackRegistration safe_point_callback = {};
 	uint64_t initialized_context_generation = 0;
 	ModOpenGLState gl_state = {};
 };
@@ -405,6 +407,10 @@ static std::string build_mod_helper_bootstrap(void)
 		<< "        return mod._read_runtime_blocks(ranges)\n"
 		<< "    def drain_native_call_events(self):\n"
 		<< "        return mod._drain_native_call_events()\n"
+		<< "    def request_safe_point(self):\n"
+		<< "        return mod._request_safe_point()\n"
+		<< "    def call_reloc_u32(self, addr, eax=0, ebx=0, ecx=0, edx=0):\n"
+		<< "        return mod._call_reloc_u32(addr, eax, ebx, ecx, edx)\n"
 		<< "    def write_reloc_u8(self, addr, value):\n"
 		<< "        return mod._write_u8(addr, value)\n"
 		<< "    def write_reloc_u16(self, addr, value):\n"
@@ -469,6 +475,10 @@ static std::string build_mod_helper_bootstrap(void)
 		<< "        return mod._register_render_callback(kind, func)\n"
 		<< "    return decorator\n"
 		<< "mod.modrender = modrender\n";
+	script
+		<< "def modsafe(func):\n"
+		<< "    return mod._register_safe_callback(func)\n"
+		<< "mod.modsafe = modsafe\n";
 	return script.str();
 }
 
@@ -537,10 +547,12 @@ static void clear_registered_hooks(void)
 
 static void clear_registered_render_callbacks(void)
 {
-	PythonRenderCallbackRegistration *callbacks[2] = {
-	        &g_python.init_callback, &g_python.compositor_callback};
+	PythonRenderCallbackRegistration *callbacks[3] = {
+	        &g_python.init_callback,
+	        &g_python.compositor_callback,
+	        &g_python.safe_point_callback};
 
-	for (size_t i = 0; i < 2; ++i) {
+	for (size_t i = 0; i < 3; ++i) {
 		if (callbacks[i]->callback && g_python.api.Py_DecRef)
 			g_python.api.Py_DecRef(callbacks[i]->callback);
 		*callbacks[i] = PythonRenderCallbackRegistration();
@@ -976,6 +988,86 @@ static PyObject *py_register_render_callback(PyObject *, PyObject *args)
 
 	g_python.api.Py_IncRef(callable_obj);
 	return callable_obj;
+}
+
+static PyObject *py_register_safe_callback(PyObject *, PyObject *args)
+{
+	if (g_python.api.PyTuple_Size(args) != 1) {
+		set_python_error(g_python.api.PyExc_TypeError,
+		                 "_register_safe_callback expects (func)");
+		return NULL;
+	}
+
+	PyObject *callable_obj = g_python.api.PyTuple_GetItem(args, 0);
+	if (!callable_obj || !g_python.api.PyCallable_Check(callable_obj)) {
+		set_python_error(g_python.api.PyExc_TypeError,
+		                 "safe-point callback target must be callable");
+		return NULL;
+	}
+	if (g_python.safe_point_callback.callback) {
+		set_python_error(g_python.api.PyExc_ValueError,
+		                 "only one safe-point callback may be registered");
+		return NULL;
+	}
+
+	g_python.safe_point_callback.kind = PYTHON_RENDER_CALLBACK_SAFE_POINT;
+	g_python.safe_point_callback.description = get_callable_name(callable_obj);
+	g_python.safe_point_callback.enabled = true;
+	g_python.safe_point_callback.callback = callable_obj;
+	g_python.api.Py_IncRef(callable_obj);
+
+	LOG_MSG("MOD: registered safe-point callback %s",
+	        g_python.safe_point_callback.description.c_str());
+
+	g_python.api.Py_IncRef(callable_obj);
+	return callable_obj;
+}
+
+static PyObject *py_request_safe_point(PyObject *, PyObject *args)
+{
+	if (g_python.api.PyTuple_Size(args) != 0) {
+		set_python_error(g_python.api.PyExc_TypeError,
+		                 "request_safe_point expects ()");
+		return NULL;
+	}
+
+	if (!MOD_RequestSafePoint()) {
+		set_python_error(g_python.api.PyExc_RuntimeError,
+		                 "request_safe_point failed");
+		return NULL;
+	}
+
+	return g_python.api.PyLong_FromUnsignedLong(1ul);
+}
+
+static PyObject *py_call_reloc_u32(PyObject *, PyObject *args)
+{
+	if (g_python.api.PyTuple_Size(args) != 5) {
+		set_python_error(g_python.api.PyExc_TypeError,
+		                 "call_reloc_u32 expects (addr, eax, ebx, ecx, edx)");
+		return NULL;
+	}
+
+	unsigned long values[5] = {};
+	for (Py_ssize_t i = 0; i < 5; ++i) {
+		if (!py_tuple_get_uint32_arg(args, i, &values[i]))
+			return NULL;
+	}
+
+	ModGuestCallRegisters input = {};
+	input.eax = static_cast<uint32_t>(values[1]);
+	input.ebx = static_cast<uint32_t>(values[2]);
+	input.ecx = static_cast<uint32_t>(values[3]);
+	input.edx = static_cast<uint32_t>(values[4]);
+	ModGuestCallRegisters output = {};
+	if (!MOD_CallRelocFunction(static_cast<uint32_t>(values[0]), input, &output)) {
+		set_python_error(g_python.api.PyExc_RuntimeError,
+		                 "call_reloc_u32 failed");
+		return NULL;
+	}
+
+	return g_python.api.PyLong_FromUnsignedLong(
+	        static_cast<unsigned long>(output.eax));
 }
 
 static PyObject *py_get_modjoystick_axes(PyObject *, PyObject *args)
@@ -1660,6 +1752,9 @@ static bool ensure_mod_helper_module(void)
 	static PyMethodDef register_render_callback_method = {
 	        "_register_render_callback", py_register_render_callback,
 	        DOSBOX_PY_METH_VARARGS, NULL};
+	static PyMethodDef register_safe_callback_method = {
+	        "_register_safe_callback", py_register_safe_callback,
+	        DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef get_modjoystick_axes_method = {
 	        "_get_modjoystick_axes", py_get_modjoystick_axes, DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef notify_frame_ready_method = {
@@ -1669,6 +1764,12 @@ static bool ensure_mod_helper_module(void)
 	        "_get_delta", py_get_delta, DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef drain_native_call_events_method = {
 	        "_drain_native_call_events", py_drain_native_call_events,
+	        DOSBOX_PY_METH_VARARGS, NULL};
+	static PyMethodDef request_safe_point_method = {
+	        "_request_safe_point", py_request_safe_point,
+	        DOSBOX_PY_METH_VARARGS, NULL};
+	static PyMethodDef call_reloc_u32_method = {
+	        "_call_reloc_u32", py_call_reloc_u32,
 	        DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef read_u8_method = {
 	        "_read_u8", py_read_u8, DOSBOX_PY_METH_VARARGS, NULL};
@@ -1707,6 +1808,8 @@ static bool ensure_mod_helper_module(void)
 	                            &register_render_hook_method) ||
 	    !attach_module_function(mod_module.get(), "_register_render_callback",
 	                            &register_render_callback_method) ||
+	    !attach_module_function(mod_module.get(), "_register_safe_callback",
+	                            &register_safe_callback_method) ||
 	    !attach_module_function(mod_module.get(), "_get_modjoystick_axes",
 	                            &get_modjoystick_axes_method) ||
 	    !attach_module_function(mod_module.get(), "_notify_frame_ready",
@@ -1715,6 +1818,10 @@ static bool ensure_mod_helper_module(void)
 	                            &get_delta_method) ||
 	    !attach_module_function(mod_module.get(), "_drain_native_call_events",
 	                            &drain_native_call_events_method) ||
+	    !attach_module_function(mod_module.get(), "_request_safe_point",
+	                            &request_safe_point_method) ||
+	    !attach_module_function(mod_module.get(), "_call_reloc_u32",
+	                            &call_reloc_u32_method) ||
 	    !attach_module_function(mod_module.get(), "_read_u8", &read_u8_method) ||
 	    !attach_module_function(mod_module.get(), "_read_u16", &read_u16_method) ||
 	    !attach_module_function(mod_module.get(), "_read_u32", &read_u32_method) ||
@@ -2384,15 +2491,16 @@ bool DOSBoxPython_LoadMods(std::vector<ModPythonHookRegistration> *hooks)
 		hooks->push_back(hook);
 	}
 
-	const unsigned int render_callback_count =
+	const unsigned int callback_count =
 	        (g_python.init_callback.callback ? 1u : 0u) +
-	        (g_python.compositor_callback.callback ? 1u : 0u);
-	if (hooks->empty() && render_callback_count == 0u)
-		LOG_MSG("MOD: no Python hooks or render callbacks registered");
+	        (g_python.compositor_callback.callback ? 1u : 0u) +
+	        (g_python.safe_point_callback.callback ? 1u : 0u);
+	if (hooks->empty() && callback_count == 0u)
+		LOG_MSG("MOD: no Python hooks or callbacks registered");
 	else
-		LOG_MSG("MOD: loaded %u hook(s) and %u render callback(s)",
+		LOG_MSG("MOD: loaded %u hook(s) and %u callback(s)",
 		        static_cast<unsigned int>(hooks->size()),
-		        render_callback_count);
+		        callback_count);
 
 	return true;
 }
@@ -2418,6 +2526,8 @@ void DOSBoxPython_ResetModRuntimeState(void)
 
 	for (size_t i = 0; i < g_python.hooks.size(); ++i)
 		g_python.hooks[i].enabled = true;
+	if (g_python.safe_point_callback.callback)
+		g_python.safe_point_callback.enabled = true;
 }
 
 void DOSBoxPython_ResetModStateTiming(void)
@@ -2480,6 +2590,27 @@ bool DOSBoxPython_InvokeHook(size_t hook_id)
 	return true;
 }
 
+bool DOSBoxPython_InvokeSafePointCallback(void)
+{
+	PythonRenderCallbackRegistration &callback = g_python.safe_point_callback;
+	if (!g_python.initialized || !g_python.modstate || !g_python.gamemem ||
+	    !callback.enabled || !callback.callback) {
+		return false;
+	}
+
+	PyOwnedRef result(g_python.api.PyObject_CallFunctionObjArgs(
+	        callback.callback, g_python.modstate, g_python.gamemem, NULL));
+	if (!result) {
+		callback.enabled = false;
+		log_python_exception(
+		        (std::string("disabling safe-point callback after exception: ") +
+		         callback.description).c_str());
+		return false;
+	}
+
+	return true;
+}
+
 void DOSBoxPython_NotifyOpenGLContextCreated(uint64_t context_generation)
 {
 	g_python.gl_state.context_generation = context_generation;
@@ -2519,6 +2650,8 @@ static bool invoke_python_render_callback(PythonRenderCallbackRegistration *call
 
 bool DOSBoxPython_InvokeOpenGLInitCallback(const ModOpenGLState &state)
 {
+	if (MOD_GuestCallActive())
+		return false;
 	if (!g_python.initialized || !g_python.modstate)
 		return false;
 	if (!g_python.init_callback.callback)
@@ -2559,6 +2692,8 @@ bool DOSBoxPython_InvokeOpenGLInitCallback(const ModOpenGLState &state)
 
 bool DOSBoxPython_InvokeOpenGLCompositorCallback(const ModOpenGLState &state)
 {
+	if (MOD_GuestCallActive())
+		return false;
 	if (!g_python.initialized || !g_python.modstate)
 		return false;
 	if (!g_python.compositor_callback.callback)

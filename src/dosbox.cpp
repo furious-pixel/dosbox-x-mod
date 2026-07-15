@@ -63,6 +63,7 @@
 #include "callback.h"
 #include "inout.h"
 #include "mixer.h"
+#include "mod.h"
 #include "timer.h"
 #include "dos_inc.h"
 #include "setup.h"
@@ -461,6 +462,7 @@ static Bitu Normal_Loop(void) {
 
     try {
         while (1) {
+            MOD_RunPendingSafePoint();
             if (PIC_RunQueue()) {
                 /* now is the time to check for the NMI (Non-maskable interrupt) */
                 CPU_Check_NMI();

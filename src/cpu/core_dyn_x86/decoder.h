@@ -2310,17 +2310,39 @@ static void dyn_call_near_imm(void) {
 	else imm=(int16_t)decode_fetchw();
 	dyn_set_eip_end(DREG(TMPW));
 	dyn_push(DREG(TMPW));
+	const bool mod_call_hooks = MOD_FastEnabled();
+	bool mod_call_can_be_suppressed = false;
 	{
 		const uint32_t linear_eip = static_cast<uint32_t>(decode.op_start);
-		if (MOD_FastEnabled())
-			gen_call_function((void *)&MOD_OnCallsite,"%Id",linear_eip);
+		if (mod_call_hooks) {
+			mod_call_can_be_suppressed =
+			        MOD_CallsiteCanBeSuppressed(linear_eip);
+			if (mod_call_can_be_suppressed)
+				gen_call_function((void *)&MOD_OnCallsite,"%Rd%Id",DREG(TMPB),linear_eip);
+			else
+				gen_call_function((void *)&MOD_OnCallsite,"%Id",linear_eip);
+		}
 	}
 	gen_dop_word_imm(DOP_ADD,decode.big_op,DREG(TMPW),imm);
+	if (mod_call_can_be_suppressed) {
+		gen_dop_word(DOP_TEST,true,DREG(TMPB),DREG(TMPB));
+		uint8_t *not_suppressed = gen_create_branch(BR_Z);
+		gen_lea(DREG(STACK),DREG(ESP),nullptr,0,decode.big_op ? 4 : 2);
+		gen_dop_word_var(DOP_AND,true,DREG(STACK),&cpu.stack.mask);
+		gen_dop_word_var(DOP_AND,true,DREG(ESP),&cpu.stack.notmask);
+		gen_dop_word(DOP_OR,true,DREG(ESP),DREG(STACK));
+		gen_fill_branch(not_suppressed);
+		gen_dop_word(DOP_ADD,decode.big_op,DREG(TMPW),DREG(TMPB));
+		gen_releasereg(DREG(TMPB));
+	}
 	if (cpu.code.big) gen_dop_word(DOP_MOV,true,DREG(EIP),DREG(TMPW));
 	else gen_extend_word(false,DREG(EIP),DREG(TMPW));
 	dyn_reduce_cycles();
 	dyn_save_critical_regs();
-	gen_jmp_ptr(&decode.block->link[0].to,offsetof(CacheBlock,cache.xstart));
+	if (mod_call_can_be_suppressed)
+		gen_return(BR_Normal);
+	else
+		gen_jmp_ptr(&decode.block->link[0].to,offsetof(CacheBlock,cache.xstart));
 	dyn_closeblock();
 }
 

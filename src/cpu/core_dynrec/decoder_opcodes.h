@@ -1221,18 +1221,39 @@ static void dyn_call_near_imm(void) {
 	dyn_set_eip_end(FC_OP1);
 	if (decode.big_op) gen_call_function_raw(dynrec_push_dword);
 	else gen_call_function_raw(dynrec_push_word);
+	const bool mod_call_hooks = MOD_FastEnabled();
+	bool mod_call_can_be_suppressed = false;
 	{
 		const uint32_t callsite = static_cast<uint32_t>(decode.op_start - SegPhys(cs));
 		const uint32_t linear_eip = static_cast<uint32_t>(SegPhys(cs) + callsite);
-		if (MOD_FastEnabled())
+		if (mod_call_hooks) {
+			mod_call_can_be_suppressed =
+			        MOD_CallsiteCanBeSuppressed(linear_eip);
 			gen_call_function_I(MOD_OnCallsite, linear_eip);
+			if (mod_call_can_be_suppressed) {
+				gen_mov_word_from_reg(
+				        FC_RETOP, &core_dynrec.protected_regs[FC_RETOP], true);
+				DRC_PTR_SIZE_IM not_suppressed =
+				        gen_create_branch_on_zero(FC_RETOP, true);
+				if (decode.big_op)
+					gen_call_function_raw(CPU_Pop32);
+				else
+					gen_call_function_raw(CPU_Pop16);
+				gen_fill_branch(not_suppressed);
+			}
+		}
 	}
 
 	dyn_set_eip_end(FC_OP1,imm);
+	if (mod_call_can_be_suppressed)
+		gen_add(FC_OP1, &core_dynrec.protected_regs[FC_RETOP]);
 	gen_mov_word_from_reg(FC_OP1,decode.big_op?(void*)(&reg_eip):(void*)(&reg_ip),decode.big_op);
 
 	dyn_reduce_cycles();
-	gen_jmp_ptr(&decode.block->link[0].to,offsetof(CacheBlockDynRec,cache.xstart));
+	if (mod_call_can_be_suppressed)
+		dyn_return(BR_Normal);
+	else
+		gen_jmp_ptr(&decode.block->link[0].to,offsetof(CacheBlockDynRec,cache.xstart));
 	dyn_closeblock();
 }
 

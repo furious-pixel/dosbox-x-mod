@@ -51,12 +51,25 @@ struct ModNativeCallEventRuntime {
 	uint8_t operation = 0;
 };
 
+struct ModCallSuppressionSiteRuntime {
+	uint32_t callsite_reloc = 0;
+	uint32_t callsite_linear = 0;
+	uint32_t target_reloc = 0;
+	int32_t call_displacement = 0;
+	uint64_t executed = 0;
+	uint64_t skipped = 0;
+};
+
 static const size_t MOD_NATIVE_CALL_EVENT_CAPACITY = 4096u;
 static const size_t MOD_NO_NATIVE_CALL_EVENT = static_cast<size_t>(-1);
+static const size_t MOD_NO_CALL_SUPPRESSION_SITE = static_cast<size_t>(-1);
 
 struct ModCallsiteRuntime {
 	std::vector<size_t> python_hook_indices = {};
 	size_t native_call_event_index = MOD_NO_NATIVE_CALL_EVENT;
+	bool scene_raster_phase_enter = false;
+	bool scene_raster_phase_leave = false;
+	size_t scene_raster_suppression_index = MOD_NO_CALL_SUPPRESSION_SITE;
 };
 
 struct ModExecutableRuntime {
@@ -80,6 +93,15 @@ struct ModExecutableRuntime {
 	        native_call_event_buffer = {};
 	size_t native_call_event_count = 0;
 	uint64_t native_call_event_dropped = 0;
+	bool scene_raster_suppression_validated = false;
+	bool scene_raster_suppression_requested = false;
+	bool scene_raster_phase_active = false;
+	bool scene_raster_callsite_hooks_active = false;
+	uint32_t scene_raster_phase_enter_linear = 0;
+	uint32_t scene_raster_phase_leave_linear = 0;
+	uint64_t scene_raster_request_frame = 0;
+	std::vector<ModCallSuppressionSiteRuntime>
+	        scene_raster_suppression_sites = {};
 };
 
 struct ModRuntime {
@@ -91,6 +113,7 @@ struct ModRuntime {
 	size_t active_executable_index = 0;
 	bool fast_enabled = false;
 	bool unsupported_core_logged = false;
+	bool dynamic_cache_refresh_pending = false;
 	bool safe_point_pending = false;
 	bool safe_point_active = false;
 	bool guest_call_active = false;
@@ -292,6 +315,95 @@ static void reset_native_call_events(ModExecutableRuntime &runtime)
 	runtime.native_call_event_dropped = 0;
 }
 
+static void reset_scene_raster_suppression(ModExecutableRuntime &runtime,
+	                                         bool reset_counters)
+{
+	runtime.scene_raster_suppression_requested = false;
+	runtime.scene_raster_phase_active = false;
+	runtime.scene_raster_request_frame = 0;
+	if (!reset_counters)
+		return;
+
+	for (size_t i = 0; i < runtime.scene_raster_suppression_sites.size(); ++i) {
+		runtime.scene_raster_suppression_sites[i].executed = 0;
+		runtime.scene_raster_suppression_sites[i].skipped = 0;
+	}
+}
+
+static void prune_empty_callsite(ModExecutableRuntime &runtime,
+	                              uint32_t linear_eip)
+{
+	std::unordered_map<uint32_t, ModCallsiteRuntime>::iterator it =
+	        runtime.callsites.find(linear_eip);
+	if (it == runtime.callsites.end())
+		return;
+
+	const ModCallsiteRuntime &callsite = it->second;
+	if (callsite.python_hook_indices.empty() &&
+	    callsite.native_call_event_index == MOD_NO_NATIVE_CALL_EVENT &&
+	    !callsite.scene_raster_phase_enter &&
+	    !callsite.scene_raster_phase_leave &&
+	    callsite.scene_raster_suppression_index ==
+	            MOD_NO_CALL_SUPPRESSION_SITE) {
+		runtime.callsites.erase(it);
+	}
+}
+
+static void set_scene_raster_callsite_hooks(ModExecutableRuntime &runtime,
+	                                         bool enabled)
+{
+	enabled = enabled && runtime.scene_raster_suppression_validated;
+	if (runtime.scene_raster_callsite_hooks_active == enabled)
+		return;
+
+	if (enabled) {
+		runtime.callsites[runtime.scene_raster_phase_enter_linear]
+		        .scene_raster_phase_enter = true;
+		runtime.callsites[runtime.scene_raster_phase_leave_linear]
+		        .scene_raster_phase_leave = true;
+		for (size_t i = 0; i < runtime.scene_raster_suppression_sites.size(); ++i) {
+			const uint32_t linear_eip =
+			        runtime.scene_raster_suppression_sites[i].callsite_linear;
+			runtime.callsites[linear_eip].scene_raster_suppression_index = i;
+		}
+	} else {
+		std::unordered_map<uint32_t, ModCallsiteRuntime>::iterator it =
+		        runtime.callsites.find(runtime.scene_raster_phase_enter_linear);
+		if (it != runtime.callsites.end())
+			it->second.scene_raster_phase_enter = false;
+		prune_empty_callsite(runtime, runtime.scene_raster_phase_enter_linear);
+
+		it = runtime.callsites.find(runtime.scene_raster_phase_leave_linear);
+		if (it != runtime.callsites.end())
+			it->second.scene_raster_phase_leave = false;
+		prune_empty_callsite(runtime, runtime.scene_raster_phase_leave_linear);
+
+		for (size_t i = 0; i < runtime.scene_raster_suppression_sites.size(); ++i) {
+			const uint32_t linear_eip =
+			        runtime.scene_raster_suppression_sites[i].callsite_linear;
+			it = runtime.callsites.find(linear_eip);
+			if (it != runtime.callsites.end()) {
+				it->second.scene_raster_suppression_index =
+				        MOD_NO_CALL_SUPPRESSION_SITE;
+			}
+			prune_empty_callsite(runtime, linear_eip);
+		}
+		runtime.scene_raster_phase_active = false;
+	}
+
+	runtime.scene_raster_callsite_hooks_active = enabled;
+}
+
+static void sync_scene_raster_callsite_hooks(void)
+{
+	for (size_t i = 0; i < g_mod.executables.size(); ++i) {
+		ModExecutableRuntime &runtime = g_mod.executables[i];
+		set_scene_raster_callsite_hooks(
+		        runtime,
+		        runtime.scene_raster_suppression_requested);
+	}
+}
+
 static void reset_runtime_frame_state(ModExecutableRuntime &runtime)
 {
 	runtime.frame_started = false;
@@ -325,7 +437,13 @@ static void rebuild_runtime_hooks(ModExecutableRuntime &runtime)
 	runtime.frame_start_linear = 0;
 	runtime.callsites.clear();
 	runtime.native_call_event_targets.clear();
+	runtime.scene_raster_suppression_sites.clear();
+	runtime.scene_raster_suppression_validated = false;
+	runtime.scene_raster_callsite_hooks_active = false;
+	runtime.scene_raster_phase_enter_linear = 0;
+	runtime.scene_raster_phase_leave_linear = 0;
 	reset_native_call_events(runtime);
+	reset_scene_raster_suppression(runtime, true);
 
 	if (!runtime.delta_ready)
 		return;
@@ -353,6 +471,83 @@ static void rebuild_runtime_hooks(ModExecutableRuntime &runtime)
 
 		hook.linear_eip = linear_eip;
 		runtime.callsites[linear_eip].python_hook_indices.push_back(i);
+	}
+
+	if (runtime.config.has_scene_raster_suppression &&
+	    !runtime.config.scene_raster_suppression_sites.empty()) {
+		uint32_t phase_enter_linear = 0;
+		uint32_t phase_leave_linear = 0;
+		bool valid = apply_delta(
+		                     runtime.config.scene_raster_phase_enter_reloc,
+		                     runtime.delta,
+		                     &phase_enter_linear) &&
+		             apply_delta(
+		                     runtime.config.scene_raster_phase_leave_reloc,
+		                     runtime.delta,
+		                     &phase_leave_linear);
+		if (!valid) {
+			LOG_MSG("MOD ERROR: %s scene raster phase boundaries are invalid with delta",
+			        runtime.config.name.c_str());
+		} else {
+			runtime.scene_raster_phase_enter_linear = phase_enter_linear;
+			runtime.scene_raster_phase_leave_linear = phase_leave_linear;
+		}
+
+		for (size_t i = 0;
+		     valid && i < runtime.config.scene_raster_suppression_sites.size();
+		     ++i) {
+			const ModCallSuppressionSiteConfig &config =
+			        runtime.config.scene_raster_suppression_sites[i];
+			uint32_t callsite_linear = 0;
+			uint32_t target_linear = 0;
+			uint8_t opcode = 0;
+			uint32_t raw_displacement = 0;
+			if (!apply_delta(config.callsite_reloc,
+			                 runtime.delta,
+			                 &callsite_linear) ||
+			    !apply_delta(config.target_reloc,
+			                 runtime.delta,
+			                 &target_linear) ||
+			    mem_readb_checked(callsite_linear, &opcode) ||
+			    opcode != 0xe8u ||
+			    mem_readd_checked(callsite_linear + 1u, &raw_displacement)) {
+				valid = false;
+				LOG_MSG("MOD ERROR: scene raster site 0x%08lX is not a readable near call",
+				        static_cast<unsigned long>(config.callsite_reloc));
+				break;
+			}
+
+			const int32_t displacement =
+			        static_cast<int32_t>(raw_displacement);
+			const int64_t decoded_target =
+			        static_cast<int64_t>(callsite_linear) + 5ll +
+			        static_cast<int64_t>(displacement);
+			if (decoded_target != static_cast<int64_t>(target_linear)) {
+				valid = false;
+				LOG_MSG("MOD ERROR: scene raster site 0x%08lX target signature mismatch",
+				        static_cast<unsigned long>(config.callsite_reloc));
+				break;
+			}
+
+			ModCallSuppressionSiteRuntime site = {};
+			site.callsite_reloc = config.callsite_reloc;
+			site.callsite_linear = callsite_linear;
+			site.target_reloc = config.target_reloc;
+			site.call_displacement = displacement;
+			runtime.scene_raster_suppression_sites.push_back(site);
+		}
+
+		runtime.scene_raster_suppression_validated =
+		        valid &&
+		        runtime.scene_raster_suppression_sites.size() ==
+		                runtime.config.scene_raster_suppression_sites.size();
+		if (runtime.scene_raster_suppression_validated) {
+			LOG_MSG("MOD: validated %u phase-scoped scene raster suppression site(s)",
+			        static_cast<unsigned int>(
+			                runtime.scene_raster_suppression_sites.size()));
+		} else {
+			reset_scene_raster_suppression(runtime, true);
+		}
 	}
 
 	if (!runtime.config.has_native_call_event_scan_range ||
@@ -512,6 +707,8 @@ static void activate_runtime_process(ModExecutableRuntime &runtime,
 	g_mod.active_executable_valid = true;
 	reset_runtime_frame_state(runtime);
 	reset_native_call_events(runtime);
+	set_scene_raster_callsite_hooks(runtime, false);
+	reset_scene_raster_suppression(runtime, true);
 	update_fast_enabled();
 	refresh_dynamic_cpu_cache();
 
@@ -531,6 +728,8 @@ static void run_pending_scan(ModExecutableRuntime &runtime, size_t runtime_index
 			g_mod.active_executable_valid = false;
 			runtime.process_active = false;
 			runtime.process_psp = 0;
+			set_scene_raster_callsite_hooks(runtime, false);
+			reset_scene_raster_suppression(runtime, false);
 			update_fast_enabled();
 			refresh_dynamic_cpu_cache();
 			DOSBoxPython_ResetModStateTiming();
@@ -807,6 +1006,8 @@ void MOD_OnTerminatePSP(uint16_t pspseg, bool tsr, uint8_t exitcode)
 			g_mod.active_executable_valid = false;
 			reset_runtime_frame_state(runtime);
 			reset_native_call_events(runtime);
+			set_scene_raster_callsite_hooks(runtime, false);
+			reset_scene_raster_suppression(runtime, true);
 			update_fast_enabled();
 			refresh_dynamic_cpu_cache();
 			DOSBoxPython_ResetModRuntimeState();
@@ -859,6 +1060,85 @@ bool MOD_GuestCallActive(void)
 	return g_mod.guest_call_active;
 }
 
+bool MOD_SetSceneRasterSuppression(bool enabled)
+{
+	ModExecutableRuntime *runtime = NULL;
+	if (!get_active_runtime(&runtime))
+		return false;
+
+	if (!enabled) {
+		const bool changed = runtime->scene_raster_suppression_requested;
+		reset_scene_raster_suppression(*runtime, false);
+		if (changed)
+			g_mod.dynamic_cache_refresh_pending = true;
+		return true;
+	}
+
+	if (!runtime->scene_raster_suppression_validated)
+		return false;
+
+	const bool changed = !runtime->scene_raster_suppression_requested;
+	runtime->scene_raster_suppression_requested = true;
+	runtime->scene_raster_request_frame = runtime->frame_state.frame;
+	if (changed)
+		g_mod.dynamic_cache_refresh_pending = true;
+	return true;
+}
+
+bool MOD_CallsiteCanBeSuppressed(uint32_t linear_eip)
+{
+	ModExecutableRuntime *runtime = NULL;
+	if (!get_active_runtime(&runtime) ||
+	    !runtime->scene_raster_suppression_validated) {
+		return false;
+	}
+
+	const std::unordered_map<uint32_t, ModCallsiteRuntime>::const_iterator it =
+	        runtime->callsites.find(linear_eip);
+	return runtime->scene_raster_suppression_requested &&
+	       it != runtime->callsites.end() &&
+	       it->second.scene_raster_suppression_index <
+	               runtime->scene_raster_suppression_sites.size();
+}
+
+void MOD_DisableSceneRasterSuppression(void)
+{
+	bool changed = false;
+	for (size_t i = 0; i < g_mod.executables.size(); ++i) {
+		changed = changed ||
+		          g_mod.executables[i].scene_raster_suppression_requested;
+		reset_scene_raster_suppression(g_mod.executables[i], false);
+	}
+	if (changed)
+		g_mod.dynamic_cache_refresh_pending = true;
+}
+
+bool MOD_GetSceneRasterSuppressionStats(ModSceneRasterSuppressionStats *stats)
+{
+	ModExecutableRuntime *runtime = NULL;
+	if (!stats || !get_active_runtime(&runtime))
+		return false;
+
+	*stats = {};
+	stats->configured = runtime->config.has_scene_raster_suppression;
+	stats->validated = runtime->scene_raster_suppression_validated;
+	stats->requested = runtime->scene_raster_suppression_requested;
+	stats->phase_active = runtime->scene_raster_phase_active;
+	stats->request_frame = runtime->scene_raster_request_frame;
+	stats->current_frame = runtime->frame_state.frame;
+	stats->sites.reserve(runtime->scene_raster_suppression_sites.size());
+	for (size_t i = 0; i < runtime->scene_raster_suppression_sites.size(); ++i) {
+		const ModCallSuppressionSiteRuntime &site =
+		        runtime->scene_raster_suppression_sites[i];
+		ModCallSuppressionSiteStats site_stats = {};
+		site_stats.callsite_reloc = site.callsite_reloc;
+		site_stats.executed = site.executed;
+		site_stats.skipped = site.skipped;
+		stats->sites.push_back(site_stats);
+	}
+	return true;
+}
+
 bool MOD_RequestSafePoint(void)
 {
 	ModExecutableRuntime *runtime = NULL;
@@ -872,6 +1152,13 @@ bool MOD_RequestSafePoint(void)
 
 void MOD_RunPendingSafePoint(void)
 {
+	if (g_mod.dynamic_cache_refresh_pending && !g_mod.safe_point_active &&
+	    !g_mod.guest_call_active) {
+		g_mod.dynamic_cache_refresh_pending = false;
+		sync_scene_raster_callsite_hooks();
+		refresh_dynamic_cpu_cache();
+	}
+
 	if (!g_mod.safe_point_pending || g_mod.safe_point_active ||
 	    g_mod.guest_call_active) {
 		return;
@@ -953,14 +1240,14 @@ bool MOD_CallRelocFunction(uint32_t reloc_eip,
 	return stopped;
 }
 
-void MOD_OnCallsite(uint32_t linear_eip)
+int32_t MOD_OnCallsite(uint32_t linear_eip)
 {
 	if (g_mod.guest_call_active)
-		return;
+		return 0;
 
 	ModExecutableRuntime *runtime = NULL;
 	if (!get_active_runtime(&runtime))
-		return;
+		return 0;
 
 	if (runtime->frame_start_ready && linear_eip == runtime->frame_start_linear)
 		update_frame_timing(*runtime);
@@ -968,7 +1255,26 @@ void MOD_OnCallsite(uint32_t linear_eip)
 	const std::unordered_map<uint32_t, ModCallsiteRuntime>::const_iterator it =
 	        runtime->callsites.find(linear_eip);
 	if (it == runtime->callsites.end())
-		return;
+		return 0;
+
+	if (it->second.scene_raster_phase_leave)
+		runtime->scene_raster_phase_active = false;
+	if (it->second.scene_raster_phase_enter) {
+		const uint64_t current_frame = runtime->frame_state.frame;
+		const uint64_t request_frame = runtime->scene_raster_request_frame;
+		const bool request_is_fresh =
+		        request_frame >= current_frame ||
+		        (request_frame < UINT64_MAX &&
+		         request_frame + 1u == current_frame);
+		runtime->scene_raster_phase_active =
+		        runtime->scene_raster_suppression_validated &&
+		        runtime->scene_raster_suppression_requested &&
+		        request_is_fresh;
+		if (!request_is_fresh) {
+			runtime->scene_raster_suppression_requested = false;
+			g_mod.dynamic_cache_refresh_pending = true;
+		}
+	}
 
 	const size_t native_event_index = it->second.native_call_event_index;
 	if (native_event_index < runtime->native_call_event_targets.size()) {
@@ -993,6 +1299,21 @@ void MOD_OnCallsite(uint32_t linear_eip)
 
 		DOSBoxPython_InvokeHook(runtime->hooks[hook_index].python_hook_id);
 	}
+
+	const size_t suppression_index =
+	        it->second.scene_raster_suppression_index;
+	if (suppression_index < runtime->scene_raster_suppression_sites.size()) {
+		ModCallSuppressionSiteRuntime &site =
+		        runtime->scene_raster_suppression_sites[suppression_index];
+		site.executed += 1;
+		if (runtime->scene_raster_phase_active) {
+			site.skipped += 1;
+			return static_cast<int32_t>(
+			        0u - static_cast<uint32_t>(site.call_displacement));
+		}
+	}
+
+	return 0;
 }
 
 bool MOD_ReadMemoryU8(uint32_t reloc_addr, uint8_t *value)

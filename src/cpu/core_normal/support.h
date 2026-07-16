@@ -66,6 +66,12 @@ static INLINE int32_t Fetchds() {
 		} \
 	} while (0)
 
+#define MOD_CALL_HOOK_ADJUST(_cs, _ip) \
+	(MOD_FastEnabled() \
+	         ? MOD_OnCallsite(static_cast<uint32_t>( \
+	                   SegPhys(_cs) + static_cast<uint32_t>(_ip))) \
+	         : 0)
+
 /* NTS: At first glance, this looks like code that will only fetch the delta for conditional jumps
  *      if the condition is true. Further examination shows that DOSBox's core has two different
  *      CS:IP variables, reg_ip and core.cseip which Fetchb() modifies. */

@@ -628,8 +628,11 @@
 			int32_t addip=Fetchds();
 			uint32_t here=GETIP;
 			Push_32(here);
-			MOD_CALL_HOOK(cs, callsite);
-			reg_eip=(uint32_t)((uint32_t)addip+here);
+			const int32_t mod_call_adjustment =
+			        MOD_CALL_HOOK_ADJUST(cs, callsite);
+			if (mod_call_adjustment != 0)
+				Pop_32();
+			reg_eip=(uint32_t)((uint32_t)addip+here+mod_call_adjustment);
 			continue;
 		}
 	CASE_D(0xe9)												/* JMP Jd */

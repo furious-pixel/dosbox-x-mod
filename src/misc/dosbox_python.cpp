@@ -407,6 +407,10 @@ static std::string build_mod_helper_bootstrap(void)
 		<< "        return mod._read_runtime_blocks(ranges)\n"
 		<< "    def drain_native_call_events(self):\n"
 		<< "        return mod._drain_native_call_events()\n"
+		<< "    def set_scene_raster_suppression(self, enabled):\n"
+		<< "        return mod._set_scene_raster_suppression(1 if enabled else 0)\n"
+		<< "    def scene_raster_suppression_stats(self):\n"
+		<< "        return mod._scene_raster_suppression_stats()\n"
 		<< "    def request_safe_point(self):\n"
 		<< "        return mod._request_safe_point()\n"
 		<< "    def call_reloc_u32(self, addr, eax=0, ebx=0, ecx=0, edx=0):\n"
@@ -1156,6 +1160,82 @@ static void write_u32_le(char *dest, uint32_t value)
 	dest[3] = static_cast<char>((value >> 24u) & 0xffu);
 }
 
+static bool tuple_set_u64(PyObject *tuple, Py_ssize_t index, uint64_t value)
+{
+	PyOwnedRef item(g_python.api.PyLong_FromUnsignedLongLong(
+	        static_cast<unsigned long long>(value)));
+	if (!item || g_python.api.PyTuple_SetItem(tuple, index, item.get()) != 0)
+		return false;
+	item.release();
+	return true;
+}
+
+static PyObject *py_set_scene_raster_suppression(PyObject *, PyObject *args)
+{
+	if (g_python.api.PyTuple_Size(args) != 1) {
+		set_python_error(g_python.api.PyExc_TypeError,
+		                 "set_scene_raster_suppression expects (enabled)");
+		return NULL;
+	}
+
+	unsigned long enabled = 0;
+	if (!py_tuple_get_uint32_arg(args, 0, &enabled) || enabled > 1u) {
+		set_python_error(g_python.api.PyExc_ValueError,
+		                 "enabled must be 0 or 1");
+		return NULL;
+	}
+
+	const bool accepted = MOD_SetSceneRasterSuppression(enabled != 0);
+	return g_python.api.PyLong_FromUnsignedLong(accepted ? 1ul : 0ul);
+}
+
+static PyObject *py_scene_raster_suppression_stats(PyObject *, PyObject *args)
+{
+	if (g_python.api.PyTuple_Size(args) != 0) {
+		set_python_error(g_python.api.PyExc_TypeError,
+		                 "scene_raster_suppression_stats expects ()");
+		return NULL;
+	}
+
+	ModSceneRasterSuppressionStats stats = {};
+	if (!MOD_GetSceneRasterSuppressionStats(&stats)) {
+		set_python_error(g_python.api.PyExc_RuntimeError,
+		                 "scene_raster_suppression_stats failed");
+		return NULL;
+	}
+
+	PyOwnedRef sites(g_python.api.PyTuple_New(
+	        static_cast<Py_ssize_t>(stats.sites.size())));
+	if (!sites)
+		return NULL;
+	for (size_t i = 0; i < stats.sites.size(); ++i) {
+		PyOwnedRef site(g_python.api.PyTuple_New(3));
+		if (!site ||
+		    !tuple_set_u64(site.get(), 0, stats.sites[i].callsite_reloc) ||
+		    !tuple_set_u64(site.get(), 1, stats.sites[i].executed) ||
+		    !tuple_set_u64(site.get(), 2, stats.sites[i].skipped) ||
+		    g_python.api.PyTuple_SetItem(
+		            sites.get(), static_cast<Py_ssize_t>(i), site.get()) != 0) {
+			return NULL;
+		}
+		site.release();
+	}
+
+	PyOwnedRef result(g_python.api.PyTuple_New(7));
+	if (!result ||
+	    !tuple_set_u64(result.get(), 0, stats.configured ? 1u : 0u) ||
+	    !tuple_set_u64(result.get(), 1, stats.validated ? 1u : 0u) ||
+	    !tuple_set_u64(result.get(), 2, stats.requested ? 1u : 0u) ||
+	    !tuple_set_u64(result.get(), 3, stats.phase_active ? 1u : 0u) ||
+	    !tuple_set_u64(result.get(), 4, stats.request_frame) ||
+	    !tuple_set_u64(result.get(), 5, stats.current_frame) ||
+	    g_python.api.PyTuple_SetItem(result.get(), 6, sites.get()) != 0) {
+		return NULL;
+	}
+	sites.release();
+	return result.release();
+}
+
 static PyObject *py_drain_native_call_events(PyObject *, PyObject *args)
 {
 	if (g_python.api.PyTuple_Size(args) != 0) {
@@ -1765,6 +1845,12 @@ static bool ensure_mod_helper_module(void)
 	static PyMethodDef drain_native_call_events_method = {
 	        "_drain_native_call_events", py_drain_native_call_events,
 	        DOSBOX_PY_METH_VARARGS, NULL};
+	static PyMethodDef set_scene_raster_suppression_method = {
+	        "_set_scene_raster_suppression", py_set_scene_raster_suppression,
+	        DOSBOX_PY_METH_VARARGS, NULL};
+	static PyMethodDef scene_raster_suppression_stats_method = {
+	        "_scene_raster_suppression_stats", py_scene_raster_suppression_stats,
+	        DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef request_safe_point_method = {
 	        "_request_safe_point", py_request_safe_point,
 	        DOSBOX_PY_METH_VARARGS, NULL};
@@ -1818,6 +1904,10 @@ static bool ensure_mod_helper_module(void)
 	                            &get_delta_method) ||
 	    !attach_module_function(mod_module.get(), "_drain_native_call_events",
 	                            &drain_native_call_events_method) ||
+	    !attach_module_function(mod_module.get(), "_set_scene_raster_suppression",
+	                            &set_scene_raster_suppression_method) ||
+	    !attach_module_function(mod_module.get(), "_scene_raster_suppression_stats",
+	                            &scene_raster_suppression_stats_method) ||
 	    !attach_module_function(mod_module.get(), "_request_safe_point",
 	                            &request_safe_point_method) ||
 	    !attach_module_function(mod_module.get(), "_call_reloc_u32",
@@ -2105,6 +2195,92 @@ static bool load_mod_init_config(const std::string &mods_dir,
 			} else {
 				config.native_call_events.clear();
 				LOG_MSG("MOD ERROR: invalid native_call_events for %s in %s",
+				        config.name.c_str(), mod_init_path.c_str());
+			}
+		}
+
+		PyOwnedRef scene_raster_suppression(get_optional_mapping_item(
+		        executable.get(), "scene_raster_suppression", entry_context));
+		if (scene_raster_suppression) {
+			const std::string suppression_context =
+			        entry_context + "['scene_raster_suppression']";
+			PyOwnedRef phase_enter(get_required_mapping_item(
+			        scene_raster_suppression.get(), "phase_enter",
+			        suppression_context));
+			PyOwnedRef phase_leave(get_required_mapping_item(
+			        scene_raster_suppression.get(), "phase_leave",
+			        suppression_context));
+			PyOwnedRef sites(get_required_mapping_item(
+			        scene_raster_suppression.get(), "sites",
+			        suppression_context));
+
+			bool valid_suppression_config =
+			        phase_enter && phase_leave && sites &&
+			        py_object_to_uint32(
+			                phase_enter.get(),
+			                suppression_context + "['phase_enter']",
+			                &config.scene_raster_phase_enter_reloc) &&
+			        py_object_to_uint32(
+			                phase_leave.get(),
+			                suppression_context + "['phase_leave']",
+			                &config.scene_raster_phase_leave_reloc);
+
+			Py_ssize_t site_count = -1;
+			if (valid_suppression_config) {
+				clear_python_error();
+				site_count = g_python.api.PySequence_Size(sites.get());
+				if (g_python.api.PyErr_Occurred &&
+				    g_python.api.PyErr_Occurred() != NULL) {
+					log_python_exception(
+					        (suppression_context + "['sites'] must be a sequence").c_str());
+					valid_suppression_config = false;
+				}
+			}
+
+			for (Py_ssize_t j = 0;
+			     valid_suppression_config && j < site_count;
+			     ++j) {
+				const std::string site_context = append_context_index(
+				        suppression_context + "['sites']",
+				        static_cast<size_t>(j));
+				PyOwnedRef site(g_python.api.PySequence_GetItem(sites.get(), j));
+				if (!site) {
+					log_python_exception(
+					        (site_context + " could not be read").c_str());
+					valid_suppression_config = false;
+					break;
+				}
+
+				PyOwnedRef callsite_reloc(get_required_mapping_item(
+				        site.get(), "callsite", site_context));
+				PyOwnedRef target_reloc(get_required_mapping_item(
+				        site.get(), "target", site_context));
+				ModCallSuppressionSiteConfig site_config = {};
+				if (!callsite_reloc || !target_reloc ||
+				    !py_object_to_uint32(
+				            callsite_reloc.get(),
+				            site_context + "['callsite']",
+				            &site_config.callsite_reloc) ||
+				    !py_object_to_uint32(
+				            target_reloc.get(),
+				            site_context + "['target']",
+				            &site_config.target_reloc)) {
+					LOG_MSG("MOD ERROR: invalid scene raster suppression site in %s",
+					        mod_init_path.c_str());
+					valid_suppression_config = false;
+					break;
+				}
+				config.scene_raster_suppression_sites.push_back(site_config);
+			}
+
+			if (valid_suppression_config &&
+			    !config.scene_raster_suppression_sites.empty() &&
+			    config.scene_raster_phase_enter_reloc !=
+			            config.scene_raster_phase_leave_reloc) {
+				config.has_scene_raster_suppression = true;
+			} else {
+				config.scene_raster_suppression_sites.clear();
+				LOG_MSG("MOD ERROR: invalid scene_raster_suppression for %s in %s",
 				        config.name.c_str(), mod_init_path.c_str());
 			}
 		}
@@ -2507,6 +2683,7 @@ bool DOSBoxPython_LoadMods(std::vector<ModPythonHookRegistration> *hooks)
 
 void DOSBoxPython_ResetModRuntimeState(void)
 {
+	MOD_DisableSceneRasterSuppression();
 	if (!g_python.initialized)
 		return;
 
@@ -2582,6 +2759,7 @@ bool DOSBoxPython_InvokeHook(size_t hook_id)
 	                                   g_python.gamemem,
 	                                   NULL));
 	if (!result) {
+		MOD_DisableSceneRasterSuppression();
 		hook.enabled = false;
 		log_python_exception(("disabling hook after exception: " + hook.description).c_str());
 		return false;
@@ -2601,6 +2779,7 @@ bool DOSBoxPython_InvokeSafePointCallback(void)
 	PyOwnedRef result(g_python.api.PyObject_CallFunctionObjArgs(
 	        callback.callback, g_python.modstate, g_python.gamemem, NULL));
 	if (!result) {
+		MOD_DisableSceneRasterSuppression();
 		callback.enabled = false;
 		log_python_exception(
 		        (std::string("disabling safe-point callback after exception: ") +
@@ -2613,6 +2792,7 @@ bool DOSBoxPython_InvokeSafePointCallback(void)
 
 void DOSBoxPython_NotifyOpenGLContextCreated(uint64_t context_generation)
 {
+	MOD_DisableSceneRasterSuppression();
 	g_python.gl_state.context_generation = context_generation;
 	g_python.gl_state.present_count = 0;
 	g_python.initialized_context_generation = 0;
@@ -2639,6 +2819,7 @@ static bool invoke_python_render_callback(PythonRenderCallbackRegistration *call
 	PyOwnedRef result(g_python.api.PyObject_CallFunctionObjArgs(
 	        callback->callback, arg0, arg1, arg2, arg3, arg4, arg5, arg6, NULL));
 	if (!result) {
+		MOD_DisableSceneRasterSuppression();
 		callback->enabled = false;
 		log_python_exception((std::string("disabling render callback after exception: ") +
 		                      disable_context + " -> " + callback->description).c_str());

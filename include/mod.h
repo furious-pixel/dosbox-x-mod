@@ -13,6 +13,11 @@ struct ModNativeCallEventConfig {
 	uint8_t operation = 0;
 };
 
+struct ModCallSuppressionSiteConfig {
+	uint32_t callsite_reloc = 0;
+	uint32_t target_reloc = 0;
+};
+
 struct ModExecutableConfig {
 	std::string name = {};
 	std::string name_upper = {};
@@ -27,12 +32,32 @@ struct ModExecutableConfig {
 	uint32_t native_call_event_scan_start = 0;
 	uint32_t native_call_event_scan_end = 0;
 	std::vector<ModNativeCallEventConfig> native_call_events = {};
+	bool has_scene_raster_suppression = false;
+	uint32_t scene_raster_phase_enter_reloc = 0;
+	uint32_t scene_raster_phase_leave_reloc = 0;
+	std::vector<ModCallSuppressionSiteConfig> scene_raster_suppression_sites = {};
 };
 
 struct ModNativeCallEvent {
 	uint32_t value = 0;
 	uint32_t source_reloc = 0;
 	uint8_t operation = 0;
+};
+
+struct ModCallSuppressionSiteStats {
+	uint32_t callsite_reloc = 0;
+	uint64_t executed = 0;
+	uint64_t skipped = 0;
+};
+
+struct ModSceneRasterSuppressionStats {
+	bool configured = false;
+	bool validated = false;
+	bool requested = false;
+	bool phase_active = false;
+	uint64_t request_frame = 0;
+	uint64_t current_frame = 0;
+	std::vector<ModCallSuppressionSiteStats> sites = {};
 };
 
 struct ModGuestCallRegisters {
@@ -95,7 +120,11 @@ void MOD_OnTerminatePSP(uint16_t pspseg, bool tsr, uint8_t exitcode);
 bool MOD_FastEnabled(void);
 bool MOD_RenderActive(void);
 bool MOD_GuestCallActive(void);
-void MOD_OnCallsite(uint32_t linear_eip);
+int32_t MOD_OnCallsite(uint32_t linear_eip);
+bool MOD_CallsiteCanBeSuppressed(uint32_t linear_eip);
+bool MOD_SetSceneRasterSuppression(bool enabled);
+void MOD_DisableSceneRasterSuppression(void);
+bool MOD_GetSceneRasterSuppressionStats(ModSceneRasterSuppressionStats *stats);
 bool MOD_RequestSafePoint(void);
 void MOD_RunPendingSafePoint(void);
 bool MOD_CallRelocFunction(uint32_t reloc_eip,

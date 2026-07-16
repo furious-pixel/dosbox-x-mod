@@ -110,6 +110,7 @@ extern bool font_16_init;
 
 SDL_OpenGL sdl_opengl = {0};
 static ModRenderViewMode mod_render_view_mode = MOD_RENDER_VIEW_SIDE_BY_SIDE;
+static ModRenderViewMode mod_render_single_view_mode = MOD_RENDER_VIEW_MOD_ONLY;
 static bool mod_render_saved_window_size_valid = false;
 static Bitu mod_render_saved_window_width = 0;
 static Bitu mod_render_saved_window_height = 0;
@@ -293,7 +294,9 @@ retry:
         Bitu side_by_side_base_width = 0;
         Bitu side_by_side_base_height = 0;
         side_by_side_resize_override =
-                mod_render_view_mode == MOD_RENDER_VIEW_SIDE_BY_SIDE &&
+                (mod_render_view_mode == MOD_RENDER_VIEW_SIDE_BY_SIDE ||
+                 mod_render_view_mode ==
+                         MOD_RENDER_VIEW_SIDE_BY_SIDE_SUPPRESSED) &&
                 GetSideBySideBaseWindowSize(&side_by_side_base_width,
                                             &side_by_side_base_height);
 
@@ -1132,6 +1135,8 @@ static const char *GetModRenderViewModeNameInternal(const ModRenderViewMode mode
         return "mod-only";
     case MOD_RENDER_VIEW_SIDE_BY_SIDE:
         return "side-by-side";
+    case MOD_RENDER_VIEW_SIDE_BY_SIDE_SUPPRESSED:
+        return "side-by-side (native geometry suppressed)";
     case MOD_RENDER_VIEW_GAME_ONLY:
     default:
         return "game-only";
@@ -1143,28 +1148,47 @@ static const char *GetModRenderViewModeTitleLabelInternal(
 {
     switch (mode) {
     case MOD_RENDER_VIEW_MOD_ONLY:
-        return "mod";
+        return "mod; native geometry suppressed";
     case MOD_RENDER_VIEW_SIDE_BY_SIDE:
         return "orig+mod";
+    case MOD_RENDER_VIEW_SIDE_BY_SIDE_SUPPRESSED:
+        return "orig+mod; native geometry suppressed";
     case MOD_RENDER_VIEW_GAME_ONLY:
     default:
         return "orig";
     }
 }
 
-bool OUTPUT_OPENGL_CycleModRenderViewMode(Bitu *target_width, Bitu *target_height)
+static bool IsModRenderSideBySideMode(const ModRenderViewMode mode)
+{
+    return mode == MOD_RENDER_VIEW_SIDE_BY_SIDE ||
+           mode == MOD_RENDER_VIEW_SIDE_BY_SIDE_SUPPRESSED;
+}
+
+static bool SetModRenderViewMode(const ModRenderViewMode mode,
+                                 Bitu *target_width,
+                                 Bitu *target_height)
 {
     if (target_width)
         *target_width = 0;
     if (target_height)
         *target_height = 0;
 
-    switch (mod_render_view_mode) {
-    case MOD_RENDER_VIEW_GAME_ONLY:
-        mod_render_view_mode = MOD_RENDER_VIEW_MOD_ONLY;
+    if (mode == mod_render_view_mode)
         return false;
-    case MOD_RENDER_VIEW_MOD_ONLY: {
-        mod_render_view_mode = MOD_RENDER_VIEW_SIDE_BY_SIDE;
+
+    const bool was_side_by_side = IsModRenderSideBySideMode(mod_render_view_mode);
+    const bool will_be_side_by_side = IsModRenderSideBySideMode(mode);
+    mod_render_view_mode = mode;
+
+    // Non-suppressed presentation choices fail open immediately. Entering a
+    // suppression-capable view still waits for Python to publish a fresh frame.
+    if (mode == MOD_RENDER_VIEW_GAME_ONLY ||
+        mode == MOD_RENDER_VIEW_SIDE_BY_SIDE) {
+        MOD_DisableSceneRasterSuppression();
+    }
+
+    if (!was_side_by_side && will_be_side_by_side) {
         if (sdl.desktop.fullscreen)
             return false;
 
@@ -1189,19 +1213,54 @@ bool OUTPUT_OPENGL_CycleModRenderViewMode(Bitu *target_width, Bitu *target_heigh
             *target_height = side_by_side_height;
         return mod_render_saved_window_size_valid && have_side_by_side_size;
     }
-    case MOD_RENDER_VIEW_SIDE_BY_SIDE:
-    default:
-        mod_render_view_mode = MOD_RENDER_VIEW_GAME_ONLY;
-        if (sdl.desktop.fullscreen || !mod_render_saved_window_size_valid)
+
+    if (was_side_by_side && !will_be_side_by_side) {
+        if (sdl.desktop.fullscreen) {
+            mod_render_saved_window_size_valid = false;
+            return false;
+        }
+
+        Bitu single_width = mod_render_saved_window_width;
+        Bitu single_height = mod_render_saved_window_height;
+        const bool have_single_size = mod_render_saved_window_size_valid ||
+                GetSideBySideBaseWindowSize(&single_width, &single_height);
+        mod_render_saved_window_size_valid = false;
+        if (!have_single_size)
             return false;
 
         if (target_width)
-            *target_width = mod_render_saved_window_width;
+            *target_width = single_width;
         if (target_height)
-            *target_height = mod_render_saved_window_height;
-        mod_render_saved_window_size_valid = false;
+            *target_height = single_height;
         return true;
     }
+
+    return false;
+}
+
+bool OUTPUT_OPENGL_ToggleModRenderSingleView(Bitu *target_width,
+                                              Bitu *target_height)
+{
+    mod_render_single_view_mode =
+            mod_render_single_view_mode == MOD_RENDER_VIEW_MOD_ONLY
+                    ? MOD_RENDER_VIEW_GAME_ONLY
+                    : MOD_RENDER_VIEW_MOD_ONLY;
+    return SetModRenderViewMode(mod_render_single_view_mode,
+                                target_width,
+                                target_height);
+}
+
+bool OUTPUT_OPENGL_ToggleModRenderComparisonView(bool suppress_native_scene,
+                                                  Bitu *target_width,
+                                                  Bitu *target_height)
+{
+    const ModRenderViewMode comparison_mode = suppress_native_scene
+            ? MOD_RENDER_VIEW_SIDE_BY_SIDE_SUPPRESSED
+            : MOD_RENDER_VIEW_SIDE_BY_SIDE;
+    const ModRenderViewMode next_mode = mod_render_view_mode == comparison_mode
+            ? mod_render_single_view_mode
+            : comparison_mode;
+    return SetModRenderViewMode(next_mode, target_width, target_height);
 }
 
 const char *OUTPUT_OPENGL_GetModRenderViewModeName(void)
@@ -1358,7 +1417,8 @@ static OpenGLPresentationLayout BuildOpenGLPresentationLayout(void)
     case MOD_RENDER_VIEW_MOD_ONLY:
         layout.game = GLViewport();
         break;
-    case MOD_RENDER_VIEW_SIDE_BY_SIDE: {
+    case MOD_RENDER_VIEW_SIDE_BY_SIDE:
+    case MOD_RENDER_VIEW_SIDE_BY_SIDE_SUPPRESSED: {
         const uint32_t half_width = layout.backbuffer_width / 2u;
         layout.game = layout.natural_game;
 
@@ -1380,7 +1440,7 @@ static GLViewport BuildInactiveModFallbackViewport(
         const OpenGLPresentationLayout &layout)
 {
     GLViewport viewport = layout.natural_game;
-    if (mod_render_view_mode == MOD_RENDER_VIEW_SIDE_BY_SIDE)
+    if (IsModRenderSideBySideMode(mod_render_view_mode))
         viewport.x += layout.mod.x;
     return viewport;
 }

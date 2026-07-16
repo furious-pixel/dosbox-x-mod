@@ -462,6 +462,7 @@ static std::string build_mod_helper_bootstrap(void)
 		<< "mod.MOD_RENDER_VIEW_GAME_ONLY = 0\n"
 		<< "mod.MOD_RENDER_VIEW_MOD_ONLY = 1\n"
 		<< "mod.MOD_RENDER_VIEW_SIDE_BY_SIDE = 2\n"
+		<< "mod.MOD_RENDER_VIEW_SIDE_BY_SIDE_SUPPRESSED = 3\n"
 		<< "def modhook(exe_name, eip, kind):\n"
 		<< "    def decorator(func):\n"
 		<< "        return mod._register_hook(exe_name, eip, kind, func)\n"

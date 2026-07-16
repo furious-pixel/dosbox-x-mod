@@ -1104,7 +1104,7 @@ void GFX_SetTitle(int32_t cycles, int frameskip, Bits timing, bool paused) {
     static int32_t internal_cycles=0;
 //  static Bits internal_timing=0;
     char title[350] = {0};
-    char mod_view_suffix[24] = {0};
+    char mod_view_suffix[64] = {0};
 
 #if C_OPENGL
     if (sdl.desktop.want_type == SCREEN_OPENGL ||
@@ -3193,20 +3193,11 @@ static void SwitchFullScreen(bool pressed) {
     }
 }
 
-static void CycleModRenderView(bool pressed)
+static void ApplyModRenderViewChange(bool resize_window,
+                                     Bitu target_width,
+                                     Bitu target_height)
 {
 #if C_OPENGL
-    if (!pressed)
-        return;
-    if (sdl.desktop.want_type != SCREEN_OPENGL) {
-        LOG_MSG("MOD: render view cycling requires output=opengl");
-        return;
-    }
-
-    Bitu target_width = 0;
-    Bitu target_height = 0;
-    const bool resize_window =
-            OUTPUT_OPENGL_CycleModRenderViewMode(&target_width, &target_height);
     LOG_MSG("MOD: render view -> %s", OUTPUT_OPENGL_GetModRenderViewModeName());
     GFX_SetTitle(-1, -1, -1, false);
 
@@ -3225,6 +3216,67 @@ static void CycleModRenderView(bool pressed)
 #endif
 
     RedrawScreen((uint32_t)sdl.draw.width, (uint32_t)sdl.draw.height);
+#else
+    (void)resize_window;
+    (void)target_width;
+    (void)target_height;
+#endif
+}
+
+static bool ModRenderViewHotkeyReady(bool pressed)
+{
+    if (!pressed)
+        return false;
+    if (sdl.desktop.want_type == SCREEN_OPENGL)
+        return true;
+
+    LOG_MSG("MOD: render view switching requires output=opengl");
+    return false;
+}
+
+static void ToggleModRenderSingleView(bool pressed)
+{
+#if C_OPENGL
+    if (!ModRenderViewHotkeyReady(pressed))
+        return;
+
+    Bitu target_width = 0;
+    Bitu target_height = 0;
+    const bool resize_window = OUTPUT_OPENGL_ToggleModRenderSingleView(
+            &target_width, &target_height);
+    ApplyModRenderViewChange(resize_window, target_width, target_height);
+#else
+    (void)pressed;
+#endif
+}
+
+static void ToggleModRenderComparisonView(bool pressed)
+{
+#if C_OPENGL
+    if (!ModRenderViewHotkeyReady(pressed))
+        return;
+
+    Bitu target_width = 0;
+    Bitu target_height = 0;
+    const bool resize_window = OUTPUT_OPENGL_ToggleModRenderComparisonView(
+            false, &target_width, &target_height);
+    ApplyModRenderViewChange(resize_window, target_width, target_height);
+#else
+    (void)pressed;
+#endif
+}
+
+static void ToggleModRenderSuppressedComparisonView(bool pressed)
+{
+#if C_OPENGL
+    if (!ModRenderViewHotkeyReady(pressed))
+        return;
+
+    Bitu target_width = 0;
+    Bitu target_height = 0;
+    const bool resize_window = OUTPUT_OPENGL_ToggleModRenderComparisonView(
+            true, &target_width, &target_height);
+    ApplyModRenderViewChange(resize_window, target_width, target_height);
 #else
     (void)pressed;
 #endif
@@ -4092,8 +4144,19 @@ static void GUI_StartUp() {
         MAPPER_AddHandler(&GUI_ResetResize, MK_backspace, MMODHOST, "resetsize", "Reset window size", &item);
         item->set_text("Reset window size");
 
-        MAPPER_AddHandler(&CycleModRenderView, MK_slash, MMOD1, "modrenderview", "Cycle mod render view", &item);
-        item->set_text("Cycle mod render view");
+        MAPPER_AddHandler(&ToggleModRenderSingleView, MK_slash, MMOD1,
+                          "modrenderview", "Toggle game/mod view", &item);
+        item->set_text("Toggle game/mod view");
+
+        MAPPER_AddHandler(&ToggleModRenderComparisonView, MK_slash,
+                          MMOD1 | MMOD3, "modrendercompare",
+                          "Toggle side-by-side comparison", &item);
+        item->set_text("Toggle side-by-side comparison");
+
+        MAPPER_AddHandler(&ToggleModRenderSuppressedComparisonView, MK_slash,
+                          MMOD1 | MMOD2, "modrendercmpoff",
+                          "Toggle suppressed side-by-side comparison", &item);
+        item->set_text("Toggle suppressed side-by-side comparison");
     }
 
 #if defined(USE_TTF)

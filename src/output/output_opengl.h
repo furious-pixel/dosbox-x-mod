@@ -164,7 +164,11 @@ void OUTPUT_OPENGL_PresentModFrame(void);
 uint64_t OUTPUT_OPENGL_NotifyModFrameReady(void);
 void OUTPUT_OPENGL_GetModPresentationMetrics(OpenGLModPresentationMetrics *metrics);
 void OUTPUT_OPENGL_Shutdown();
-bool OUTPUT_OPENGL_CycleModRenderViewMode(Bitu *target_width, Bitu *target_height);
+bool OUTPUT_OPENGL_ToggleModRenderSingleView(Bitu *target_width,
+                                              Bitu *target_height);
+bool OUTPUT_OPENGL_ToggleModRenderComparisonView(bool suppress_native_scene,
+                                                  Bitu *target_width,
+                                                  Bitu *target_height);
 const char *OUTPUT_OPENGL_GetModRenderViewModeName(void);
 const char *OUTPUT_OPENGL_GetModRenderViewModeTitleLabel(void);
 

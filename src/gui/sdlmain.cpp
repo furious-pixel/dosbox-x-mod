@@ -377,6 +377,8 @@ extern bool IME_GetEnable();
 #endif
 
 int NonUserResizeCounter = 0;
+static int modRenderPresentationResizeWidth = 0;
+static int modRenderPresentationResizeHeight = 0;
 
 #if defined(WIN32) && !defined(HX_DOS)
 enum class CornerPreference {
@@ -3204,18 +3206,24 @@ static void ApplyModRenderViewChange(bool resize_window,
 #if defined(C_SDL2)
     if (resize_window && !sdl.desktop.fullscreen && sdl.window &&
         target_width > 0 && target_height > 0) {
-        NonUserResizeCounter++;
+        int current_width = 0;
+        int current_height = 0;
+        SDL_GetWindowSize(sdl.window, &current_width, &current_height);
         UpdateWindowDimensions(target_width, target_height);
         userResizeWindowWidth = target_width;
         userResizeWindowHeight = target_height;
-        SDL_SetWindowSize(sdl.window, (int)target_width, (int)target_height);
+        if (current_width != (int)target_width ||
+            current_height != (int)target_height) {
+            modRenderPresentationResizeWidth = (int)target_width;
+            modRenderPresentationResizeHeight = (int)target_height;
+            SDL_SetWindowSize(sdl.window, (int)target_width, (int)target_height);
+        }
         sdl.surface = SDL_GetWindowSurface(sdl.window);
-        RedrawScreen((uint32_t)target_width, (uint32_t)target_height);
-        return;
     }
 #endif
 
-    RedrawScreen((uint32_t)sdl.draw.width, (uint32_t)sdl.draw.height);
+    if (sdl.draw.callback)
+        sdl.draw.callback(GFX_CallBackRedraw);
 #else
     (void)resize_window;
     (void)target_width;
@@ -3227,11 +3235,16 @@ static bool ModRenderViewHotkeyReady(bool pressed)
 {
     if (!pressed)
         return false;
-    if (sdl.desktop.want_type == SCREEN_OPENGL)
-        return true;
+    if (sdl.desktop.want_type != SCREEN_OPENGL) {
+        LOG_MSG("MOD: render view switching requires output=opengl");
+        return false;
+    }
+    if (!OUTPUT_OPENGL_ModRendererAvailable()) {
+        LOG_MSG("MOD: render view switching ignored; no OpenGL renderer is registered");
+        return false;
+    }
 
-    LOG_MSG("MOD: render view switching requires output=opengl");
-    return false;
+    return true;
 }
 
 static void ToggleModRenderSingleView(bool pressed)
@@ -4629,6 +4642,25 @@ bool GFX_MustActOnResize() {
 
 #if defined(C_SDL2)
 void GFX_HandleVideoResize(int width, int height) {
+
+    if (modRenderPresentationResizeWidth > 0 &&
+        modRenderPresentationResizeHeight > 0) {
+        const bool expected_resize =
+                width == modRenderPresentationResizeWidth &&
+                height == modRenderPresentationResizeHeight;
+        modRenderPresentationResizeWidth = 0;
+        modRenderPresentationResizeHeight = 0;
+        if (expected_resize && sdl.desktop.want_type == SCREEN_OPENGL) {
+            UpdateWindowDimensions((unsigned int)width,
+                                   (unsigned int)height);
+            if (sdl.window)
+                sdl.surface = SDL_GetWindowSurface(sdl.window);
+            sdl.must_redraw_all = true;
+            if (sdl.draw.callback)
+                sdl.draw.callback(GFX_CallBackRedraw);
+            return;
+        }
+    }
 
     /* don't act if 3Dfx OpenGL emulation is active */
     if (GFX_GetPreventFullscreen()) {

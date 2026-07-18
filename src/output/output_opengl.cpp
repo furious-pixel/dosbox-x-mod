@@ -109,8 +109,9 @@ extern int initgl, lastcp;
 extern bool font_16_init;
 
 SDL_OpenGL sdl_opengl = {0};
-static ModRenderViewMode mod_render_view_mode = MOD_RENDER_VIEW_SIDE_BY_SIDE;
+static ModRenderViewMode mod_render_view_mode = MOD_RENDER_VIEW_GAME_ONLY;
 static ModRenderViewMode mod_render_single_view_mode = MOD_RENDER_VIEW_MOD_ONLY;
+static bool mod_render_view_initialized = false;
 static bool mod_render_saved_window_size_valid = false;
 static Bitu mod_render_saved_window_width = 0;
 static Bitu mod_render_saved_window_height = 0;
@@ -449,10 +450,20 @@ retry:
 void OUTPUT_OPENGL_Initialize()
 {
     memset(&sdl_opengl, 0, sizeof(sdl_opengl));
+    mod_render_view_mode = MOD_RENDER_VIEW_GAME_ONLY;
+    mod_render_single_view_mode = MOD_RENDER_VIEW_MOD_ONLY;
+    mod_render_view_initialized = false;
 }
 
 void OUTPUT_OPENGL_Select( GLKind kind )
 {
+    if (!mod_render_view_initialized) {
+        mod_render_view_mode = DOSBoxPython_OpenGLRendererAvailable()
+                ? MOD_RENDER_VIEW_SIDE_BY_SIDE
+                : MOD_RENDER_VIEW_GAME_ONLY;
+        mod_render_view_initialized = true;
+    }
+
     sdl.desktop.want_type = SCREEN_OPENGL;
     render.aspectOffload = true;
 
@@ -1136,7 +1147,7 @@ static const char *GetModRenderViewModeNameInternal(const ModRenderViewMode mode
     case MOD_RENDER_VIEW_SIDE_BY_SIDE:
         return "side-by-side";
     case MOD_RENDER_VIEW_SIDE_BY_SIDE_SUPPRESSED:
-        return "side-by-side (native geometry suppressed)";
+        return "side-by-side (allow scene suppression)";
     case MOD_RENDER_VIEW_GAME_ONLY:
     default:
         return "game-only";
@@ -1146,13 +1157,20 @@ static const char *GetModRenderViewModeNameInternal(const ModRenderViewMode mode
 static const char *GetModRenderViewModeTitleLabelInternal(
         const ModRenderViewMode mode)
 {
+    ModSceneRasterSuppressionStats suppression = {};
+    const bool scene_suppressed =
+            MOD_GetSceneRasterSuppressionStats(&suppression) &&
+            suppression.requested;
+
     switch (mode) {
     case MOD_RENDER_VIEW_MOD_ONLY:
-        return "mod; native geometry suppressed";
+        return scene_suppressed ? "mod; scene render suppressed" : "mod";
     case MOD_RENDER_VIEW_SIDE_BY_SIDE:
         return "orig+mod";
     case MOD_RENDER_VIEW_SIDE_BY_SIDE_SUPPRESSED:
-        return "orig+mod; native geometry suppressed";
+        return scene_suppressed
+                ? "orig+mod; scene render suppressed"
+                : "orig+mod";
     case MOD_RENDER_VIEW_GAME_ONLY:
     default:
         return "orig";
@@ -1241,6 +1259,14 @@ static bool SetModRenderViewMode(const ModRenderViewMode mode,
 bool OUTPUT_OPENGL_ToggleModRenderSingleView(Bitu *target_width,
                                               Bitu *target_height)
 {
+    if (!OUTPUT_OPENGL_ModRendererAvailable()) {
+        if (target_width)
+            *target_width = 0;
+        if (target_height)
+            *target_height = 0;
+        return false;
+    }
+
     mod_render_single_view_mode =
             mod_render_single_view_mode == MOD_RENDER_VIEW_MOD_ONLY
                     ? MOD_RENDER_VIEW_GAME_ONLY
@@ -1254,6 +1280,14 @@ bool OUTPUT_OPENGL_ToggleModRenderComparisonView(bool suppress_native_scene,
                                                   Bitu *target_width,
                                                   Bitu *target_height)
 {
+    if (!OUTPUT_OPENGL_ModRendererAvailable()) {
+        if (target_width)
+            *target_width = 0;
+        if (target_height)
+            *target_height = 0;
+        return false;
+    }
+
     const ModRenderViewMode comparison_mode = suppress_native_scene
             ? MOD_RENDER_VIEW_SIDE_BY_SIDE_SUPPRESSED
             : MOD_RENDER_VIEW_SIDE_BY_SIDE;
@@ -1270,7 +1304,14 @@ const char *OUTPUT_OPENGL_GetModRenderViewModeName(void)
 
 const char *OUTPUT_OPENGL_GetModRenderViewModeTitleLabel(void)
 {
+    if (!OUTPUT_OPENGL_ModRendererAvailable())
+        return "orig";
     return GetModRenderViewModeTitleLabelInternal(mod_render_view_mode);
+}
+
+bool OUTPUT_OPENGL_ModRendererAvailable(void)
+{
+    return DOSBoxPython_OpenGLRendererAvailable();
 }
 
 uint64_t OUTPUT_OPENGL_NotifyModFrameReady(void)

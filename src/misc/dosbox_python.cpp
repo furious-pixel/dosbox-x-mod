@@ -2791,6 +2791,15 @@ bool DOSBoxPython_InvokeSafePointCallback(void)
 	return true;
 }
 
+bool DOSBoxPython_OpenGLRendererAvailable(void)
+{
+	return g_python.initialized &&
+	       g_python.init_callback.enabled &&
+	       g_python.init_callback.callback &&
+	       g_python.compositor_callback.enabled &&
+	       g_python.compositor_callback.callback;
+}
+
 void DOSBoxPython_NotifyOpenGLContextCreated(uint64_t context_generation)
 {
 	MOD_DisableSceneRasterSuppression();

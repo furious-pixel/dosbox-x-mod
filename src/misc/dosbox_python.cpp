@@ -484,6 +484,13 @@ static std::string build_mod_helper_bootstrap(void)
 		<< "def modsafe(func):\n"
 		<< "    return mod._register_safe_callback(func)\n"
 		<< "mod.modsafe = modsafe\n";
+	script
+		<< "if not hasattr(mod, '_postload_callbacks'):\n"
+		<< "    mod._postload_callbacks = []\n"
+		<< "def modpostload(func):\n"
+		<< "    mod._postload_callbacks.append(func)\n"
+		<< "    return func\n"
+		<< "mod.modpostload = modpostload\n";
 	return script.str();
 }
 
@@ -509,6 +516,7 @@ static std::string build_mod_loader_script(const std::string &mods_dir)
 	std::ostringstream script;
 	script
 		<< "import builtins\n"
+		<< "import mod\n"
 		<< "import os\n"
 		<< "import pathlib\n"
 		<< "import runpy\n"
@@ -522,6 +530,7 @@ static std::string build_mod_loader_script(const std::string &mods_dir)
 		<< "    except OSError:\n"
 		<< "        pass\n"
 		<< "mods_dir = pathlib.Path('" << escaped_mods_dir << "').resolve()\n"
+		<< "mod._postload_callbacks.clear()\n"
 		<< "if mods_dir.is_dir():\n"
 		<< "    sys.path.insert(0, str(mods_dir))\n"
 		<< "    for mod_path in sorted(mods_dir.glob('*.py')):\n"
@@ -537,6 +546,13 @@ static std::string build_mod_loader_script(const std::string &mods_dir)
 		<< "            traceback.print_exc()\n"
 		<< "else:\n"
 		<< "    print(f'PYTHON: mods directory not found: {mods_dir}', flush=True)\n"
+		<< "for callback in tuple(mod._postload_callbacks):\n"
+		<< "    try:\n"
+		<< "        callback()\n"
+		<< "    except Exception:\n"
+		<< "        print('MOD ERROR: post-load work failed', flush=True)\n"
+		<< "        traceback.print_exc()\n"
+		<< "        raise\n"
 		<< "sys.stdout.flush()\n";
 	return script.str();
 }

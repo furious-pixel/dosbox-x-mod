@@ -469,7 +469,20 @@ static Bitu Normal_Loop(void) {
 
                 saved_allow = dosbox_allow_nonrecursive_page_fault;
                 dosbox_allow_nonrecursive_page_fault = true;
+                const uint64_t timing_started = MOD_TimingBegin();
+                const int64_t timing_requested_cycles =
+                        static_cast<int64_t>(CPU_Cycles);
+                const int64_t timing_cycle_max =
+                        static_cast<int64_t>(CPU_CycleMax);
                 ret = (*cpudecoder)();
+                const uint64_t decoder_elapsed = MOD_TimingEnd(
+                        MOD_TIMING_CPU_DECODER, timing_started);
+                MOD_TimingRecordDecoderSlice(
+                        decoder_elapsed,
+                        timing_requested_cycles,
+                        static_cast<int64_t>(CPU_Cycles),
+                        timing_cycle_max,
+                        CPU_CycleAutoAdjust);
                 dosbox_allow_nonrecursive_page_fault = saved_allow;
 
                 if (GCC_UNLIKELY(ret<0))
@@ -509,12 +522,18 @@ static Bitu Normal_Loop(void) {
                     return 0;
 #endif
             } else {
+                const uint64_t events_started = MOD_TimingBegin();
                 GFX_Events();
+                MOD_TimingEnd(MOD_TIMING_GFX_EVENTS, events_started);
                 if (DOSBox_Paused() == false && ticksRemain > 0) {
+                    const uint64_t timer_started = MOD_TimingBegin();
                     TIMER_AddTick();
+                    MOD_TimingEnd(MOD_TIMING_TIMER_TICK, timer_started);
                     ticksRemain--;
                 } else {
+                    const uint64_t tick_started = MOD_TimingBegin();
                     increaseticks();
+                    MOD_TimingEnd(MOD_TIMING_TICK_CONTROL, tick_started);
                     return 0;
                 }
             }
@@ -579,6 +598,7 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
     if (ticksNew <= ticksLast) { //lower should not be possible, only equal.
         ticksAdded = 0;
 
+        const uint64_t sleep_started = MOD_TimingBegin();
         if (!CPU_CycleAutoAdjust || CPU_SkipCycleAutoAdjust || sleep1count < 3) {
             wrap_delay(1);
         }
@@ -593,6 +613,7 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
             wrap_delay(sleeppattern[sleepindex++]);
             sleepindex %= sizeof(sleeppattern) / sizeof(sleeppattern[0]);
         }
+        MOD_TimingEnd(MOD_TIMING_TICK_SLEEP, sleep_started);
         int32_t timeslept = (int32_t)(GetTicks() - ticksNew);
         // Count how many times in the current block (of 250 ms) the time slept was 1 ms
         if (CPU_CycleAutoAdjust && !CPU_SkipCycleAutoAdjust && timeslept == 1) sleep1count++;
@@ -630,7 +651,14 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
     if (!CPU_CycleAutoAdjust || CPU_SkipCycleAutoAdjust)
         return;
 
+    const uint64_t auto_started = MOD_TimingBegin();
+    const int64_t timing_cycle_max_before = static_cast<int64_t>(CPU_CycleMax);
+    const int32_t timing_ticks_added = static_cast<int32_t>(ticksAdded);
+    const int32_t timing_ticks_scheduled = static_cast<int32_t>(ticksScheduled);
+    const int32_t timing_ticks_done = ticksDone;
+    bool timing_auto_adjusted = false;
     if (ticksScheduled >= 250 || ticksDone >= 250 || (ticksAdded > 15 && ticksScheduled >= 5)) {
+        timing_auto_adjusted = true;
         if (ticksDone < 1) ticksDone = 1; // Protect against div by zero
         /* ratio we are aiming for is around 90% usage*/
         int32_t ratio = (int32_t)((ticksScheduled * (CPU_CyclePercUsed * 90 * 1024 / 100 / 100)) / ticksDone);
@@ -704,6 +732,7 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
         sleep1count = 0;
     }
     else if (ticksAdded > 15) {
+        timing_auto_adjusted = true;
         /* ticksAdded > 15 but ticksScheduled < 5, lower the cycles
            but do not reset the scheduled/done ticks to take them into
            account during the next auto cycle adjustment */
@@ -712,6 +741,15 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
         if (CPU_CycleMax < CPU_CYCLES_LOWER_LIMIT)
             CPU_CycleMax = CPU_CYCLES_LOWER_LIMIT;
     }
+    if (timing_auto_adjusted) {
+        MOD_TimingRecordAutoCycleAdjustment(
+                timing_cycle_max_before,
+                static_cast<int64_t>(CPU_CycleMax),
+                timing_ticks_added,
+                timing_ticks_scheduled,
+                timing_ticks_done);
+    }
+    MOD_TimingEnd(MOD_TIMING_AUTO_CYCLE, auto_started);
 }
 
 LoopHandler *DOSBOX_GetLoop(void) {

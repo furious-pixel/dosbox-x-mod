@@ -400,7 +400,9 @@ restart_core:
 		if (!chandler->invalidation_map || (chandler->invalidation_map[ip_point&4095]<4)) {
 			decoder_pagefault.had_pagefault = false;
 			int cache_size = dynamic_core_cache_block_size;
+			uint64_t timing_started = MOD_TimingBegin();
 			block = CreateCacheBlock(chandler,ip_point,cache_size);
+			MOD_TimingEnd(MOD_TIMING_DYNAMIC_COMPILE, timing_started);
 			while (decoder_pagefault.had_pagefault) {
 				// Can happen only if use_dynamic_core_with_paging is on
 				// We can't throw exception during the creation of the block, as it will corrupt things
@@ -411,7 +413,9 @@ restart_core:
 					throw GuestPageFaultException(decoder_pagefault.lin_addr, decoder_pagefault.page_addr, decoder_pagefault.faultcode);
 				cache_size /= 2;
 				decoder_pagefault.had_pagefault = false;
+				timing_started = MOD_TimingBegin();
 				block = CreateCacheBlock(chandler,ip_point,cache_size);
+				MOD_TimingEnd(MOD_TIMING_DYNAMIC_COMPILE, timing_started);
 			}
 		} else {
 			int32_t old_cycles=(int32_t)CPU_Cycles;

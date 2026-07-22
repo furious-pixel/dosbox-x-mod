@@ -23,6 +23,7 @@
 #include "cpu.h"
 #include "callback.h"
 #include "logging.h"
+#include "mod.h"
 #include "pic.h"
 #include "timer.h"
 #include "setup.h"
@@ -766,9 +767,11 @@ bool PIC_RunQueue(void) {
             pic_queue.next_entry=entry->next;
             srv_lag = entry->index;
 
-            if (entry->pic_event != NULL)
+            if (entry->pic_event != NULL) {
+                const uint64_t timing_started = MOD_TimingBegin();
                 (entry->pic_event)(entry->value); // call the event handler
-            else
+                MOD_TimingEnd(MOD_TIMING_PIC_EVENT, timing_started);
+            } else
                 LOG(LOG_MISC,LOG_WARN)("PIC: Event in queue with NULL handler"); // This can happen after save state / load state
 
             /* Put the entry in the free list */

@@ -1161,6 +1161,19 @@ void GFX_SetTitle(int32_t cycles, int frameskip, Bits timing, bool paused) {
                         metrics.average_latency_ms,
                         metrics.maximum_latency_ms);
             }
+            ModTimingSummary timing = {};
+            if (MOD_GetTimingSummary(&timing)) {
+                p = title + strlen(title);
+                sprintf(p, ", frame p99/max %.1f/%.1f ms",
+                        timing.frame_p99_ms,
+                        timing.frame_max_ms);
+                if (timing.present_max_ms > 0.0) {
+                    p = title + strlen(title);
+                    sprintf(p, ", cadence p99/max %.1f/%.1f ms",
+                            timing.present_p99_ms,
+                            timing.present_max_ms);
+                }
+            }
         } else
 #endif
             sprintf(p,", FPS %2d",(int)frames);

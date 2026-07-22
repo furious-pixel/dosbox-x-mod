@@ -73,6 +73,36 @@ struct ModFrameState {
 	double frame_delta_seconds = 0.0;
 };
 
+enum ModTimingCategory {
+	MOD_TIMING_CPU_DECODER = 0,
+	MOD_TIMING_PIC_EVENT,
+	MOD_TIMING_PYTHON_HOOK,
+	MOD_TIMING_SAFE_POINT,
+	MOD_TIMING_DYNAMIC_COMPILE,
+	MOD_TIMING_COMPOSITOR,
+	MOD_TIMING_SWAP,
+	MOD_TIMING_GFX_EVENTS,
+	MOD_TIMING_TIMER_TICK,
+	MOD_TIMING_TICK_CONTROL,
+	MOD_TIMING_TICK_SLEEP,
+	MOD_TIMING_AUTO_CYCLE,
+	MOD_TIMING_CATEGORY_COUNT,
+};
+
+struct ModTimingSummary {
+	bool valid = false;
+	double frame_p50_ms = 0.0;
+	double frame_p95_ms = 0.0;
+	double frame_p99_ms = 0.0;
+	double frame_max_ms = 0.0;
+	double present_p50_ms = 0.0;
+	double present_p95_ms = 0.0;
+	double present_p99_ms = 0.0;
+	double present_max_ms = 0.0;
+	uint64_t frame_spikes = 0;
+	uint64_t present_spikes = 0;
+};
+
 enum ModRenderViewMode {
 	MOD_RENDER_VIEW_GAME_ONLY = 0,
 	MOD_RENDER_VIEW_MOD_ONLY = 1,
@@ -133,6 +163,27 @@ bool MOD_CallRelocFunction(uint32_t reloc_eip,
                            ModGuestCallRegisters *output);
 bool MOD_DrainNativeCallEvents(std::vector<ModNativeCallEvent> *events,
                                uint64_t *dropped);
+
+uint64_t MOD_TimingBegin(void);
+uint64_t MOD_TimingEnd(ModTimingCategory category, uint64_t started_ns);
+void MOD_TimingRecordDecoderSlice(uint64_t elapsed_ns,
+                                  int64_t requested_cycles,
+                                  int64_t remaining_cycles,
+                                  int64_t cycle_max,
+                                  bool auto_adjust);
+void MOD_TimingRecordAutoCycleAdjustment(int64_t cycle_max_before,
+                                         int64_t cycle_max_after,
+                                         int32_t ticks_added,
+                                         int32_t ticks_scheduled,
+                                         int32_t ticks_done);
+void MOD_TimingCountNativeFrame(void);
+void MOD_TimingCountModFrameReady(void);
+void MOD_TimingPresentationBoundary(bool compositor_invoked,
+                                    bool new_mod_frame,
+                                    uint64_t compositor_ns,
+                                    uint64_t swap_ns,
+                                    const char *source);
+bool MOD_GetTimingSummary(ModTimingSummary *summary);
 
 bool MOD_ReadMemoryU8(uint32_t reloc_addr, uint8_t *value);
 bool MOD_ReadMemoryU16(uint32_t reloc_addr, uint16_t *value);

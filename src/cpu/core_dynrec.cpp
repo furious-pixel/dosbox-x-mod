@@ -290,7 +290,9 @@ Bits CPU_Core_Dynrec_Run(void) {
 			// unless the instruction is known to be modified
 			if (!chandler->invalidation_map || (chandler->invalidation_map[ip_point&4095]<4)) {
 				// translate up to 32 instructions
+				const uint64_t timing_started = MOD_TimingBegin();
 				block=CreateCacheBlock(chandler,ip_point,32);
+				MOD_TimingEnd(MOD_TIMING_DYNAMIC_COMPILE, timing_started);
 			} else {
 				dosbox_allow_nonrecursive_page_fault = true;
 				// let the normal core handle this instruction to avoid zero-sized blocks

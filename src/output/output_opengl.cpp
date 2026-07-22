@@ -1324,6 +1324,7 @@ uint64_t OUTPUT_OPENGL_NotifyModFrameReady(void)
     metrics.latest_ready_sequence++;
     metrics.latest_ready_ticks = now;
     metrics.mod_count++;
+    MOD_TimingCountModFrameReady();
     return metrics.latest_ready_sequence;
 }
 
@@ -1334,6 +1335,7 @@ static void RecordNativeFrame(void)
     if (metrics.interval_start_ticks == 0)
         metrics.interval_start_ticks = now;
     metrics.native_count++;
+    MOD_TimingCountNativeFrame();
 }
 
 void OUTPUT_OPENGL_GetModPresentationMetrics(
@@ -1378,7 +1380,7 @@ void OUTPUT_OPENGL_GetModPresentationMetrics(
     *result = metrics.snapshot;
 }
 
-static void RecordOpenGLPresentation(const bool compositor_invoked)
+static bool RecordOpenGLPresentation(const bool compositor_invoked)
 {
     ModPresentationMetricsState &metrics = mod_presentation_metrics;
     const uint32_t now = SDL_GetTicks();
@@ -1388,7 +1390,7 @@ static void RecordOpenGLPresentation(const bool compositor_invoked)
     metrics.presentation_count++;
     if (!compositor_invoked || metrics.latest_ready_sequence == 0 ||
         metrics.latest_ready_sequence == metrics.last_presented_ready_sequence) {
-        return;
+        return false;
     }
 
     metrics.last_presented_ready_sequence = metrics.latest_ready_sequence;
@@ -1396,6 +1398,7 @@ static void RecordOpenGLPresentation(const bool compositor_invoked)
     metrics.latency_sum_ms += latency_ms;
     metrics.latency_sample_count++;
     metrics.latency_max_ms = std::max(metrics.latency_max_ms, latency_ms);
+    return true;
 }
 
 static OpenGLPresentationLayout BuildOpenGLPresentationLayout(void)
@@ -1668,6 +1671,7 @@ static void FinishOpenGLPresentation(void)
             mod_render_view_mode != MOD_RENDER_VIEW_GAME_ONLY &&
             mod_render_was_active && !mod_render_active;
     bool compositor_invoked = false;
+    uint64_t compositor_ns = 0;
 
     if (mod_render_active)
         DOSBoxPython_InvokeOpenGLInitCallback(mod_state);
@@ -1680,16 +1684,25 @@ static void FinishOpenGLPresentation(void)
 
     if (mod_render_active &&
         mod_render_view_mode != MOD_RENDER_VIEW_GAME_ONLY) {
+        const uint64_t timing_started = MOD_TimingBegin();
         compositor_invoked =
                 DOSBoxPython_InvokeOpenGLCompositorCallback(mod_state);
+        compositor_ns = MOD_TimingEnd(MOD_TIMING_COMPOSITOR, timing_started);
     } else if (!mod_render_active &&
                mod_render_view_mode != MOD_RENDER_VIEW_GAME_ONLY) {
         DrawDOSBoxTextureToViewport(layout, fallback);
     }
 
     RestoreOpenGLPresentationState(layout);
+    const uint64_t swap_started = MOD_TimingBegin();
     SDL_GL_SwapBuffers();
-    RecordOpenGLPresentation(compositor_invoked);
+    const uint64_t swap_ns = MOD_TimingEnd(MOD_TIMING_SWAP, swap_started);
+    const bool new_mod_frame = RecordOpenGLPresentation(compositor_invoked);
+    MOD_TimingPresentationBoundary(compositor_invoked,
+                                   new_mod_frame,
+                                   compositor_ns,
+                                   swap_ns,
+                                   "vga");
 
     if (drain_inactive_buffers)
         DrainInactiveModRenderBuffers(layout);

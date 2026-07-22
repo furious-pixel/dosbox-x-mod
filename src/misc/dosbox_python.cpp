@@ -434,6 +434,10 @@ static std::string build_mod_helper_bootstrap(void)
 		<< "class _DOSBoxOpenGL(object):\n"
 		<< "    def notify_frame_ready(self):\n"
 		<< "        return mod._notify_frame_ready()\n"
+		<< "    def set_frame_pacing_suspended(self, suspended):\n"
+		<< "        return mod._set_frame_pacing_suspended(1 if suspended else 0)\n"
+		<< "    def set_continuous_presentation(self, active):\n"
+		<< "        return mod._set_continuous_presentation(1 if active else 0)\n"
 		<< "    pass\n"
 		<< "if not hasattr(mod, 'modgl'):\n"
 		<< "    mod.modgl = _DOSBoxOpenGL()\n"
@@ -1141,6 +1145,45 @@ static PyObject *py_notify_frame_ready(PyObject *, PyObject *args)
 	        static_cast<unsigned long long>(sequence));
 }
 
+static PyObject *py_set_frame_pacing_suspended(PyObject *, PyObject *args)
+{
+	if (g_python.api.PyTuple_Size(args) != 1) {
+		set_python_error(g_python.api.PyExc_TypeError,
+		                 "set_frame_pacing_suspended expects (suspended)");
+		return NULL;
+	}
+
+	unsigned long suspended = 0;
+	if (!py_tuple_get_uint32_arg(args, 0, &suspended) || suspended > 1u) {
+		set_python_error(g_python.api.PyExc_ValueError,
+		                 "suspended must be 0 or 1");
+		return NULL;
+	}
+
+	const bool configured = MOD_SetFramePacingSuspended(suspended != 0);
+	return g_python.api.PyLong_FromUnsignedLong(configured ? 1ul : 0ul);
+}
+
+static PyObject *py_set_continuous_presentation(PyObject *, PyObject *args)
+{
+	if (g_python.api.PyTuple_Size(args) != 1) {
+		set_python_error(g_python.api.PyExc_TypeError,
+		                 "set_continuous_presentation expects (active)");
+		return NULL;
+	}
+
+	unsigned long active = 0;
+	if (!py_tuple_get_uint32_arg(args, 0, &active) || active > 1u) {
+		set_python_error(g_python.api.PyExc_ValueError,
+		                 "active must be 0 or 1");
+		return NULL;
+	}
+
+	const bool accepted =
+	        MOD_SetFramePacingContinuousPresentation(active != 0);
+	return g_python.api.PyLong_FromUnsignedLong(accepted ? 1ul : 0ul);
+}
+
 static PyObject *py_get_delta(PyObject *, PyObject *args)
 {
 	if (g_python.api.PyTuple_Size(args) != 0) {
@@ -1796,6 +1839,12 @@ static bool ensure_mod_helper_module(void)
 	static PyMethodDef notify_frame_ready_method = {
 	        "_notify_frame_ready", py_notify_frame_ready,
 	        DOSBOX_PY_METH_VARARGS, NULL};
+	static PyMethodDef set_frame_pacing_suspended_method = {
+	        "_set_frame_pacing_suspended", py_set_frame_pacing_suspended,
+	        DOSBOX_PY_METH_VARARGS, NULL};
+	static PyMethodDef set_continuous_presentation_method = {
+	        "_set_continuous_presentation", py_set_continuous_presentation,
+	        DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef get_delta_method = {
 	        "_get_delta", py_get_delta, DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef set_scene_raster_suppression_method = {
@@ -1853,6 +1902,10 @@ static bool ensure_mod_helper_module(void)
 	                            &get_modjoystick_axes_method) ||
 	    !attach_module_function(mod_module.get(), "_notify_frame_ready",
 	                            &notify_frame_ready_method) ||
+	    !attach_module_function(mod_module.get(), "_set_frame_pacing_suspended",
+	                            &set_frame_pacing_suspended_method) ||
+	    !attach_module_function(mod_module.get(), "_set_continuous_presentation",
+	                            &set_continuous_presentation_method) ||
 	    !attach_module_function(mod_module.get(), "_get_delta",
 	                            &get_delta_method) ||
 	    !attach_module_function(mod_module.get(), "_set_scene_raster_suppression",

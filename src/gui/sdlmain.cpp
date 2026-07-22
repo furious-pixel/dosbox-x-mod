@@ -3561,6 +3561,14 @@ switch_type:
     }
 }
 
+void GFX_ServiceModFramePresentation(void)
+{
+#if C_OPENGL
+    if (sdl.desktop.type == SCREEN_OPENGL)
+        OUTPUT_OPENGL_PresentReadyModFrame();
+#endif
+}
+
 void GFX_SetPalette(Bitu start,Bitu count,GFX_PalEntry * entries) {
     (void)start;
     (void)count;

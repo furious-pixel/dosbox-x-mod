@@ -463,6 +463,7 @@ static Bitu Normal_Loop(void) {
     try {
         while (1) {
             MOD_RunPendingSafePoint();
+            GFX_ServiceModFramePresentation();
             if (PIC_RunQueue()) {
                 /* now is the time to check for the NMI (Non-maskable interrupt) */
                 CPU_Check_NMI();
@@ -582,6 +583,7 @@ static Bitu Normal_Loop(void) {
 void increaseticks() { //Make it return ticksRemain and set it in the function above to remove the global variable.
     static int32_t lastsleepDone = -1;
     static Bitu sleep1count = 0;
+    const bool frame_pacing_waiting = MOD_FramePacingWaiting();
     if (GCC_UNLIKELY(ticksLocked)) { // For Fast Forward Mode
         ticksRemainSpeedFrac = 0;
         ticksRemain = 5;
@@ -599,7 +601,8 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
         ticksAdded = 0;
 
         const uint64_t sleep_started = MOD_TimingBegin();
-        if (!CPU_CycleAutoAdjust || CPU_SkipCycleAutoAdjust || sleep1count < 3) {
+        if (frame_pacing_waiting || !CPU_CycleAutoAdjust ||
+            CPU_SkipCycleAutoAdjust || sleep1count < 3) {
             wrap_delay(1);
         }
         else {
@@ -616,7 +619,8 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
         MOD_TimingEnd(MOD_TIMING_TICK_SLEEP, sleep_started);
         int32_t timeslept = (int32_t)(GetTicks() - ticksNew);
         // Count how many times in the current block (of 250 ms) the time slept was 1 ms
-        if (CPU_CycleAutoAdjust && !CPU_SkipCycleAutoAdjust && timeslept == 1) sleep1count++;
+        if (!frame_pacing_waiting && CPU_CycleAutoAdjust &&
+            !CPU_SkipCycleAutoAdjust && timeslept == 1) sleep1count++;
         lastsleepDone = ticksDone;
 
         // Update ticksDone with the time spent sleeping
@@ -624,6 +628,13 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
 
         if (ticksDone < 0)
             ticksDone = 0;
+        if (frame_pacing_waiting) {
+            CPU_IODelayRemoved = 0;
+            ticksDone = 0;
+            ticksScheduled = 0;
+            lastsleepDone = -1;
+            sleep1count = 0;
+        }
         return;
     }
 
@@ -646,6 +657,19 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
         ticksRemain = 20;
     }
     ticksAdded = ticksRemain;
+
+    // Pacing time is intentional host-side idle time, not evidence that the
+    // emulated CPU is overloaded. Keep guest timer delivery above, but keep
+    // this interval out of cycles=auto's utilization estimate.
+    if (frame_pacing_waiting) {
+        CPU_IODelayRemoved = 0;
+        ticksAdded = 0;
+        ticksDone = 0;
+        ticksScheduled = 0;
+        lastsleepDone = -1;
+        sleep1count = 0;
+        return;
+    }
 
     // Is the system in auto cycle mode guessing? If not just exit. (It can be temporarily disabled)
     if (!CPU_CycleAutoAdjust || CPU_SkipCycleAutoAdjust)
@@ -2163,6 +2187,17 @@ void DOSBOX_SetupConfigSections(void) {
     Pint->SetMinMax(0,10);
     Pint->Set_help("How many frames DOSBox-X skips before drawing one.");
     Pint->SetBasic(true);
+
+    Pint = secprop->Add_int("mod renderer target fps",Property::Changeable::OnlyAtStart,0);
+    Pint->SetMinMax(0,240);
+    Pint->Set_help("Pace supported mod-renderer-only gameplay at this frame rate. 0 disables pacing.");
+    Pint->SetBasic(true);
+
+    Pstring = secprop->Add_string("mod renderer start view",Property::Changeable::OnlyAtStart,"side-by-side");
+    const char *modrenderstartviews[] = {"game-only", "mod-only", "side-by-side", 0};
+    Pstring->Set_values(modrenderstartviews);
+    Pstring->Set_help("Initial OpenGL presentation view when a mod renderer is available.");
+    Pstring->SetBasic(true);
 
     Pstring = secprop->Add_string("aspect", Property::Changeable::Always, "false");
     Pstring->Set_values(aspectmodes);

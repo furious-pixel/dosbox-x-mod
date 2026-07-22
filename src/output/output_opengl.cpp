@@ -133,6 +133,25 @@ struct ModPresentationMetricsState {
 
 static ModPresentationMetricsState mod_presentation_metrics = {};
 
+static ModRenderViewMode GetConfiguredModRenderStartView(void)
+{
+    if (!DOSBoxPython_OpenGLRendererAvailable())
+        return MOD_RENDER_VIEW_GAME_ONLY;
+
+    const Section_prop *render_section = static_cast<const Section_prop *>(
+            control->GetSection("render"));
+    if (!render_section)
+        return MOD_RENDER_VIEW_SIDE_BY_SIDE;
+
+    const char *configured =
+            render_section->Get_string("mod renderer start view");
+    if (configured && !strcmp(configured, "mod-only"))
+        return MOD_RENDER_VIEW_MOD_ONLY;
+    if (configured && !strcmp(configured, "game-only"))
+        return MOD_RENDER_VIEW_GAME_ONLY;
+    return MOD_RENDER_VIEW_SIDE_BY_SIDE;
+}
+
 // One normal inactive present clears the current back buffer before swapping.
 // Two post-swap clears drain the other buffers when drivers are effectively
 // triple-buffering behind SDL's back.
@@ -453,16 +472,21 @@ void OUTPUT_OPENGL_Initialize()
     mod_render_view_mode = MOD_RENDER_VIEW_GAME_ONLY;
     mod_render_single_view_mode = MOD_RENDER_VIEW_MOD_ONLY;
     mod_render_view_initialized = false;
+    MOD_SetFramePacingViewEligible(false);
 }
 
 void OUTPUT_OPENGL_Select( GLKind kind )
 {
     if (!mod_render_view_initialized) {
-        mod_render_view_mode = DOSBoxPython_OpenGLRendererAvailable()
-                ? MOD_RENDER_VIEW_SIDE_BY_SIDE
-                : MOD_RENDER_VIEW_GAME_ONLY;
+        mod_render_view_mode = GetConfiguredModRenderStartView();
+        if (mod_render_view_mode == MOD_RENDER_VIEW_GAME_ONLY ||
+            mod_render_view_mode == MOD_RENDER_VIEW_MOD_ONLY) {
+            mod_render_single_view_mode = mod_render_view_mode;
+        }
         mod_render_view_initialized = true;
     }
+    MOD_SetFramePacingViewEligible(
+            mod_render_view_mode == MOD_RENDER_VIEW_MOD_ONLY);
 
     sdl.desktop.want_type = SCREEN_OPENGL;
     render.aspectOffload = true;
@@ -1192,6 +1216,7 @@ static bool SetModRenderViewMode(const ModRenderViewMode mode,
     if (target_height)
         *target_height = 0;
 
+    MOD_SetFramePacingViewEligible(mode == MOD_RENDER_VIEW_MOD_ONLY);
     if (mode == mod_render_view_mode)
         return false;
 
@@ -1325,6 +1350,7 @@ uint64_t OUTPUT_OPENGL_NotifyModFrameReady(void)
     metrics.latest_ready_ticks = now;
     metrics.mod_count++;
     MOD_TimingCountModFrameReady();
+    MOD_FramePacingNotifyReady(metrics.latest_ready_sequence);
     return metrics.latest_ready_sequence;
 }
 
@@ -1660,7 +1686,7 @@ static void DrainInactiveModRenderBuffers(const OpenGLPresentationLayout &layout
     }
 }
 
-static void FinishOpenGLPresentation(void)
+static void FinishOpenGLPresentation(const char *source)
 {
     const bool mod_render_active = MOD_RenderActive();
     const OpenGLPresentationLayout layout = BuildOpenGLPresentationLayout();
@@ -1702,7 +1728,7 @@ static void FinishOpenGLPresentation(void)
                                    new_mod_frame,
                                    compositor_ns,
                                    swap_ns,
-                                   "vga");
+                                   source);
 
     if (drain_inactive_buffers)
         DrainInactiveModRenderBuffers(layout);
@@ -1712,7 +1738,8 @@ static void FinishOpenGLPresentation(void)
 
 bool OUTPUT_OPENGL_ModPresentationRequired(void)
 {
-    return mod_render_view_mode != MOD_RENDER_VIEW_GAME_ONLY &&
+    return !MOD_FramePacingOwnsPresentation() &&
+           mod_render_view_mode != MOD_RENDER_VIEW_GAME_ONLY &&
            (MOD_RenderActive() || mod_render_was_active);
 }
 
@@ -1721,9 +1748,22 @@ void OUTPUT_OPENGL_PresentModFrame(void)
     if (!OUTPUT_OPENGL_ModPresentationRequired())
         return;
 
-    FinishOpenGLPresentation();
+    FinishOpenGLPresentation("vga");
     if (!menu.hidecycles && !sdl.desktop.fullscreen)
         frames++;
+}
+
+bool OUTPUT_OPENGL_PresentReadyModFrame(void)
+{
+    uint64_t ready_sequence = 0;
+    if (!MOD_FramePacingTakePresentation(&ready_sequence))
+        return false;
+
+    FinishOpenGLPresentation("mod-ready");
+    MOD_FramePacingPresented(ready_sequence);
+    if (!menu.hidecycles && !sdl.desktop.fullscreen)
+        frames++;
+    return true;
 }
 
 void OUTPUT_OPENGL_EndUpdate(const uint16_t *changedLines)
@@ -1787,7 +1827,6 @@ void OUTPUT_OPENGL_EndUpdate(const uint16_t *changedLines)
                     (uint8_t *)sdl_opengl.framebuf);
             }
             RecordNativeFrame();
-            FinishOpenGLPresentation();
         }
         else
 #endif /*C_XBRZ*/
@@ -1859,7 +1898,8 @@ void OUTPUT_OPENGL_EndUpdate(const uint16_t *changedLines)
         } else
             return;
 
-        FinishOpenGLPresentation();
+        if (!MOD_FramePacingOwnsPresentation())
+            FinishOpenGLPresentation("vga");
 
 #if 0 /* DEBUG Prove to me that you're drawing the damn texture */
         glBindTexture(GL_TEXTURE_2D, SDLDrawGenFontTexture);
@@ -1892,12 +1932,16 @@ void OUTPUT_OPENGL_EndUpdate(const uint16_t *changedLines)
 	glBindTexture(GL_TEXTURE_2D, sdl_opengl.texture);
 #endif
 
-        if (!menu.hidecycles && !sdl.desktop.fullscreen) frames++;
+        if (!MOD_FramePacingOwnsPresentation() &&
+            !menu.hidecycles && !sdl.desktop.fullscreen) {
+            frames++;
+        }
     }
 }
 
 void OUTPUT_OPENGL_Shutdown()
 {
+	MOD_SetFramePacingViewEligible(false);
 	if (sdl_opengl.pixel_buffer_object)
 	{
 		glBindBufferARB(GL_PIXEL_UNPACK_BUFFER_EXT, 0);

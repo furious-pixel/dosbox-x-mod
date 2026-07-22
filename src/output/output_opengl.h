@@ -161,6 +161,7 @@ bool OUTPUT_OPENGL_StartUpdate(uint8_t* &pixels, Bitu &pitch);
 void OUTPUT_OPENGL_EndUpdate(const uint16_t *changedLines);
 bool OUTPUT_OPENGL_ModPresentationRequired(void);
 void OUTPUT_OPENGL_PresentModFrame(void);
+bool OUTPUT_OPENGL_PresentReadyModFrame(void);
 bool OUTPUT_OPENGL_ModRendererAvailable(void);
 uint64_t OUTPUT_OPENGL_NotifyModFrameReady(void);
 void OUTPUT_OPENGL_GetModPresentationMetrics(OpenGLModPresentationMetrics *metrics);

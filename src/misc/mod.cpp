@@ -17,6 +17,7 @@
 #include <cstdarg>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <unordered_map>
 #include <vector>
 
@@ -72,6 +73,8 @@ struct ModExecutableRuntime {
 	int64_t delta = 0;
 	bool frame_start_ready = false;
 	uint32_t frame_start_linear = 0;
+	bool frame_start_defer_ready = false;
+	int32_t frame_start_defer_adjustment = 0;
 	bool frame_started = false;
 	Uint64 frame_counter_start = 0;
 	Uint64 frame_counter_last = 0;
@@ -112,6 +115,51 @@ struct ModRuntime {
 };
 
 ModRuntime g_mod = {};
+
+enum class ModFramePacingPhase {
+	Inactive,
+	AwaitingFirstFrame,
+	Running,
+};
+
+struct ModFramePacingState {
+	uint32_t target_fps = 0;
+	uint64_t period_ns = 0;
+	bool view_eligible = false;
+	bool suspended = false;
+	ModFramePacingPhase phase = ModFramePacingPhase::Inactive;
+	bool waiting = false;
+	bool continuous_presentation = false;
+	bool ready_since_release = false;
+	bool presentation_pending = false;
+	uint64_t pending_ready_sequence = 0;
+	uint64_t last_frame_start_ns = 0;
+	uint64_t next_deadline_ns = 0;
+	uint64_t continuous_presentation_deadline_ns = 0;
+	uint64_t deferred_checks = 0;
+	uint64_t released_frames = 0;
+	uint64_t total_lateness_ns = 0;
+	uint64_t maximum_lateness_ns = 0;
+};
+
+static ModFramePacingState g_frame_pacing = {};
+
+static void reset_frame_pacing_runtime_state(void)
+{
+	g_frame_pacing.phase = ModFramePacingPhase::Inactive;
+	g_frame_pacing.waiting = false;
+	g_frame_pacing.continuous_presentation = false;
+	g_frame_pacing.ready_since_release = false;
+	g_frame_pacing.presentation_pending = false;
+	g_frame_pacing.pending_ready_sequence = 0;
+	g_frame_pacing.last_frame_start_ns = 0;
+	g_frame_pacing.next_deadline_ns = 0;
+	g_frame_pacing.continuous_presentation_deadline_ns = 0;
+	g_frame_pacing.deferred_checks = 0;
+	g_frame_pacing.released_frames = 0;
+	g_frame_pacing.total_lateness_ns = 0;
+	g_frame_pacing.maximum_lateness_ns = 0;
+}
 
 static const size_t MOD_TIMING_HISTORY_CAPACITY = 256u;
 static const uint64_t MOD_TIMING_WARMUP_READY_FRAMES = 180u;
@@ -481,6 +529,18 @@ static std::string get_configured_core_setting(const Config& config)
 	return lowercase_ascii_copy(cpu_section->Get_string("core"));
 }
 
+static uint32_t get_configured_mod_renderer_target_fps(const Config& config)
+{
+	const Section_prop *render_section =
+	        dynamic_cast<const Section_prop *>(config.GetSection("render"));
+	if (!render_section)
+		return 0;
+
+	const int configured_fps =
+	        render_section->Get_int("mod renderer target fps");
+	return configured_fps > 0 ? static_cast<uint32_t>(configured_fps) : 0;
+}
+
 static bool is_supported_non_dynamic_decoder(CPU_Decoder *decoder)
 {
 	return decoder == &CPU_Core_Normal_Run ||
@@ -690,6 +750,7 @@ static void reset_runtime_frame_state(ModExecutableRuntime &runtime)
 	runtime.frame_counter_start = 0;
 	runtime.frame_counter_last = 0;
 	runtime.frame_state = {};
+	reset_frame_pacing_runtime_state();
 	reset_mod_timing_state();
 	DOSBoxPython_ResetModStateTiming();
 }
@@ -716,6 +777,8 @@ static void rebuild_runtime_hooks(ModExecutableRuntime &runtime)
 {
 	runtime.frame_start_ready = false;
 	runtime.frame_start_linear = 0;
+	runtime.frame_start_defer_ready = false;
+	runtime.frame_start_defer_adjustment = 0;
 	runtime.callsites.clear();
 	runtime.scene_raster_suppression_sites.clear();
 	runtime.scene_raster_suppression_validated = false;
@@ -732,6 +795,34 @@ static void rebuild_runtime_hooks(ModExecutableRuntime &runtime)
 		if (apply_delta(runtime.config.frame_start_reloc, runtime.delta, &frame_start_linear)) {
 			runtime.frame_start_linear = frame_start_linear;
 			runtime.frame_start_ready = true;
+
+			uint8_t opcode = 0;
+			uint32_t raw_displacement = 0;
+			if (!mem_readb_checked(frame_start_linear, &opcode) &&
+			    opcode == 0xe8u &&
+			    !mem_readd_checked(frame_start_linear + 1u,
+			                      &raw_displacement)) {
+				const int32_t displacement =
+				        static_cast<int32_t>(raw_displacement);
+				const int64_t call_target =
+				        static_cast<int64_t>(frame_start_linear) + 5ll +
+				        static_cast<int64_t>(displacement);
+				const int64_t adjustment =
+				        static_cast<int64_t>(frame_start_linear) - call_target;
+				if (adjustment >= std::numeric_limits<int32_t>::min() &&
+				    adjustment <= std::numeric_limits<int32_t>::max() &&
+				    adjustment != 0) {
+					runtime.frame_start_defer_adjustment =
+					        static_cast<int32_t>(adjustment);
+					runtime.frame_start_defer_ready = true;
+				}
+			}
+
+			if (g_frame_pacing.target_fps > 0 &&
+			    !runtime.frame_start_defer_ready) {
+				LOG_MSG("MOD ERROR: %s frame pacing disabled because frame_start is not a readable near call",
+				        runtime.config.name.c_str());
+			}
 		} else {
 			LOG_MSG("MOD ERROR: %s frame_start 0x%08lX is invalid with delta",
 			        runtime.config.name.c_str(),
@@ -1102,6 +1193,103 @@ static bool find_executable_runtime_by_name(const char *name, size_t *runtime_in
 	return false;
 }
 
+static bool frame_pacing_runtime_ready(ModExecutableRuntime **runtime)
+{
+	if (g_frame_pacing.target_fps == 0 ||
+	    !g_frame_pacing.view_eligible ||
+	    g_frame_pacing.suspended) {
+		return false;
+	}
+
+	ModExecutableRuntime *active = NULL;
+	if (!get_active_runtime(&active) || !active->frame_start_defer_ready)
+		return false;
+
+	if (runtime)
+		*runtime = active;
+	return true;
+}
+
+static int32_t frame_pacing_on_frame_start(ModExecutableRuntime &runtime)
+{
+	ModExecutableRuntime *active = NULL;
+	if (!frame_pacing_runtime_ready(&active) || active != &runtime) {
+		reset_frame_pacing_runtime_state();
+		return 0;
+	}
+
+	const uint64_t now = timing_now_ns();
+	if (g_frame_pacing.phase == ModFramePacingPhase::Inactive) {
+		g_frame_pacing.phase = ModFramePacingPhase::AwaitingFirstFrame;
+		g_frame_pacing.last_frame_start_ns = now;
+		return 0;
+	}
+
+	if (g_frame_pacing.phase == ModFramePacingPhase::AwaitingFirstFrame) {
+		g_frame_pacing.last_frame_start_ns = now;
+		return 0;
+	}
+
+	if (g_frame_pacing.continuous_presentation) {
+		if (now < g_frame_pacing.next_deadline_ns) {
+			g_frame_pacing.waiting = true;
+			g_frame_pacing.deferred_checks++;
+			CPU_Cycles = 0;
+			return runtime.frame_start_defer_adjustment;
+		}
+
+		g_frame_pacing.waiting = false;
+		do {
+			g_frame_pacing.next_deadline_ns += g_frame_pacing.period_ns;
+		} while (g_frame_pacing.next_deadline_ns <= now);
+		return 0;
+	}
+
+	if (!g_frame_pacing.ready_since_release) {
+		reset_frame_pacing_runtime_state();
+		g_frame_pacing.phase = ModFramePacingPhase::AwaitingFirstFrame;
+		g_frame_pacing.last_frame_start_ns = now;
+		return 0;
+	}
+
+	if (now < g_frame_pacing.next_deadline_ns) {
+		g_frame_pacing.waiting = true;
+		g_frame_pacing.deferred_checks++;
+		CPU_Cycles = 0;
+		return runtime.frame_start_defer_adjustment;
+	}
+
+	g_frame_pacing.waiting = false;
+	g_frame_pacing.ready_since_release = false;
+	const uint64_t lateness_ns = now - g_frame_pacing.next_deadline_ns;
+	g_frame_pacing.total_lateness_ns += lateness_ns;
+	g_frame_pacing.maximum_lateness_ns = std::max(
+	        g_frame_pacing.maximum_lateness_ns, lateness_ns);
+	g_frame_pacing.released_frames++;
+	do {
+		g_frame_pacing.next_deadline_ns += g_frame_pacing.period_ns;
+	} while (g_frame_pacing.next_deadline_ns <= now);
+
+	if ((g_frame_pacing.released_frames %
+	     MOD_TIMING_SUMMARY_INTERVAL_FRAMES) == 0u) {
+		const double average_lateness_ms =
+		        static_cast<double>(g_frame_pacing.total_lateness_ns) /
+		        static_cast<double>(g_frame_pacing.released_frames) /
+		        1000000.0;
+		timing_log_line(
+		        "FRAME_PACING summary target_fps=%u released=%llu deferred_checks=%llu average_lateness_ms=%.3f maximum_lateness_ms=%.3f",
+		        static_cast<unsigned int>(g_frame_pacing.target_fps),
+		        static_cast<unsigned long long>(
+		                g_frame_pacing.released_frames),
+		        static_cast<unsigned long long>(
+		                g_frame_pacing.deferred_checks),
+		        average_lateness_ms,
+		        timing_ns_to_ms(g_frame_pacing.maximum_lateness_ns));
+	}
+
+	return 0;
+}
+
 } // namespace
 
 uint64_t MOD_TimingBegin(void)
@@ -1247,6 +1435,13 @@ bool MOD_GetTimingSummary(ModTimingSummary *summary)
 bool MOD_Init(const Config& config)
 {
 	g_mod = {};
+	g_frame_pacing = {};
+	g_frame_pacing.target_fps =
+	        get_configured_mod_renderer_target_fps(config);
+	if (g_frame_pacing.target_fps > 0) {
+		g_frame_pacing.period_ns =
+		        1000000000ull / g_frame_pacing.target_fps;
+	}
 	reset_mod_timing_state();
 
 	const std::string core_setting = get_configured_core_setting(config);
@@ -1283,6 +1478,7 @@ void MOD_Shutdown(void)
 	if (g_mod.guest_call_stop_callback != 0)
 		CALLBACK_DeAllocate(g_mod.guest_call_stop_callback);
 	g_mod = {};
+	g_frame_pacing = {};
 	DOSBoxPython_Shutdown();
 	close_mod_timing_log();
 }
@@ -1448,10 +1644,16 @@ bool MOD_SetSceneRasterSuppression(bool enabled)
 bool MOD_CallsiteCanBeSuppressed(uint32_t linear_eip)
 {
 	ModExecutableRuntime *runtime = NULL;
-	if (!get_active_runtime(&runtime) ||
-	    !runtime->scene_raster_suppression_validated) {
+	if (!get_active_runtime(&runtime)) {
 		return false;
 	}
+	if (g_frame_pacing.target_fps > 0 &&
+	    runtime->frame_start_defer_ready &&
+	    linear_eip == runtime->frame_start_linear) {
+		return true;
+	}
+	if (!runtime->scene_raster_suppression_validated)
+		return false;
 
 	const std::unordered_map<uint32_t, ModCallsiteRuntime>::const_iterator it =
 	        runtime->callsites.find(linear_eip);
@@ -1459,6 +1661,132 @@ bool MOD_CallsiteCanBeSuppressed(uint32_t linear_eip)
 	       it != runtime->callsites.end() &&
 	       it->second.scene_raster_suppression_index <
 	               runtime->scene_raster_suppression_sites.size();
+}
+
+void MOD_SetFramePacingViewEligible(bool eligible)
+{
+	if (g_frame_pacing.view_eligible == eligible)
+		return;
+	g_frame_pacing.view_eligible = eligible;
+	reset_frame_pacing_runtime_state();
+}
+
+bool MOD_SetFramePacingSuspended(bool suspended)
+{
+	if (g_frame_pacing.target_fps == 0)
+		return false;
+	if (g_frame_pacing.suspended == suspended)
+		return true;
+	g_frame_pacing.suspended = suspended;
+	reset_frame_pacing_runtime_state();
+	return true;
+}
+
+bool MOD_SetFramePacingContinuousPresentation(bool active)
+{
+	if (g_frame_pacing.target_fps == 0)
+		return false;
+
+	if (!active) {
+		g_frame_pacing.continuous_presentation = false;
+		g_frame_pacing.continuous_presentation_deadline_ns = 0;
+		g_frame_pacing.waiting = false;
+		return true;
+	}
+
+	if (g_frame_pacing.phase != ModFramePacingPhase::Running ||
+	    !frame_pacing_runtime_ready(NULL) ||
+	    g_frame_pacing.pending_ready_sequence == 0) {
+		return false;
+	}
+
+	if (!g_frame_pacing.continuous_presentation) {
+		const uint64_t now = timing_now_ns();
+		g_frame_pacing.continuous_presentation_deadline_ns =
+		        g_frame_pacing.next_deadline_ns > now
+		                ? g_frame_pacing.next_deadline_ns
+		                : now + g_frame_pacing.period_ns;
+		g_frame_pacing.continuous_presentation = true;
+	}
+	g_frame_pacing.waiting = true;
+	CPU_Cycles = 0;
+	return true;
+}
+
+bool MOD_FramePacingWaiting(void)
+{
+	return (g_frame_pacing.waiting ||
+	        g_frame_pacing.continuous_presentation) &&
+	       frame_pacing_runtime_ready(NULL);
+}
+
+bool MOD_FramePacingOwnsPresentation(void)
+{
+	return g_frame_pacing.phase == ModFramePacingPhase::Running &&
+	       frame_pacing_runtime_ready(NULL);
+}
+
+void MOD_FramePacingNotifyReady(uint64_t ready_sequence)
+{
+	if (ready_sequence == 0 || !frame_pacing_runtime_ready(NULL) ||
+	    g_frame_pacing.phase == ModFramePacingPhase::Inactive) {
+		return;
+	}
+
+	g_frame_pacing.ready_since_release = true;
+	g_frame_pacing.presentation_pending = true;
+	g_frame_pacing.pending_ready_sequence = ready_sequence;
+	CPU_Cycles = 0;
+}
+
+bool MOD_FramePacingTakePresentation(uint64_t *ready_sequence)
+{
+	if (!ready_sequence || !frame_pacing_runtime_ready(NULL)) {
+		return false;
+	}
+
+	if (g_frame_pacing.continuous_presentation) {
+		const uint64_t now = timing_now_ns();
+		if (now < g_frame_pacing.continuous_presentation_deadline_ns)
+			return false;
+
+		*ready_sequence = g_frame_pacing.pending_ready_sequence;
+		g_frame_pacing.presentation_pending = false;
+		do {
+			g_frame_pacing.continuous_presentation_deadline_ns +=
+			        g_frame_pacing.period_ns;
+		} while (g_frame_pacing.continuous_presentation_deadline_ns <=
+		         now);
+		return true;
+	}
+
+	if (!g_frame_pacing.presentation_pending)
+		return false;
+
+	*ready_sequence = g_frame_pacing.pending_ready_sequence;
+	g_frame_pacing.presentation_pending = false;
+	return true;
+}
+
+void MOD_FramePacingPresented(uint64_t ready_sequence)
+{
+	if (ready_sequence == 0 ||
+	    ready_sequence != g_frame_pacing.pending_ready_sequence ||
+	    !frame_pacing_runtime_ready(NULL)) {
+		return;
+	}
+
+	if (g_frame_pacing.phase == ModFramePacingPhase::AwaitingFirstFrame) {
+		const uint64_t now = timing_now_ns();
+		g_frame_pacing.phase = ModFramePacingPhase::Running;
+		g_frame_pacing.next_deadline_ns =
+		        g_frame_pacing.last_frame_start_ns +
+		        g_frame_pacing.period_ns;
+		while (g_frame_pacing.next_deadline_ns <= now)
+			g_frame_pacing.next_deadline_ns += g_frame_pacing.period_ns;
+		LOG_MSG("MOD: renderer-owned frame pacing active at %u FPS",
+		        static_cast<unsigned int>(g_frame_pacing.target_fps));
+	}
 }
 
 void MOD_DisableSceneRasterSuppression(void)
@@ -1611,8 +1939,13 @@ int32_t MOD_OnCallsite(uint32_t linear_eip)
 	if (!get_active_runtime(&runtime))
 		return 0;
 
-	if (runtime->frame_start_ready && linear_eip == runtime->frame_start_linear)
+	if (runtime->frame_start_ready && linear_eip == runtime->frame_start_linear) {
+		const int32_t pacing_adjustment =
+		        frame_pacing_on_frame_start(*runtime);
+		if (pacing_adjustment != 0)
+			return pacing_adjustment;
 		update_frame_timing(*runtime);
+	}
 
 	const std::unordered_map<uint32_t, ModCallsiteRuntime>::const_iterator it =
 	        runtime->callsites.find(linear_eip);

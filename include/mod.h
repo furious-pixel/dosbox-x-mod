@@ -8,11 +8,6 @@
 
 class Config;
 
-struct ModNativeCallEventConfig {
-	uint32_t target_reloc = 0;
-	uint8_t operation = 0;
-};
-
 struct ModCallSuppressionSiteConfig {
 	uint32_t callsite_reloc = 0;
 	uint32_t target_reloc = 0;
@@ -28,20 +23,10 @@ struct ModExecutableConfig {
 	uint32_t scan_end = 0;
 	bool has_frame_start = false;
 	uint32_t frame_start_reloc = 0;
-	bool has_native_call_event_scan_range = false;
-	uint32_t native_call_event_scan_start = 0;
-	uint32_t native_call_event_scan_end = 0;
-	std::vector<ModNativeCallEventConfig> native_call_events = {};
 	bool has_scene_raster_suppression = false;
 	uint32_t scene_raster_phase_enter_reloc = 0;
 	uint32_t scene_raster_phase_leave_reloc = 0;
 	std::vector<ModCallSuppressionSiteConfig> scene_raster_suppression_sites = {};
-};
-
-struct ModNativeCallEvent {
-	uint32_t value = 0;
-	uint32_t source_reloc = 0;
-	uint8_t operation = 0;
 };
 
 struct ModCallSuppressionSiteStats {
@@ -161,9 +146,6 @@ void MOD_RunPendingSafePoint(void);
 bool MOD_CallRelocFunction(uint32_t reloc_eip,
                            const ModGuestCallRegisters& input,
                            ModGuestCallRegisters *output);
-bool MOD_DrainNativeCallEvents(std::vector<ModNativeCallEvent> *events,
-                               uint64_t *dropped);
-
 uint64_t MOD_TimingBegin(void);
 uint64_t MOD_TimingEnd(ModTimingCategory category, uint64_t started_ns);
 void MOD_TimingRecordDecoderSlice(uint64_t elapsed_ns,

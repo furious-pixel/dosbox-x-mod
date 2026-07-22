@@ -405,8 +405,6 @@ static std::string build_mod_helper_bootstrap(void)
 		<< "        return mod._read_runtime_bytes(addr, size)\n"
 		<< "    def read_runtime_blocks(self, ranges):\n"
 		<< "        return mod._read_runtime_blocks(ranges)\n"
-		<< "    def drain_native_call_events(self):\n"
-		<< "        return mod._drain_native_call_events()\n"
 		<< "    def set_scene_raster_suppression(self, enabled):\n"
 		<< "        return mod._set_scene_raster_suppression(1 if enabled else 0)\n"
 		<< "    def scene_raster_suppression_stats(self):\n"
@@ -1169,14 +1167,6 @@ static PyObject *py_get_delta(PyObject *, PyObject *args)
 	return g_python.api.PyLong_FromLong(static_cast<long>(delta));
 }
 
-static void write_u32_le(char *dest, uint32_t value)
-{
-	dest[0] = static_cast<char>(value & 0xffu);
-	dest[1] = static_cast<char>((value >> 8u) & 0xffu);
-	dest[2] = static_cast<char>((value >> 16u) & 0xffu);
-	dest[3] = static_cast<char>((value >> 24u) & 0xffu);
-}
-
 static bool tuple_set_u64(PyObject *tuple, Py_ssize_t index, uint64_t value)
 {
 	PyOwnedRef item(g_python.api.PyLong_FromUnsignedLongLong(
@@ -1250,57 +1240,6 @@ static PyObject *py_scene_raster_suppression_stats(PyObject *, PyObject *args)
 		return NULL;
 	}
 	sites.release();
-	return result.release();
-}
-
-static PyObject *py_drain_native_call_events(PyObject *, PyObject *args)
-{
-	if (g_python.api.PyTuple_Size(args) != 0) {
-		set_python_error(g_python.api.PyExc_TypeError,
-		                 "drain_native_call_events expects ()");
-		return NULL;
-	}
-
-	std::vector<ModNativeCallEvent> events;
-	uint64_t dropped = 0;
-	if (!MOD_DrainNativeCallEvents(&events, &dropped)) {
-		set_python_error(g_python.api.PyExc_RuntimeError,
-		                 "drain_native_call_events failed");
-		return NULL;
-	}
-
-	static const size_t record_size = 12u;
-	PyOwnedRef payload(g_python.api.PyBytes_FromStringAndSize(
-	        NULL, static_cast<Py_ssize_t>(events.size() * record_size)));
-	if (!payload)
-		return NULL;
-
-	char *data = g_python.api.PyBytes_AsString(payload.get());
-	if (!data)
-		return NULL;
-
-	for (size_t i = 0; i < events.size(); ++i) {
-		char *record = data + i * record_size;
-		write_u32_le(record, events[i].value);
-		write_u32_le(record + 4u, events[i].source_reloc);
-		record[8] = static_cast<char>(events[i].operation);
-		record[9] = 0;
-		record[10] = 0;
-		record[11] = 0;
-	}
-
-	PyOwnedRef dropped_obj(g_python.api.PyLong_FromUnsignedLongLong(
-	        static_cast<unsigned long long>(dropped)));
-	PyOwnedRef result(g_python.api.PyTuple_New(2));
-	if (!dropped_obj || !result)
-		return NULL;
-
-	if (g_python.api.PyTuple_SetItem(result.get(), 0, payload.get()) != 0)
-		return NULL;
-	payload.release();
-	if (g_python.api.PyTuple_SetItem(result.get(), 1, dropped_obj.get()) != 0)
-		return NULL;
-	dropped_obj.release();
 	return result.release();
 }
 
@@ -1859,9 +1798,6 @@ static bool ensure_mod_helper_module(void)
 	        DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef get_delta_method = {
 	        "_get_delta", py_get_delta, DOSBOX_PY_METH_VARARGS, NULL};
-	static PyMethodDef drain_native_call_events_method = {
-	        "_drain_native_call_events", py_drain_native_call_events,
-	        DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef set_scene_raster_suppression_method = {
 	        "_set_scene_raster_suppression", py_set_scene_raster_suppression,
 	        DOSBOX_PY_METH_VARARGS, NULL};
@@ -1919,8 +1855,6 @@ static bool ensure_mod_helper_module(void)
 	                            &notify_frame_ready_method) ||
 	    !attach_module_function(mod_module.get(), "_get_delta",
 	                            &get_delta_method) ||
-	    !attach_module_function(mod_module.get(), "_drain_native_call_events",
-	                            &drain_native_call_events_method) ||
 	    !attach_module_function(mod_module.get(), "_set_scene_raster_suppression",
 	                            &set_scene_raster_suppression_method) ||
 	    !attach_module_function(mod_module.get(), "_scene_raster_suppression_stats",
@@ -2124,95 +2058,6 @@ static bool load_mod_init_config(const std::string &mods_dir,
 			                        entry_context + "['frame_start']",
 			                        &config.frame_start_reloc)) {
 				config.has_frame_start = true;
-			}
-		}
-
-		PyOwnedRef native_call_events(get_optional_mapping_item(
-		        executable.get(), "native_call_events", entry_context));
-		if (native_call_events) {
-			const std::string native_context =
-			        entry_context + "['native_call_events']";
-			PyOwnedRef event_scan_range(get_required_mapping_item(
-			        native_call_events.get(), "scan_range", native_context));
-			PyOwnedRef event_targets(get_required_mapping_item(
-			        native_call_events.get(), "targets", native_context));
-
-			bool valid_event_config = event_scan_range && event_targets;
-			if (valid_event_config) {
-				PyOwnedRef event_scan_start(get_required_mapping_item(
-				        event_scan_range.get(), "start",
-				        native_context + "['scan_range']"));
-				PyOwnedRef event_scan_end(get_required_mapping_item(
-				        event_scan_range.get(), "end",
-				        native_context + "['scan_range']"));
-				valid_event_config =
-				        event_scan_start && event_scan_end &&
-				        py_object_to_uint32(
-				                event_scan_start.get(),
-				                native_context + "['scan_range']['start']",
-				                &config.native_call_event_scan_start) &&
-				        py_object_to_uint32(
-				                event_scan_end.get(),
-				                native_context + "['scan_range']['end']",
-				                &config.native_call_event_scan_end) &&
-				        config.native_call_event_scan_start <
-				                config.native_call_event_scan_end;
-			}
-
-			Py_ssize_t target_count = -1;
-			if (valid_event_config) {
-				clear_python_error();
-				target_count = g_python.api.PySequence_Size(event_targets.get());
-				if (g_python.api.PyErr_Occurred &&
-				    g_python.api.PyErr_Occurred() != NULL) {
-					log_python_exception(
-					        (native_context + "['targets'] must be a sequence").c_str());
-					valid_event_config = false;
-				}
-			}
-
-			for (Py_ssize_t j = 0; valid_event_config && j < target_count; ++j) {
-				const std::string target_context = append_context_index(
-				        native_context + "['targets']", static_cast<size_t>(j));
-				PyOwnedRef target(g_python.api.PySequence_GetItem(
-				        event_targets.get(), j));
-				if (!target) {
-					log_python_exception(
-					        (target_context + " could not be read").c_str());
-					valid_event_config = false;
-					break;
-				}
-
-				PyOwnedRef target_reloc(get_required_mapping_item(
-				        target.get(), "reloc", target_context));
-				PyOwnedRef target_operation(get_required_mapping_item(
-				        target.get(), "operation", target_context));
-				uint32_t reloc = 0;
-				uint32_t operation = 0;
-				if (!target_reloc || !target_operation ||
-				    !py_object_to_uint32(target_reloc.get(),
-				                         target_context + "['reloc']", &reloc) ||
-				    !py_object_to_uint32(target_operation.get(),
-				                         target_context + "['operation']", &operation) ||
-				    operation == 0 || operation > 0xffu) {
-					LOG_MSG("MOD ERROR: invalid native call event target in %s",
-					        mod_init_path.c_str());
-					valid_event_config = false;
-					break;
-				}
-
-				ModNativeCallEventConfig event_config = {};
-				event_config.target_reloc = reloc;
-				event_config.operation = static_cast<uint8_t>(operation);
-				config.native_call_events.push_back(event_config);
-			}
-
-			if (valid_event_config && !config.native_call_events.empty()) {
-				config.has_native_call_event_scan_range = true;
-			} else {
-				config.native_call_events.clear();
-				LOG_MSG("MOD ERROR: invalid native_call_events for %s in %s",
-				        config.name.c_str(), mod_init_path.c_str());
 			}
 		}
 

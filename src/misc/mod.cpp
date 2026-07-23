@@ -1835,6 +1835,11 @@ bool MOD_RequestSafePoint(void)
 	}
 
 	g_mod.safe_point_pending = true;
+	// A request made by a guest-code hook must run before the decoder resumes
+	// at the hook's continuation address. End the current decoder slice so the
+	// main loop services the pending callback first.
+	if (!g_mod.safe_point_active)
+		CPU_Cycles = 0;
 	return true;
 }
 

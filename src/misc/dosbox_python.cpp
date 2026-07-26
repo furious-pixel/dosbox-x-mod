@@ -411,6 +411,8 @@ static std::string build_mod_helper_bootstrap(void)
 		<< "        return mod._scene_raster_suppression_stats()\n"
 		<< "    def request_safe_point(self):\n"
 		<< "        return mod._request_safe_point()\n"
+		<< "    def set_safe_point_barrier(self, active):\n"
+		<< "        return mod._set_safe_point_barrier(1 if active else 0)\n"
 		<< "    def call_reloc_u32(self, addr, eax=0, ebx=0, ecx=0, edx=0):\n"
 		<< "        return mod._call_reloc_u32(addr, eax, ebx, ecx, edx)\n"
 		<< "    def write_reloc_u8(self, addr, value):\n"
@@ -1061,6 +1063,25 @@ static PyObject *py_request_safe_point(PyObject *, PyObject *args)
 	}
 
 	return g_python.api.PyLong_FromUnsignedLong(1ul);
+}
+
+static PyObject *py_set_safe_point_barrier(PyObject *, PyObject *args)
+{
+	if (g_python.api.PyTuple_Size(args) != 1) {
+		set_python_error(g_python.api.PyExc_TypeError,
+		                 "set_safe_point_barrier expects (active)");
+		return NULL;
+	}
+
+	unsigned long active = 0;
+	if (!py_tuple_get_uint32_arg(args, 0, &active) || active > 1u) {
+		set_python_error(g_python.api.PyExc_ValueError,
+		                 "active must be 0 or 1");
+		return NULL;
+	}
+
+	const bool configured = MOD_SetSafePointBarrier(active != 0);
+	return g_python.api.PyLong_FromUnsignedLong(configured ? 1ul : 0ul);
 }
 
 static PyObject *py_call_reloc_u32(PyObject *, PyObject *args)
@@ -1856,6 +1877,9 @@ static bool ensure_mod_helper_module(void)
 	static PyMethodDef request_safe_point_method = {
 	        "_request_safe_point", py_request_safe_point,
 	        DOSBOX_PY_METH_VARARGS, NULL};
+	static PyMethodDef set_safe_point_barrier_method = {
+	        "_set_safe_point_barrier", py_set_safe_point_barrier,
+	        DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef call_reloc_u32_method = {
 	        "_call_reloc_u32", py_call_reloc_u32,
 	        DOSBOX_PY_METH_VARARGS, NULL};
@@ -1914,6 +1938,8 @@ static bool ensure_mod_helper_module(void)
 	                            &scene_raster_suppression_stats_method) ||
 	    !attach_module_function(mod_module.get(), "_request_safe_point",
 	                            &request_safe_point_method) ||
+	    !attach_module_function(mod_module.get(), "_set_safe_point_barrier",
+	                            &set_safe_point_barrier_method) ||
 	    !attach_module_function(mod_module.get(), "_call_reloc_u32",
 	                            &call_reloc_u32_method) ||
 	    !attach_module_function(mod_module.get(), "_read_u8", &read_u8_method) ||

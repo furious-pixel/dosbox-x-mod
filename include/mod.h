@@ -151,6 +151,10 @@ void MOD_DisableSceneRasterSuppression(void);
 bool MOD_GetSceneRasterSuppressionStats(ModSceneRasterSuppressionStats *stats);
 bool MOD_RequestSafePoint(void);
 void MOD_RunPendingSafePoint(void);
+bool MOD_SetSafePointBarrier(bool active);
+bool MOD_SafePointBarrierActive(void);
+bool MOD_SafePointPending(void);
+bool MOD_SafePointBarrierPresentationDue(void);
 bool MOD_CallRelocFunction(uint32_t reloc_eip,
                            const ModGuestCallRegisters& input,
                            ModGuestCallRegisters *output);

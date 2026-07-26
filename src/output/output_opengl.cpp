@@ -1688,6 +1688,12 @@ static void DrainInactiveModRenderBuffers(const OpenGLPresentationLayout &layout
 
 static void FinishOpenGLPresentation(const char *source)
 {
+    // Guest-call execution re-enters the DOSBox loop without allowing Python
+    // compositor callbacks. Never clear or swap a mod backbuffer from that
+    // nested context, even if a future caller misses its entry-point guard.
+    if (MOD_GuestCallActive())
+        return;
+
     const bool mod_render_active = MOD_RenderActive();
     const OpenGLPresentationLayout layout = BuildOpenGLPresentationLayout();
     const GLViewport fallback = BuildInactiveModFallbackViewport(layout);
@@ -1738,7 +1744,8 @@ static void FinishOpenGLPresentation(const char *source)
 
 bool OUTPUT_OPENGL_ModPresentationRequired(void)
 {
-    return !MOD_FramePacingOwnsPresentation() &&
+    return !MOD_GuestCallActive() &&
+           !MOD_FramePacingOwnsPresentation() &&
            mod_render_view_mode != MOD_RENDER_VIEW_GAME_ONLY &&
            (MOD_RenderActive() || mod_render_was_active);
 }
@@ -1755,6 +1762,9 @@ void OUTPUT_OPENGL_PresentModFrame(void)
 
 bool OUTPUT_OPENGL_PresentReadyModFrame(void)
 {
+    if (MOD_GuestCallActive())
+        return false;
+
     uint64_t ready_sequence = 0;
     if (!MOD_FramePacingTakePresentation(&ready_sequence))
         return false;
@@ -1898,7 +1908,8 @@ void OUTPUT_OPENGL_EndUpdate(const uint16_t *changedLines)
         } else
             return;
 
-        if (!MOD_FramePacingOwnsPresentation())
+        if (!MOD_GuestCallActive() &&
+            !MOD_FramePacingOwnsPresentation())
             FinishOpenGLPresentation("vga");
 
 #if 0 /* DEBUG Prove to me that you're drawing the damn texture */
@@ -1932,7 +1943,8 @@ void OUTPUT_OPENGL_EndUpdate(const uint16_t *changedLines)
 	glBindTexture(GL_TEXTURE_2D, sdl_opengl.texture);
 #endif
 
-        if (!MOD_FramePacingOwnsPresentation() &&
+        if (!MOD_GuestCallActive() &&
+            !MOD_FramePacingOwnsPresentation() &&
             !menu.hidecycles && !sdl.desktop.fullscreen) {
             frames++;
         }

@@ -107,6 +107,8 @@ struct ModRuntime {
 	bool unsupported_core_logged = false;
 	bool dynamic_cache_refresh_pending = false;
 	bool safe_point_pending = false;
+	bool safe_point_barrier_active = false;
+	uint64_t safe_point_barrier_present_deadline_ns = 0;
 	bool safe_point_active = false;
 	bool guest_call_active = false;
 	bool guest_call_stopped = false;
@@ -115,6 +117,12 @@ struct ModRuntime {
 };
 
 ModRuntime g_mod = {};
+
+static void reset_safe_point_barrier(void)
+{
+	g_mod.safe_point_barrier_active = false;
+	g_mod.safe_point_barrier_present_deadline_ns = 0;
+}
 
 enum class ModFramePacingPhase {
 	Inactive,
@@ -1556,6 +1564,7 @@ void MOD_OnTerminatePSP(uint16_t pspseg, bool tsr, uint8_t exitcode)
 		        g_mod.executables[g_mod.active_executable_index];
 		if (runtime.process_active && runtime.process_psp == pspseg) {
 			g_mod.safe_point_pending = false;
+			reset_safe_point_barrier();
 			runtime.process_active = false;
 			runtime.process_psp = 0;
 			runtime.process_start_pending = false;
@@ -1827,6 +1836,59 @@ bool MOD_GetSceneRasterSuppressionStats(ModSceneRasterSuppressionStats *stats)
 	return true;
 }
 
+bool MOD_SetSafePointBarrier(bool active)
+{
+	if (!active) {
+		reset_safe_point_barrier();
+		return true;
+	}
+
+	ModExecutableRuntime *runtime = NULL;
+	if (!get_active_runtime(&runtime) || g_mod.guest_call_active)
+		return false;
+
+	g_mod.safe_point_barrier_active = true;
+	g_mod.safe_point_barrier_present_deadline_ns = timing_now_ns();
+	CPU_Cycles = 0;
+	return true;
+}
+
+bool MOD_SafePointBarrierActive(void)
+{
+	return g_mod.safe_point_barrier_active;
+}
+
+bool MOD_SafePointPending(void)
+{
+	return g_mod.safe_point_pending && !g_mod.safe_point_active &&
+	       !g_mod.guest_call_active && cpu.pmode && cpu.code.big &&
+	       cpu.stack.big;
+}
+
+bool MOD_SafePointBarrierPresentationDue(void)
+{
+	if (!g_mod.safe_point_barrier_active)
+		return false;
+
+	// Always redraw after the final batch before releasing the guest. This
+	// prevents a resource upload from leaving an incomplete backbuffer for the
+	// next swap.
+	if (!g_mod.safe_point_pending)
+		return true;
+
+	const uint64_t now = timing_now_ns();
+	if (g_mod.safe_point_barrier_present_deadline_ns > now)
+		return false;
+
+	const uint64_t period_ns = g_frame_pacing.period_ns > 0
+	                                   ? g_frame_pacing.period_ns
+	                                   : 1000000000ull / 60ull;
+	do {
+		g_mod.safe_point_barrier_present_deadline_ns += period_ns;
+	} while (g_mod.safe_point_barrier_present_deadline_ns <= now);
+	return true;
+}
+
 bool MOD_RequestSafePoint(void)
 {
 	ModExecutableRuntime *runtime = NULL;
@@ -1862,6 +1924,7 @@ void MOD_RunPendingSafePoint(void)
 	ModExecutableRuntime *runtime = NULL;
 	if (!get_active_runtime(&runtime)) {
 		g_mod.safe_point_pending = false;
+		reset_safe_point_barrier();
 		return;
 	}
 

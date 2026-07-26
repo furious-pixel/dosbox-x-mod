@@ -464,6 +464,21 @@ static Bitu Normal_Loop(void) {
         while (1) {
             MOD_RunPendingSafePoint();
             GFX_ServiceModFramePresentation();
+            // Guest resource calls re-enter this loop while the safe-point
+            // callback is still active. The compositor intentionally cannot
+            // run in that nested context, so leave barrier presentation and
+            // lifecycle management to the outer loop.
+            if (MOD_SafePointBarrierActive() && !MOD_GuestCallActive()) {
+                if (MOD_SafePointBarrierPresentationDue() &&
+                    GFX_ServiceModSafePointBarrierPresentation()) {
+                    GFX_Events();
+                }
+                if (MOD_SafePointPending())
+                    continue;
+                // A completed or failed callback that did not request another
+                // batch releases the guest after one final presentation.
+                MOD_SetSafePointBarrier(false);
+            }
             if (PIC_RunQueue()) {
                 /* now is the time to check for the NMI (Non-maskable interrupt) */
                 CPU_Check_NMI();

@@ -3569,6 +3569,18 @@ void GFX_ServiceModFramePresentation(void)
 #endif
 }
 
+bool GFX_ServiceModSafePointBarrierPresentation(void)
+{
+#if C_OPENGL
+    if (sdl.desktop.type == SCREEN_OPENGL &&
+        OUTPUT_OPENGL_ModPresentationRequired()) {
+        OUTPUT_OPENGL_PresentModFrame();
+        return true;
+    }
+#endif
+    return false;
+}
+
 void GFX_SetPalette(Bitu start,Bitu count,GFX_PalEntry * entries) {
     (void)start;
     (void)count;

@@ -189,12 +189,46 @@ static bool GetConfiguredWindowSize(Bitu *width, Bitu *height)
     return true;
 }
 
+static bool ParseComparisonPaneSize(const char *configured,
+                                    Bitu *width,
+                                    Bitu *height)
+{
+    if (!configured || !*configured || !strcmp(configured, "auto"))
+        return false;
+
+    char *width_end = NULL;
+    const unsigned long parsed_width = strtoul(configured, &width_end, 10);
+    if (width_end == configured || (*width_end != 'x' && *width_end != 'X'))
+        return false;
+
+    char *height_end = NULL;
+    const unsigned long parsed_height = strtoul(width_end + 1, &height_end, 10);
+    if (height_end == width_end + 1 || *height_end != '\0' ||
+        parsed_width == 0 || parsed_width > 32767ul ||
+        parsed_height == 0 || parsed_height > 65535ul) {
+        return false;
+    }
+
+    if (width)
+        *width = (Bitu)parsed_width;
+    if (height)
+        *height = (Bitu)parsed_height;
+    return true;
+}
+
 static bool GetSideBySideBaseWindowSize(Bitu *target_width, Bitu *target_height)
 {
     Bitu base_width = 0;
     Bitu base_height = 0;
 
-    if (!GetConfiguredWindowSize(&base_width, &base_height)) {
+    const Section_prop *render_section = static_cast<const Section_prop *>(
+            control->GetSection("render"));
+    const char *configured = render_section
+            ? render_section->Get_string("mod renderer comparison resolution")
+            : NULL;
+
+    if (!ParseComparisonPaneSize(configured, &base_width, &base_height) &&
+        !GetConfiguredWindowSize(&base_width, &base_height)) {
         const Bitu current_width = currentWindowWidth ? currentWindowWidth :
                 (sdl.surface ? (Bitu)sdl.surface->w : (Bitu)0u);
         const Bitu current_height = currentWindowHeight ? currentWindowHeight :
@@ -238,27 +272,51 @@ uint8_t *GetDbcsFont(Bitu code);
 //      this works better with maximized window or full-screen mode and the
 //      setting "dpi aware=true".
 
-static void PPScale (
-    uint16_t  fixed_w , uint16_t  fixed_h,
-    uint16_t* window_w, uint16_t* window_h )
+static void GetOpenGLPPSourceGeometry(int *orig_w,
+                                      int *orig_h,
+                                      int *min_w,
+                                      int *min_h,
+                                      double *pixel_aspect_ratio)
 {
-    int    sx, sy, orig_w, orig_h, min_w, min_h;
-    double par, par_sq;
-
-    orig_w = min_w = (int)render.src.width;
-    orig_h = min_h = (int)render.src.height;
+    int source_w = (int)render.src.width;
+    int source_h = (int)render.src.height;
+    int minimum_w = source_w;
+    int minimum_h = source_h;
 
     int x = (aspect_ratio_x>0 && aspect_ratio_y>0) ? aspect_ratio_x : ((aspect_ratio_x==-1 && aspect_ratio_y==-1) ? sdl.draw.width : 4);
     int y = (aspect_ratio_x>0 && aspect_ratio_y>0) ? aspect_ratio_y : ((aspect_ratio_x==-1 && aspect_ratio_y==-1) ? sdl.draw.height : 3);
-    par = (double)orig_w / orig_h * y / x;
+    double par = (double)source_w / source_h * y / x;
     /* HACK: because RENDER_SetSize() does not set dblw and dblh correctly: */
     /* E.g. in 360x360 mode DOSBox-X will wrongly allocate a 720x360 area. I  */
     /* therefore calculate square-pixel proportions par_sq myself:          */
-         if( par < 0.707 ) { par_sq = 0.5; min_w *= 2; }
-    else if( par > 1.414 ) { par_sq = 2.0; min_h *= 2; }
+    double par_sq;
+         if( par < 0.707 ) { par_sq = 0.5; minimum_w *= 2; }
+    else if( par > 1.414 ) { par_sq = 2.0; minimum_h *= 2; }
     else                     par_sq = 1.0;
 
     if( !render.aspect ) par = par_sq;
+
+    *orig_w = source_w;
+    *orig_h = source_h;
+    *min_w = minimum_w;
+    *min_h = minimum_h;
+    *pixel_aspect_ratio = par;
+}
+
+static void PPScale (
+    uint16_t  fixed_w , uint16_t  fixed_h,
+    uint16_t* window_w, uint16_t* window_h,
+    SDL_Rect* target_clip,
+    bool log_result = true )
+{
+    int sx, sy, orig_w, orig_h, min_w, min_h;
+    double par;
+
+    GetOpenGLPPSourceGeometry(&orig_w,
+                              &orig_h,
+                              &min_w,
+                              &min_h,
+                              &par);
 
     *window_w = fixed_w; *window_h = fixed_h;
     /* Handle non-fixed resolutions and ensure a sufficient window size: */
@@ -270,16 +328,63 @@ static void PPScale (
         fixed_w, fixed_h, 1.14,
         &sx    , &sy         );
 
-    sdl.clip.w = orig_w * sx;
-    sdl.clip.h = orig_h * sy;
-    sdl.clip.x = (*window_w - sdl.clip.w) / 2;
-    sdl.clip.y = (*window_h - sdl.clip.h) / 2;
+    target_clip->w = orig_w * sx;
+    target_clip->h = orig_h * sy;
+    target_clip->x = (*window_w - target_clip->w) / 2;
+    target_clip->y = (*window_h - target_clip->h) / 2;
 
-    LOG_MSG( "OpenGL PP: [%ix%i]: %ix%i (%3.2f) -> [%ix%i] -> %ix%i (%3.2f)",
-        fixed_w,    fixed_h,
-        orig_w,     orig_h, par,
-        sx,         sy,
-        sdl.clip.w, sdl.clip.h, (double)sy/sx );
+    if (log_result) {
+        LOG_MSG( "OpenGL PP: [%ix%i]: %ix%i (%3.2f) -> [%ix%i] -> %ix%i (%3.2f)",
+            fixed_w,         fixed_h,
+            orig_w,          orig_h, par,
+            sx,              sy,
+            target_clip->w,  target_clip->h, (double)sy/sx );
+    }
+}
+
+static SDL_Rect FitOpenGLPPSourceToBounds(uint16_t bounds_w,
+                                          uint16_t bounds_h)
+{
+    SDL_Rect clip = {0, 0, (int)bounds_w, (int)bounds_h};
+    int orig_w = 0;
+    int orig_h = 0;
+    int min_w = 0;
+    int min_h = 0;
+    double par = 1.0;
+    GetOpenGLPPSourceGeometry(&orig_w,
+                              &orig_h,
+                              &min_w,
+                              &min_h,
+                              &par);
+
+    if ((int)bounds_w >= min_w && (int)bounds_h >= min_h) {
+        uint16_t logical_window_width = bounds_w;
+        uint16_t logical_window_height = bounds_h;
+        PPScale(bounds_w,
+                bounds_h,
+                &logical_window_width,
+                &logical_window_height,
+                &clip,
+                false);
+        return clip;
+    }
+
+    // Pixel-perfect scaling only magnifies. When a comparison pane is smaller
+    // than the source's minimum integer-scaled footprint, fit the same intended
+    // display aspect uniformly inside the pane instead of growing past it.
+    const double display_aspect = (double)orig_w / ((double)orig_h * par);
+    int fitted_w = (int)bounds_w;
+    int fitted_h = std::max(1, (int)std::lround(fitted_w / display_aspect));
+    if (fitted_h > (int)bounds_h) {
+        fitted_h = (int)bounds_h;
+        fitted_w = std::max(1, (int)std::lround(fitted_h * display_aspect));
+    }
+
+    clip.w = std::min((int)bounds_w, fitted_w);
+    clip.h = std::min((int)bounds_h, fitted_h);
+    clip.x = ((int)bounds_w - clip.w) / 2;
+    clip.y = ((int)bounds_h - clip.h) / 2;
+    return clip;
 }
 
 static SDL_Surface* SetupSurfaceScaledOpenGL(uint32_t sdl_flags, uint32_t bpp) 
@@ -376,7 +481,8 @@ retry:
         sdl.clip.w = windowWidth = (uint16_t)Voodoo_OGL_GetWidth();
         sdl.clip.h = windowHeight = (uint16_t)Voodoo_OGL_GetHeight();
     } else if (sdl_opengl.kind == GLPerfect ) {
-        PPScale( fixedWidth, fixedHeight, &windowWidth, &windowHeight );
+        PPScale( fixedWidth, fixedHeight, &windowWidth, &windowHeight,
+                 &sdl.clip );
     } else
         if (fixedWidth && fixedHeight)
         {
@@ -1489,13 +1595,61 @@ static OpenGLPresentationLayout BuildOpenGLPresentationLayout(void)
         break;
     case MOD_RENDER_VIEW_SIDE_BY_SIDE:
     case MOD_RENDER_VIEW_SIDE_BY_SIDE_SUPPRESSED: {
-        const uint32_t half_width = layout.backbuffer_width / 2u;
-        layout.game = layout.natural_game;
+        Bitu configured_width = 0;
+        Bitu configured_height = 0;
+        if (!GetSideBySideBaseWindowSize(&configured_width,
+                                         &configured_height)) {
+            configured_width = std::max<uint32_t>(1u,
+                    layout.backbuffer_width / 2u);
+            configured_height = std::max<uint32_t>(1u,
+                    layout.backbuffer_height);
+        }
 
-        layout.mod.x = (GLint)half_width;
-        layout.mod.y = 0;
-        layout.mod.w = (GLsizei)(layout.backbuffer_width - half_width);
-        layout.mod.h = (GLsizei)layout.backbuffer_height;
+        const uint32_t pane_width = (uint32_t)configured_width;
+        const uint32_t pane_height = (uint32_t)configured_height;
+        const uint32_t comparison_width = pane_width * 2u;
+        const double canvas_scale = std::min(
+                1.0,
+                std::min((double)layout.backbuffer_width /
+                                 (double)comparison_width,
+                         (double)layout.backbuffer_height /
+                                 (double)pane_height));
+        const uint32_t presented_pane_width = std::max<uint32_t>(
+                1u, (uint32_t)std::lround((double)pane_width * canvas_scale));
+        const uint32_t presented_pane_height = std::max<uint32_t>(
+                1u, (uint32_t)std::lround((double)pane_height * canvas_scale));
+        const uint32_t presented_comparison_width = presented_pane_width * 2u;
+        const uint32_t canvas_x =
+                (layout.backbuffer_width - presented_comparison_width) / 2u;
+        const uint32_t canvas_y =
+                (layout.backbuffer_height - presented_pane_height) / 2u;
+
+        SDL_Rect logical_game = {0, 0, (int)pane_width, (int)pane_height};
+        if (sdl_opengl.kind == GLPerfect) {
+            logical_game = FitOpenGLPPSourceToBounds((uint16_t)pane_width,
+                                                     (uint16_t)pane_height);
+        } else if (render.aspect) {
+            aspectCorrectFitClip(logical_game.w,
+                                 logical_game.h,
+                                 logical_game.x,
+                                 logical_game.y,
+                                 (int)pane_width,
+                                 (int)pane_height);
+        }
+
+        layout.game.x = (GLint)(canvas_x + (uint32_t)std::lround(
+                (double)logical_game.x * canvas_scale));
+        layout.game.y = (GLint)(canvas_y + (uint32_t)std::lround(
+                (double)logical_game.y * canvas_scale));
+        layout.game.w = (GLsizei)std::max<uint32_t>(1u,
+                (uint32_t)std::lround((double)logical_game.w * canvas_scale));
+        layout.game.h = (GLsizei)std::max<uint32_t>(1u,
+                (uint32_t)std::lround((double)logical_game.h * canvas_scale));
+
+        layout.mod.x = (GLint)(canvas_x + presented_pane_width);
+        layout.mod.y = (GLint)canvas_y;
+        layout.mod.w = (GLsizei)presented_pane_width;
+        layout.mod.h = (GLsizei)presented_pane_height;
         break;
     }
     case MOD_RENDER_VIEW_GAME_ONLY:
@@ -1509,10 +1663,15 @@ static OpenGLPresentationLayout BuildOpenGLPresentationLayout(void)
 static GLViewport BuildInactiveModFallbackViewport(
         const OpenGLPresentationLayout &layout)
 {
-    GLViewport viewport = layout.natural_game;
-    if (IsModRenderSideBySideMode(mod_render_view_mode))
-        viewport.x += layout.mod.x;
-    return viewport;
+    if (IsModRenderSideBySideMode(mod_render_view_mode)) {
+        GLViewport viewport = layout.game;
+        viewport.x += layout.mod.w;
+        return viewport;
+    }
+    // Mod-only deliberately has no game presentation viewport, but until the
+    // Python renderer publishes its first usable frame it must still fail open
+    // to the native game clip rather than presenting a cleared black buffer.
+    return layout.natural_game;
 }
 
 static void PrepareOpenGLPresentationState(const OpenGLPresentationLayout &layout,
@@ -1714,15 +1873,20 @@ static void FinishOpenGLPresentation(const char *source)
     CheckManagement();
     DrawDOSBoxTextureToViewport(layout, layout.game);
 
-    if (mod_render_active &&
-        mod_render_view_mode != MOD_RENDER_VIEW_GAME_ONLY) {
-        const uint64_t timing_started = MOD_TimingBegin();
-        compositor_invoked =
-                DOSBoxPython_InvokeOpenGLCompositorCallback(mod_state);
-        compositor_ns = MOD_TimingEnd(MOD_TIMING_COMPOSITOR, timing_started);
-    } else if (!mod_render_active &&
-               mod_render_view_mode != MOD_RENDER_VIEW_GAME_ONLY) {
-        DrawDOSBoxTextureToViewport(layout, fallback);
+    if (mod_render_view_mode != MOD_RENDER_VIEW_GAME_ONLY) {
+        if (mod_render_active) {
+            const uint64_t timing_started = MOD_TimingBegin();
+            compositor_invoked =
+                    DOSBoxPython_InvokeOpenGLCompositorCallback(mod_state);
+            compositor_ns = MOD_TimingEnd(MOD_TIMING_COMPOSITOR,
+                                          timing_started);
+        }
+
+        // MOD_RenderActive reports that the configured executable is running,
+        // not that Python has a working compositor. Fail open to the native
+        // texture if the callback is absent, disabled, or raises an exception.
+        if (!compositor_invoked)
+            DrawDOSBoxTextureToViewport(layout, fallback);
     }
 
     RestoreOpenGLPresentationState(layout);

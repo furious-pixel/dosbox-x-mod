@@ -2214,6 +2214,10 @@ void DOSBOX_SetupConfigSections(void) {
     Pstring->Set_help("Initial OpenGL presentation view when a mod renderer is available.");
     Pstring->SetBasic(true);
 
+    Pstring = secprop->Add_string("mod renderer comparison resolution",Property::Changeable::OnlyAtStart,"auto");
+    Pstring->Set_help("Per-pane resolution for side-by-side mod-renderer comparison, formatted as WIDTHxHEIGHT. 'auto' uses windowresolution.");
+    Pstring->SetBasic(true);
+
     Pstring = secprop->Add_string("aspect", Property::Changeable::Always, "false");
     Pstring->Set_values(aspectmodes);
     Pstring->Set_help(

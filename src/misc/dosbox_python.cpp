@@ -361,6 +361,10 @@ static std::string build_mod_helper_bootstrap(void)
 	script
 		<< "import mod\n"
 		<< "class _DOSBoxModState(object):\n"
+		<< "    def get_modjoystick_devices(self):\n"
+		<< "        return mod._get_modjoystick_devices()\n"
+		<< "    def bind_modjoystick_axes(self, bindings):\n"
+		<< "        return mod._bind_modjoystick_axes(bindings)\n"
 		<< "    def get_modjoystick_axes(self):\n"
 		<< "        return mod._get_modjoystick_axes()\n"
 		<< "    pass\n"
@@ -504,6 +508,10 @@ static std::string build_modstate_reset_script(void)
 	script
 		<< "import mod\n"
 		<< "class _DOSBoxModState(object):\n"
+		<< "    def get_modjoystick_devices(self):\n"
+		<< "        return mod._get_modjoystick_devices()\n"
+		<< "    def bind_modjoystick_axes(self, bindings):\n"
+		<< "        return mod._bind_modjoystick_axes(bindings)\n"
 		<< "    def get_modjoystick_axes(self):\n"
 		<< "        return mod._get_modjoystick_axes()\n"
 		<< "    pass\n"
@@ -1114,6 +1122,112 @@ static PyObject *py_call_reloc_u32(PyObject *, PyObject *args)
 	        static_cast<unsigned long>(output.eax));
 }
 
+static PyObject *py_get_modjoystick_devices(PyObject *, PyObject *args)
+{
+	if (g_python.api.PyTuple_Size(args) != 0) {
+		set_python_error(g_python.api.PyExc_TypeError,
+		                 "_get_modjoystick_devices expects no arguments");
+		return NULL;
+	}
+
+	const int device_count = ModJoystick_GetDeviceCount();
+	PyOwnedRef devices(g_python.api.PyTuple_New(device_count));
+	if (!devices)
+		return NULL;
+
+	for (Py_ssize_t device_index = 0; device_index < device_count; ++device_index) {
+		PyOwnedRef device(g_python.api.PyTuple_New(2));
+		PyOwnedRef name(g_python.api.PyUnicode_FromString(
+		        ModJoystick_GetDeviceName(static_cast<int>(device_index))));
+		PyOwnedRef axis_count(g_python.api.PyLong_FromLong(
+		        ModJoystick_GetDeviceAxisCount(static_cast<int>(device_index))));
+		if (!device || !name || !axis_count ||
+		    g_python.api.PyTuple_SetItem(device.get(), 0, name.get()) != 0) {
+			return NULL;
+		}
+		name.release();
+		if (g_python.api.PyTuple_SetItem(device.get(), 1, axis_count.get()) != 0)
+			return NULL;
+		axis_count.release();
+		if (g_python.api.PyTuple_SetItem(devices.get(), device_index, device.get()) != 0)
+			return NULL;
+		device.release();
+	}
+
+	return devices.release();
+}
+
+static PyObject *py_bind_modjoystick_axes(PyObject *, PyObject *args)
+{
+	if (g_python.api.PyTuple_Size(args) != 1) {
+		set_python_error(g_python.api.PyExc_TypeError,
+		                 "_bind_modjoystick_axes expects (bindings)");
+		return NULL;
+	}
+
+	PyObject *binding_sequence = g_python.api.PyTuple_GetItem(args, 0);
+	const Py_ssize_t binding_count = g_python.api.PySequence_Size(binding_sequence);
+	if (binding_count < 0 || binding_count > INT_MAX) {
+		set_python_error(g_python.api.PyExc_ValueError,
+		                 "bindings must be a finite sequence");
+		return NULL;
+	}
+
+	std::vector<ModJoyBindingRequest> requests = {};
+	requests.reserve(static_cast<size_t>(binding_count));
+	for (Py_ssize_t binding_index = 0; binding_index < binding_count; ++binding_index) {
+		PyOwnedRef binding(g_python.api.PySequence_GetItem(
+		        binding_sequence, binding_index));
+		if (!binding || g_python.api.PySequence_Size(binding.get()) != 2) {
+			set_python_error(g_python.api.PyExc_TypeError,
+			                 "each binding must be (device_name, axis_index)");
+			return NULL;
+		}
+
+		PyOwnedRef name(g_python.api.PySequence_GetItem(binding.get(), 0));
+		PyOwnedRef axis(g_python.api.PySequence_GetItem(binding.get(), 1));
+		ModJoyBindingRequest request = {};
+		if (!name || !py_object_to_string(name.get(), "binding device name",
+		                                  &request.device_name)) {
+			set_python_error(g_python.api.PyExc_TypeError,
+			                 "binding device name must be a string");
+			return NULL;
+		}
+
+		clear_python_error();
+		const long axis_index = axis ? g_python.api.PyLong_AsLong(axis.get()) : 0;
+		if (!axis ||
+		    (g_python.api.PyErr_Occurred && g_python.api.PyErr_Occurred() != NULL) ||
+		    axis_index < INT_MIN || axis_index > INT_MAX) {
+			set_python_error(g_python.api.PyExc_TypeError,
+			                 "binding axis index must be an integer");
+			return NULL;
+		}
+		request.axis_index = static_cast<int>(axis_index);
+		requests.push_back(request);
+	}
+
+	const auto statuses = ModJoystick_BindAxes(requests);
+	PyOwnedRef result(g_python.api.PyTuple_New(
+	        static_cast<Py_ssize_t>(statuses.size())));
+	if (!result)
+		return NULL;
+
+	for (Py_ssize_t status_index = 0;
+	     status_index < static_cast<Py_ssize_t>(statuses.size());
+	     ++status_index) {
+		PyOwnedRef status(g_python.api.PyUnicode_FromString(
+		        ModJoystick_GetBindingStatusName(statuses[status_index])));
+		if (!status ||
+		    g_python.api.PyTuple_SetItem(result.get(), status_index, status.get()) != 0) {
+			return NULL;
+		}
+		status.release();
+	}
+
+	return result.release();
+}
+
 static PyObject *py_get_modjoystick_axes(PyObject *, PyObject *args)
 {
 	if (g_python.api.PyTuple_Size(args) != 0) {
@@ -1122,16 +1236,16 @@ static PyObject *py_get_modjoystick_axes(PyObject *, PyObject *args)
 		return NULL;
 	}
 
-	int16_t axis_values[max_modjoy_axes] = {};
-	ModJoystick_ReadAxes(axis_values, max_modjoy_axes);
+	const auto& axis_values = ModJoystick_ReadAxes();
+	const auto binding_count = static_cast<Py_ssize_t>(axis_values.size());
 
-	PyOwnedRef axis_tuple(g_python.api.PyTuple_New(max_modjoy_axes));
+	PyOwnedRef axis_tuple(g_python.api.PyTuple_New(binding_count));
 	if (!axis_tuple) {
 		log_python_exception("failed to allocate joystick axis tuple");
 		return NULL;
 	}
 
-	for (Py_ssize_t i = 0; i < max_modjoy_axes; ++i) {
+	for (Py_ssize_t i = 0; i < binding_count; ++i) {
 		PyOwnedRef axis_value(g_python.api.PyLong_FromLong(
 		        static_cast<long>(axis_values[i])));
 		if (!axis_value) {
@@ -1855,6 +1969,12 @@ static bool ensure_mod_helper_module(void)
 	static PyMethodDef register_safe_callback_method = {
 	        "_register_safe_callback", py_register_safe_callback,
 	        DOSBOX_PY_METH_VARARGS, NULL};
+	static PyMethodDef get_modjoystick_devices_method = {
+	        "_get_modjoystick_devices", py_get_modjoystick_devices,
+	        DOSBOX_PY_METH_VARARGS, NULL};
+	static PyMethodDef bind_modjoystick_axes_method = {
+	        "_bind_modjoystick_axes", py_bind_modjoystick_axes,
+	        DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef get_modjoystick_axes_method = {
 	        "_get_modjoystick_axes", py_get_modjoystick_axes, DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef notify_frame_ready_method = {
@@ -1922,6 +2042,10 @@ static bool ensure_mod_helper_module(void)
 	                            &register_render_callback_method) ||
 	    !attach_module_function(mod_module.get(), "_register_safe_callback",
 	                            &register_safe_callback_method) ||
+	    !attach_module_function(mod_module.get(), "_get_modjoystick_devices",
+	                            &get_modjoystick_devices_method) ||
+	    !attach_module_function(mod_module.get(), "_bind_modjoystick_axes",
+	                            &bind_modjoystick_axes_method) ||
 	    !attach_module_function(mod_module.get(), "_get_modjoystick_axes",
 	                            &get_modjoystick_axes_method) ||
 	    !attach_module_function(mod_module.get(), "_notify_frame_ready",

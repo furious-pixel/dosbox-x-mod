@@ -19,7 +19,9 @@
 #ifndef DOSBOX_JOYSTICK_H
 #define DOSBOX_JOYSTICK_H
 
+#include <string>
 #include <stdint.h>
+#include <vector>
 
 void JOYSTICK_Enable(Bitu which,bool enabled);
 
@@ -48,27 +50,29 @@ enum JoystickType {
 	JOY_MODJOY
 };
 
-constexpr int max_modjoy_axes = 4;
+struct ModJoyBindingRequest {
+	std::string device_name = {};
+	int axis_index = -1;
+};
 
-struct ModJoyAxisBinding {
-	bool configured;
-	int sdl_joystick_index;
-	int sdl_axis_index;
-	void* sdl_joystick;
-	char joystick_name[128];
+enum class ModJoyBindingStatus {
+	Bound,
+	Unconfigured,
+	DeviceNotFound,
+	DuplicateDeviceName,
+	AxisOutOfRange,
 };
 
 extern JoystickType joytype;
 extern bool button_wrapping_enabled;
-extern bool modjoy_rawvalue_log;
-extern bool modjoy_axis_log;
-extern ModJoyAxisBinding modjoy_axis_bindings[max_modjoy_axes];
 
 void ModJoystick_Initialize();
 void ModJoystick_Shutdown();
-int16_t ModJoystick_GetAxis(int axis_index);
-void ModJoystick_ReadAxes(int16_t* axis_values, int axis_count);
+std::vector<ModJoyBindingStatus> ModJoystick_BindAxes(
+        const std::vector<ModJoyBindingRequest>& requests);
+const std::vector<int16_t>& ModJoystick_ReadAxes();
 int ModJoystick_GetDeviceCount();
 const char* ModJoystick_GetDeviceName(int device_index);
-int16_t ModJoystick_GetDeviceAxisValue(int device_index, int axis_index);
+int ModJoystick_GetDeviceAxisCount(int device_index);
+const char* ModJoystick_GetBindingStatusName(ModJoyBindingStatus status);
 #endif

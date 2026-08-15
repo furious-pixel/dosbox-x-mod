@@ -19,7 +19,6 @@
 
 #include <string.h>
 #include <string>
-#include <cstdlib>
 #include <vector>
 #include "SDL.h"
 #include "dosbox.h"
@@ -53,82 +52,24 @@ static uint32_t last_write = 0;
 static bool write_active = false;
 static bool swap34 = false;
 bool button_wrapping_enabled = true;
-bool modjoy_rawvalue_log = false;
-bool modjoy_axis_log = false;
-ModJoyAxisBinding modjoy_axis_bindings[max_modjoy_axes] = {};
 
 extern bool autofire; //sdl_mapper.cpp
 extern int joy1axes[]; //sdl_mapper.cpp
 extern int joy2axes[]; //sdl_mapper.cpp
-
-static std::string TrimModJoyString(const std::string& value)
-{
-    const auto begin = value.find_first_not_of(" \t\r\n");
-    if (begin == std::string::npos)
-        return {};
-
-    const auto end = value.find_last_not_of(" \t\r\n");
-    return value.substr(begin, end - begin + 1);
-}
-
-static void ResetModJoyBinding(ModJoyAxisBinding& binding)
-{
-    binding.configured = false;
-    binding.sdl_joystick_index = -1;
-    binding.sdl_axis_index = -1;
-    binding.sdl_joystick = nullptr;
-    binding.joystick_name[0] = 0;
-}
-
-static bool ParseModJoyBinding(const std::string& value, ModJoyAxisBinding& binding)
-{
-    ResetModJoyBinding(binding);
-
-    std::string input = TrimModJoyString(value);
-    if (input.empty())
-        return false;
-
-    std::string joystick_name = {};
-    std::string axis_spec = {};
-
-    if (input[0] == '"') {
-        const auto closing_quote = input.find('"', 1);
-        if (closing_quote == std::string::npos)
-            return false;
-
-        joystick_name = input.substr(1, closing_quote - 1);
-        axis_spec = TrimModJoyString(input.substr(closing_quote + 1));
-        if (!axis_spec.empty() && axis_spec[0] == ',')
-            axis_spec = TrimModJoyString(axis_spec.substr(1));
-    } else {
-        const auto comma = input.find(',');
-        if (comma == std::string::npos)
-            return false;
-
-        joystick_name = TrimModJoyString(input.substr(0, comma));
-        axis_spec = TrimModJoyString(input.substr(comma + 1));
-    }
-
-    if (joystick_name.empty() || axis_spec.size() < 5 || strncasecmp(axis_spec.c_str(), "axis", 4))
-        return false;
-
-    char* end_ptr = nullptr;
-    const long axis_index = strtol(axis_spec.c_str() + 4, &end_ptr, 10);
-    const std::string remainder = TrimModJoyString(end_ptr ? end_ptr : "");
-    if (end_ptr == axis_spec.c_str() + 4 || !remainder.empty() || axis_index < 0)
-        return false;
-
-    safe_strncpy(binding.joystick_name, joystick_name.c_str(), sizeof(binding.joystick_name));
-    binding.configured = true;
-    binding.sdl_axis_index = static_cast<int>(axis_index);
-    return true;
-}
 
 namespace {
 
 struct OpenModJoystickDevice {
     SDL_Joystick* sdl_joystick = nullptr;
     std::string joystick_name = {};
+    int enumeration_index = -1;
+    int axis_count = 0;
+    bool duplicate_name = false;
+};
+
+struct CachedModJoyAxisBinding {
+    SDL_Joystick* sdl_joystick = nullptr;
+    int axis_index = -1;
 };
 
 class ModJoystickManager {
@@ -156,19 +97,34 @@ public:
             OpenModJoystickDevice device = {};
             device.sdl_joystick = sdl_joystick;
             device.joystick_name = joystick_name ? joystick_name : "[unknown joystick]";
+            device.enumeration_index = joystick_index;
+            const int axis_count = SDL_JoystickNumAxes(sdl_joystick);
+            device.axis_count = axis_count >= 0 ? axis_count : 0;
             opened_devices.push_back(device);
         }
 
-        ResolveMappings();
-        initialized = true;
+        for (size_t device_index = 0; device_index < opened_devices.size(); device_index++) {
+            auto& device = opened_devices[device_index];
+            for (size_t other_index = 0; other_index < opened_devices.size(); other_index++) {
+                if (device_index != other_index &&
+                    device.joystick_name == opened_devices[other_index].joystick_name) {
+                    device.duplicate_name = true;
+                    break;
+                }
+            }
+
+            LOG_MSG("modjoy: SDL device %d \"%s\", axes=%d%s",
+                    device.enumeration_index,
+                    device.joystick_name.c_str(),
+                    device.axis_count,
+                    device.duplicate_name ? ", duplicate name unsupported" : "");
+        }
     }
 
     void Shutdown()
     {
-        for (auto& binding : modjoy_axis_bindings) {
-            binding.sdl_joystick_index = -1;
-            binding.sdl_joystick = nullptr;
-        }
+        bindings.clear();
+        axis_values.clear();
 
         for (auto& device : opened_devices) {
             if (device.sdl_joystick != nullptr) {
@@ -178,45 +134,39 @@ public:
         }
 
         opened_devices.clear();
-        initialized = false;
     }
 
-    void ResolveMappings()
+    std::vector<ModJoyBindingStatus> BindAxes(
+            const std::vector<ModJoyBindingRequest>& requests)
     {
-        for (auto& binding : modjoy_axis_bindings) {
-            binding.sdl_joystick_index = -1;
-            binding.sdl_joystick = nullptr;
+        std::vector<CachedModJoyAxisBinding> new_bindings(requests.size());
+        std::vector<ModJoyBindingStatus> statuses = {};
+        statuses.reserve(requests.size());
 
-            if (!binding.configured || binding.sdl_axis_index < 0)
-                continue;
-
-            for (size_t device_index = 0; device_index < opened_devices.size(); device_index++) {
-                auto& device = opened_devices[device_index];
-                if (device.joystick_name != binding.joystick_name)
-                    continue;
-                if (device.sdl_joystick == nullptr)
-                    continue;
-                if (binding.sdl_axis_index >= SDL_JoystickNumAxes(device.sdl_joystick))
-                    continue;
-
-                binding.sdl_joystick = device.sdl_joystick;
-                binding.sdl_joystick_index = static_cast<int>(device_index);
-                break;
-            }
+        for (size_t binding_index = 0; binding_index < requests.size(); binding_index++) {
+            const auto& request = requests[binding_index];
+            auto& binding = new_bindings[binding_index];
+            statuses.push_back(ResolveBinding(request, binding));
         }
+
+        bindings.swap(new_bindings);
+        axis_values.assign(bindings.size(), 0);
+        return statuses;
     }
 
-    int16_t GetAxis(const int axis_index) const
+    const std::vector<int16_t>& ReadAxes()
     {
-        if (axis_index < 0 || axis_index >= max_modjoy_axes)
-            return 0;
+        if (bindings.empty())
+            return axis_values;
 
-        const auto& binding = modjoy_axis_bindings[axis_index];
-        if (binding.sdl_joystick == nullptr)
-            return 0;
-
-        return SDL_JoystickGetAxis(static_cast<SDL_Joystick*>(binding.sdl_joystick),
-                                   binding.sdl_axis_index);
+        SDL_JoystickUpdate();
+        for (size_t axis_index = 0; axis_index < bindings.size(); axis_index++) {
+            const auto& binding = bindings[axis_index];
+            axis_values[axis_index] = binding.sdl_joystick != nullptr
+                    ? SDL_JoystickGetAxis(binding.sdl_joystick, binding.axis_index)
+                    : 0;
+        }
+        return axis_values;
     }
 
     int GetDeviceCount() const
@@ -232,25 +182,44 @@ public:
         return opened_devices[device_index].joystick_name.c_str();
     }
 
-    int16_t GetDeviceAxisValue(const int device_index, const int axis_index) const
+    int GetDeviceAxisCount(const int device_index) const
     {
         if (device_index < 0 || device_index >= static_cast<int>(opened_devices.size()))
             return 0;
-        if (axis_index < 0 || axis_index >= max_modjoy_axes)
-            return 0;
-
-        auto* sdl_joystick = opened_devices[device_index].sdl_joystick;
-        if (sdl_joystick == nullptr)
-            return 0;
-        if (axis_index >= SDL_JoystickNumAxes(sdl_joystick))
-            return 0;
-
-        return SDL_JoystickGetAxis(sdl_joystick, axis_index);
+        return opened_devices[device_index].axis_count;
     }
 
 private:
-    bool initialized = false;
+    ModJoyBindingStatus ResolveBinding(
+            const ModJoyBindingRequest& request,
+            CachedModJoyAxisBinding& binding) const
+    {
+        if (request.device_name.empty())
+            return ModJoyBindingStatus::Unconfigured;
+
+        const OpenModJoystickDevice* matched_device = nullptr;
+        for (const auto& device : opened_devices) {
+            if (device.joystick_name == request.device_name) {
+                matched_device = &device;
+                break;
+            }
+        }
+
+        if (matched_device == nullptr)
+            return ModJoyBindingStatus::DeviceNotFound;
+        if (matched_device->duplicate_name)
+            return ModJoyBindingStatus::DuplicateDeviceName;
+        if (request.axis_index < 0 || request.axis_index >= matched_device->axis_count)
+            return ModJoyBindingStatus::AxisOutOfRange;
+
+        binding.sdl_joystick = matched_device->sdl_joystick;
+        binding.axis_index = request.axis_index;
+        return ModJoyBindingStatus::Bound;
+    }
+
     std::vector<OpenModJoystickDevice> opened_devices = {};
+    std::vector<CachedModJoyAxisBinding> bindings = {};
+    std::vector<int16_t> axis_values = {};
 };
 
 ModJoystickManager mod_joystick_manager = {};
@@ -463,8 +432,6 @@ void JOYSTICK_Init() {
 		autofire = section->Get_bool("autofire");
 		swap34 = section->Get_bool("swap34");
 		button_wrapping_enabled = section->Get_bool("buttonwrap");
-		modjoy_rawvalue_log = section->Get_bool("modjoy_rawvalue_log");
-		modjoy_axis_log = section->Get_bool("modjoy_axis_log");
 		stick[0].enabled = false;
 		stick[1].enabled = false;
 		stick[0].xtick = stick[0].ytick = stick[1].xtick =
@@ -489,11 +456,6 @@ void JOYSTICK_Init() {
 				}
 			}
 		}
-
-        for (auto i = 0; i < 4; i++) {
-            auto propname = "modjoyaxis" + std::to_string(i);
-            ParseModJoyBinding(section->Get_string(propname), modjoy_axis_bindings[i]);
-        }
 	}
 
 	AddExitFunction(AddExitFunctionFuncPair(JOYSTICK_Destroy),true);
@@ -516,9 +478,6 @@ public:
         registerPOD(write_active);
         registerPOD(swap34);
         registerPOD(button_wrapping_enabled);
-        registerPOD(modjoy_rawvalue_log);
-        registerPOD(modjoy_axis_log);
-        registerPOD(modjoy_axis_bindings);
         registerPOD(autofire);
     }
 } dummy;
@@ -534,24 +493,15 @@ void ModJoystick_Shutdown()
     mod_joystick_manager.Shutdown();
 }
 
-int16_t ModJoystick_GetAxis(const int axis_index)
+std::vector<ModJoyBindingStatus> ModJoystick_BindAxes(
+        const std::vector<ModJoyBindingRequest>& requests)
 {
-    return mod_joystick_manager.GetAxis(axis_index);
+    return mod_joystick_manager.BindAxes(requests);
 }
 
-void ModJoystick_ReadAxes(int16_t* axis_values, const int axis_count)
+const std::vector<int16_t>& ModJoystick_ReadAxes()
 {
-    if (axis_values == nullptr || axis_count <= 0)
-        return;
-
-    for (int axis_index = 0; axis_index < axis_count; axis_index++)
-        axis_values[axis_index] = 0;
-
-    SDL_JoystickUpdate();
-
-    const int read_count = axis_count < max_modjoy_axes ? axis_count : max_modjoy_axes;
-    for (int axis_index = 0; axis_index < read_count; axis_index++)
-        axis_values[axis_index] = mod_joystick_manager.GetAxis(axis_index);
+    return mod_joystick_manager.ReadAxes();
 }
 
 int ModJoystick_GetDeviceCount()
@@ -564,7 +514,19 @@ const char* ModJoystick_GetDeviceName(const int device_index)
     return mod_joystick_manager.GetDeviceName(device_index);
 }
 
-int16_t ModJoystick_GetDeviceAxisValue(const int device_index, const int axis_index)
+int ModJoystick_GetDeviceAxisCount(const int device_index)
 {
-    return mod_joystick_manager.GetDeviceAxisValue(device_index, axis_index);
+    return mod_joystick_manager.GetDeviceAxisCount(device_index);
+}
+
+const char* ModJoystick_GetBindingStatusName(const ModJoyBindingStatus status)
+{
+    switch (status) {
+    case ModJoyBindingStatus::Bound: return "bound";
+    case ModJoyBindingStatus::Unconfigured: return "unconfigured";
+    case ModJoyBindingStatus::DeviceNotFound: return "device_not_found";
+    case ModJoyBindingStatus::DuplicateDeviceName: return "duplicate_device_name";
+    case ModJoyBindingStatus::AxisOutOfRange: return "axis_out_of_range";
+    }
+    return "unknown";
 }

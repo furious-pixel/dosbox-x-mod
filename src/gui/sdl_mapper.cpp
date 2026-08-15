@@ -5283,79 +5283,7 @@ static void CreateBindGroups(void) {
 }
 
 #if defined (REDUCE_JOYSTICK_POLLING)
-static void LogAllSdlJoystickAxes()
-{
-    static constexpr uint32_t raw_axis_report_interval_ms = 4000;
-    static uint32_t next_raw_axis_report_tick = 0;
-
-    if (joytype != JOY_MODJOY || !modjoy_rawvalue_log)
-        return;
-
-    const uint32_t now = SDL_GetTicks();
-    if (now < next_raw_axis_report_tick)
-        return;
-
-    struct RawJoystickLogEntry {
-        std::string name = {};
-        Sint16 axis_values[max_modjoy_axes] = {};
-    };
-    std::vector<RawJoystickLogEntry> entries = {};
-    entries.reserve(static_cast<size_t>(ModJoystick_GetDeviceCount()));
-    size_t longest_name_len = 0;
-
-    for (int joystick_index = 0; joystick_index < ModJoystick_GetDeviceCount(); joystick_index++) {
-        RawJoystickLogEntry entry = {};
-        entry.name = ModJoystick_GetDeviceName(joystick_index);
-        longest_name_len = std::max(longest_name_len, entry.name.size());
-
-        for (int axis_index = 0; axis_index < max_modjoy_axes; axis_index++) {
-            entry.axis_values[axis_index] = ModJoystick_GetDeviceAxisValue(joystick_index, axis_index);
-        }
-        entries.push_back(entry);
-    }
-
-    for (const auto& entry : entries) {
-        LOG_MSG("\"%-*s\" SDL axes: [0]=%6d [1]=%6d [2]=%6d [3]=%6d",
-                static_cast<int>(longest_name_len),
-                entry.name.c_str(),
-                entry.axis_values[0],
-                entry.axis_values[1],
-                entry.axis_values[2],
-                entry.axis_values[3]);
-    }
-
-    next_raw_axis_report_tick = now + raw_axis_report_interval_ms;
-}
-
-static void LogModJoyAxes()
-{
-    static constexpr uint32_t modjoy_axis_report_interval_ms = 4000;
-    static uint32_t next_modjoy_axis_report_tick = 0;
-
-    if (joytype != JOY_MODJOY || !modjoy_axis_log)
-        return;
-
-    const uint32_t now = SDL_GetTicks();
-    if (now < next_modjoy_axis_report_tick)
-        return;
-
-    Sint16 axis_values[max_modjoy_axes] = {};
-    for (int modjoy_axis = 0; modjoy_axis < max_modjoy_axes; modjoy_axis++) {
-        axis_values[modjoy_axis] = ModJoystick_GetAxis(modjoy_axis);
-    }
-
-    LOG_MSG("modjoy axes: [0]=%6d [1]=%6d [2]=%6d [3]=%6d",
-            axis_values[0],
-            axis_values[1],
-            axis_values[2],
-            axis_values[3]);
-
-    next_modjoy_axis_report_tick = now + modjoy_axis_report_interval_ms;
-}
-
 void MAPPER_UpdateJoysticks(void) {
-    LogAllSdlJoystickAxes();
-    LogModJoyAxes();
     for (Bitu i=0; i<mapper.sticks.num_groups; i++) {
         mapper.sticks.stick[i]->UpdateJoystick();
     }

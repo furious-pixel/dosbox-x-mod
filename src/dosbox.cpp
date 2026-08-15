@@ -4306,22 +4306,6 @@ void DOSBOX_SetupConfigSections(void) {
     Pbool->Set_help("enable button wrapping at the number of emulated buttons.");
     Pbool->SetBasic(true);
 
-    Pbool = secprop->Add_bool("modjoy_rawvalue_log",Property::Changeable::WhenIdle,false);
-    Pbool->Set_help("log raw SDL joystick axis values for all detected joysticks when joysticktype=modjoy.");
-    Pbool->SetBasic(true);
-
-    Pbool = secprop->Add_bool("modjoy_axis_log",Property::Changeable::WhenIdle,false);
-    Pbool->Set_help("log resolved modjoy axis values every 4 seconds when joysticktype=modjoy.");
-    Pbool->SetBasic(true);
-
-    for (auto i = 0; i < 4; i++) {
-        const auto axis = std::to_string(i);
-        const auto name = "modjoyaxis" + axis;
-        Pstring = secprop->Add_string(name, Property::Changeable::WhenIdle, "");
-        Pstring->Set_help("modjoy axis " + axis + " mapping in the form \"<SDL joystick name>\", axis<n>.");
-        Pstring->SetBasic(true);
-    }
-
 	/*improved joystick
 	 * each axis has its own deadzone and response
 	 * each axis index can be remapped, e.g. fix poor driver mappings

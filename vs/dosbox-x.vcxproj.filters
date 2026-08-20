@@ -855,6 +855,9 @@
     <ClCompile Include="..\src\output\output_opengl.cpp">
       <Filter>Sources\output</Filter>
     </ClCompile>
+    <ClCompile Include="..\src\output\ra_glsl.cpp">
+      <Filter>Sources\output</Filter>
+    </ClCompile>
     <ClCompile Include="..\src\output\output_tools.cpp">
       <Filter>Sources\output</Filter>
     </ClCompile>
@@ -2316,6 +2319,9 @@
       <Filter>Sources\output</Filter>
     </ClInclude>
     <ClInclude Include="..\src\output\output_opengl.h">
+      <Filter>Sources\output</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\output\ra_glsl.h">
       <Filter>Sources\output</Filter>
     </ClInclude>
     <ClInclude Include="..\src\output\output_tools.h">

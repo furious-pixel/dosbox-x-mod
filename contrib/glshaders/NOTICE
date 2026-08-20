@@ -1,0 +1,24 @@
+RetroArch GLSL CRT presets for DOSBox-X native OpenGL presentation.
+
+Upstream pack: https://github.com/libretro/glsl-shaders
+Snapshot: 2b2c5ee3fd8e1a3884e20ed424fd9bfbc51cbb3d (2026-06-03)
+
+This directory is a shortlist, not the full pack. Licenses are per-file;
+do not treat these shaders as MIT as a whole.
+
+Shipped here (compatible with DOSBox-X GPL-2):
+
+path | author | license in-tree | notes
+-----|--------|-----------------|------
+crt/shaders/hyllian/crt-hyllian.glsl | Hyllian (sergiogdb@gmail.com) | MIT | keep the copyright and permission notice
+crt/shaders/hyllian/crt-hyllian.glsl (mask_weights) | hunterk | public domain | some mask arrays are adapted from cgwg crt-geom-deluxe LUTs
+crt/shaders/guest/* | guest(r) (guest.r@gmail.com) and Dr. Venom | GPL-2+ | keep headers
+crt/shaders/guest/crt-guest-dr-venom.glsl (curvature) | cgwg crt-geom | GPL | borrowed under GPL
+crt/shaders/guest/lut/*.png | torridgristle (lut/README) | attribution only | keep lut/README; no separate grant
+
+Local .glslp edits (not upstream):
+- crt/crt-guest-dr-venom.glslp: interm=0, inter=800, warpX=0, warpY=0
+- presets/crt-guest-dr-venom-kurozumi.glslp: same interlace/warp overrides; beam_min=1.45; maskDark=0.55
+- presets/crt-guest-dr-venom-stock.glslp: rewritten as a full-res 480p Guest chain (not the upstream 240p stock preset)
+
+See CREDITS.md for the repository-wide borrowed-code list.

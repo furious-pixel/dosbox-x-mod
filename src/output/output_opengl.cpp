@@ -21,6 +21,7 @@ extern "C" {
 #include <output/output_opengl.h>
 #include <output/output_tools.h>
 #include <output/output_tools_xbrz.h>
+#include <output/ra_glsl.h>
 
 #include <algorithm>
 
@@ -156,6 +157,17 @@ static ModRenderViewMode GetConfiguredModRenderStartView(void)
 // Two post-swap clears drain the other buffers when drivers are effectively
 // triple-buffering behind SDL's back.
 static constexpr int MOD_RENDER_INACTIVE_POST_SWAP_CLEARS = 2;
+
+// CRT presets are for full native presentation (game-only). Side-by-side is
+// an A/B against the enhanced renderer; do not run the CRT on the native pane
+// there. If this nearest blit is not a fair comparison, replace the native
+// SBS path with openglpp instead of turning this back on.
+static constexpr bool kApplyNativeCrtInSideBySide = false;
+
+static bool NativeCrtLetterboxes(void)
+{
+    return RA_GLSL_HasPreset();
+}
 
 struct GLViewport {
     GLint x = 0;
@@ -490,7 +502,8 @@ retry:
             windowHeight = fixedHeight;
             sdl.clip.w = windowWidth;
             sdl.clip.h = windowHeight;
-            if (render.aspect) aspectCorrectFitClip(sdl.clip.w, sdl.clip.h, sdl.clip.x, sdl.clip.y, fixedWidth, fixedHeight);
+            if (render.aspect || NativeCrtLetterboxes())
+                aspectCorrectFitClip(sdl.clip.w, sdl.clip.h, sdl.clip.x, sdl.clip.y, fixedWidth, fixedHeight);
         }
         else
         {
@@ -498,6 +511,8 @@ retry:
             windowHeight = (uint16_t)(sdl.draw.height * sdl.draw.scaley);
             if (render.aspect) aspectCorrectExtend(windowWidth, windowHeight);
             sdl.clip.w = windowWidth; sdl.clip.h = windowHeight;
+            if (NativeCrtLetterboxes())
+                aspectCorrectFitClip(sdl.clip.w, sdl.clip.h, sdl.clip.x, sdl.clip.y, windowWidth, windowHeight);
         }
 
     if (side_by_side_resize_override)
@@ -615,6 +630,7 @@ void OUTPUT_OPENGL_Select( GLKind kind )
     sdl.window = GFX_SetSDLWindowMode(640,400, SCREEN_OPENGL);
     if (sdl.window) {
         if(sdl_opengl.context) {
+            RA_GLSL_Release();
             SDL_GL_DeleteContext(sdl_opengl.context);
             sdl_opengl.context = nullptr;
         }
@@ -1628,7 +1644,7 @@ static OpenGLPresentationLayout BuildOpenGLPresentationLayout(void)
         if (sdl_opengl.kind == GLPerfect) {
             logical_game = FitOpenGLPPSourceToBounds((uint16_t)pane_width,
                                                      (uint16_t)pane_height);
-        } else if (render.aspect) {
+        } else if (render.aspect || NativeCrtLetterboxes()) {
             aspectCorrectFitClip(logical_game.w,
                                  logical_game.h,
                                  logical_game.x,
@@ -1783,10 +1799,32 @@ static ModOpenGLState BuildModOpenGLState(const OpenGLPresentationLayout &layout
     return state;
 }
 
+static bool ShouldDrawNativeCrt(void)
+{
+    if (!RA_GLSL_HasPreset())
+        return false;
+    if (IsModRenderSideBySideMode(mod_render_view_mode))
+        return kApplyNativeCrtInSideBySide;
+    return true;
+}
+
 static void DrawDOSBoxTextureToViewport(const OpenGLPresentationLayout &layout,
                                         const GLViewport &viewport)
 {
     if (ViewportIsEmpty(viewport))
+        return;
+
+    if (ShouldDrawNativeCrt() &&
+        RA_GLSL_Draw((unsigned int)sdl_opengl.texture,
+                     (int)sdl_opengl.texture_size,
+                     (int)sdl_opengl.input_width,
+                     (int)sdl_opengl.input_height,
+                     (int)viewport.x,
+                     (int)viewport.y,
+                     (int)viewport.w,
+                     (int)viewport.h,
+                     (int)sdl_opengl.actual_frame_count++,
+                     (unsigned long long)sdl_opengl.context_generation))
         return;
 
     PrepareOpenGLPresentationState(layout, viewport);
@@ -1867,7 +1905,7 @@ static void FinishOpenGLPresentation(const char *source)
     if (mod_render_active)
         DOSBoxPython_InvokeOpenGLInitCallback(mod_state);
 
-    if (mod_render_view_mode != MOD_RENDER_VIEW_GAME_ONLY)
+    if (mod_render_view_mode != MOD_RENDER_VIEW_GAME_ONLY || NativeCrtLetterboxes())
         ClearOpenGLBackbuffer();
 
     CheckManagement();
@@ -2117,6 +2155,7 @@ void OUTPUT_OPENGL_EndUpdate(const uint16_t *changedLines)
 
 void OUTPUT_OPENGL_Shutdown()
 {
+	RA_GLSL_Release();
 	MOD_SetFramePacingViewEligible(false);
 	if (sdl_opengl.pixel_buffer_object)
 	{

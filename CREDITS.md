@@ -105,3 +105,15 @@ MAME CHD support (Romain Tisserand; BSD 3-clause) src/libs/libchdr/*
 Game Link IPC protocol (David Walters, ported by Jörg Walter; GPLv2+) src/gamelink/* src/output/output_gamelink*
 
 passthroughio library, port I/O to/from the host system (Daniël Hörchner; GPLv2+) src/libs/passthroughio/*
+
+Hyllian's CRT GLSL shader (Hyllian; MIT) contrib/glshaders/crt/shaders/hyllian/crt-hyllian.glsl
+
+Phosphor mask weights in Hyllian's CRT shader (hunterk; public domain) contrib/glshaders/crt/shaders/hyllian/crt-hyllian.glsl
+
+CRT-Guest-Dr-Venom GLSL shaders (guest(r), Dr. Venom; GPL-2+) contrib/glshaders/crt/shaders/guest/*
+
+Curvature code in CRT-Guest-Dr-Venom (cgwg crt-geom; GPL) contrib/glshaders/crt/shaders/guest/crt-guest-dr-venom.glsl
+
+CRT LUT textures (torridgristle; attribution) contrib/glshaders/crt/shaders/guest/lut/*.png
+
+See contrib/glshaders/NOTICE for the libretro/glsl-shaders snapshot hash and the local .glslp edits.

@@ -388,6 +388,8 @@ if not exist "$(OutputPath)\shaders\" mkdir "$(OutputPath)\shaders"
 copy "$(SolutionDir)\..\contrib\windows\shaders\*.*" "$(OutputPath)\shaders\"
 if not exist "$(OutputPath)\glshaders\" mkdir "$(OutputPath)\glshaders"
 copy "$(SolutionDir)\..\contrib\glshaders\*.*" "$(OutputPath)\glshaders\"
+xcopy /E /I /Y "$(SolutionDir)\..\contrib\glshaders\crt" "$(OutputPath)\glshaders\crt\"
+xcopy /E /I /Y "$(SolutionDir)\..\contrib\glshaders\presets" "$(OutputPath)\glshaders\presets\"
 if not exist "$(OutputPath)\languages\" mkdir "$(OutputPath)\languages"
 for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "$(OutputPath)\languages\"</Command>
     </PostBuildEvent>
@@ -436,6 +438,8 @@ if not exist "$(OutputPath)\shaders\" mkdir "$(OutputPath)\shaders"
 copy "$(SolutionDir)\..\contrib\windows\shaders\*.*" "$(OutputPath)\shaders\"
 if not exist "$(OutputPath)\glshaders\" mkdir "$(OutputPath)\glshaders"
 copy "$(SolutionDir)\..\contrib\glshaders\*.*" "$(OutputPath)\glshaders\"
+xcopy /E /I /Y "$(SolutionDir)\..\contrib\glshaders\crt" "$(OutputPath)\glshaders\crt\"
+xcopy /E /I /Y "$(SolutionDir)\..\contrib\glshaders\presets" "$(OutputPath)\glshaders\presets\"
 if not exist "$(OutputPath)\languages\" mkdir "$(OutputPath)\languages"
 for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "$(OutputPath)\languages\"</Command>
     </PostBuildEvent>
@@ -480,6 +484,8 @@ if not exist "$(OutputPath)\shaders\" mkdir "$(OutputPath)\shaders"
 copy "$(SolutionDir)\..\contrib\windows\shaders\*.*" "$(OutputPath)\shaders\"
 if not exist "$(OutputPath)\glshaders\" mkdir "$(OutputPath)\glshaders"
 copy "$(SolutionDir)\..\contrib\glshaders\*.*" "$(OutputPath)\glshaders\"
+xcopy /E /I /Y "$(SolutionDir)\..\contrib\glshaders\crt" "$(OutputPath)\glshaders\crt\"
+xcopy /E /I /Y "$(SolutionDir)\..\contrib\glshaders\presets" "$(OutputPath)\glshaders\presets\"
 if not exist "$(OutputPath)\languages\" mkdir "$(OutputPath)\languages"
 for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "$(OutputPath)\languages\"</Command>
       <Message>
@@ -524,6 +530,8 @@ if not exist "$(OutputPath)\shaders\" mkdir "$(OutputPath)\shaders"
 copy "$(SolutionDir)\..\contrib\windows\shaders\*.*" "$(OutputPath)\shaders\"
 if not exist "$(OutputPath)\glshaders\" mkdir "$(OutputPath)\glshaders"
 copy "$(SolutionDir)\..\contrib\glshaders\*.*" "$(OutputPath)\glshaders\"
+xcopy /E /I /Y "$(SolutionDir)\..\contrib\glshaders\crt" "$(OutputPath)\glshaders\crt\"
+xcopy /E /I /Y "$(SolutionDir)\..\contrib\glshaders\presets" "$(OutputPath)\glshaders\presets\"
 if not exist "$(OutputPath)\languages\" mkdir "$(OutputPath)\languages"
 for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "$(OutputPath)\languages\"</Command>
       <Message>
@@ -568,6 +576,8 @@ if not exist "$(OutputPath)\shaders\" mkdir "$(OutputPath)\shaders"
 copy "$(SolutionDir)\..\contrib\windows\shaders\*.*" "$(OutputPath)\shaders\"
 if not exist "$(OutputPath)\glshaders\" mkdir "$(OutputPath)\glshaders"
 copy "$(SolutionDir)\..\contrib\glshaders\*.*" "$(OutputPath)\glshaders\"
+xcopy /E /I /Y "$(SolutionDir)\..\contrib\glshaders\crt" "$(OutputPath)\glshaders\crt\"
+xcopy /E /I /Y "$(SolutionDir)\..\contrib\glshaders\presets" "$(OutputPath)\glshaders\presets\"
 if not exist "$(OutputPath)\languages\" mkdir "$(OutputPath)\languages"
 for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "$(OutputPath)\languages\"</Command>
       <Message>
@@ -615,6 +625,8 @@ if not exist "$(OutputPath)\shaders\" mkdir "$(OutputPath)\shaders"
 copy "$(SolutionDir)\..\contrib\windows\shaders\*.*" "$(OutputPath)\shaders\"
 if not exist "$(OutputPath)\glshaders\" mkdir "$(OutputPath)\glshaders"
 copy "$(SolutionDir)\..\contrib\glshaders\*.*" "$(OutputPath)\glshaders\"
+xcopy /E /I /Y "$(SolutionDir)\..\contrib\glshaders\crt" "$(OutputPath)\glshaders\crt\"
+xcopy /E /I /Y "$(SolutionDir)\..\contrib\glshaders\presets" "$(OutputPath)\glshaders\presets\"
 if not exist "$(OutputPath)\languages\" mkdir "$(OutputPath)\languages"
 for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "$(OutputPath)\languages\"</Command>
       <Message>
@@ -659,6 +671,8 @@ if not exist "$(OutputPath)\shaders\" mkdir "$(OutputPath)\shaders"
 copy "$(SolutionDir)\..\contrib\windows\shaders\*.*" "$(OutputPath)\shaders\"
 if not exist "$(OutputPath)\glshaders\" mkdir "$(OutputPath)\glshaders"
 copy "$(SolutionDir)\..\contrib\glshaders\*.*" "$(OutputPath)\glshaders\"
+xcopy /E /I /Y "$(SolutionDir)\..\contrib\glshaders\crt" "$(OutputPath)\glshaders\crt\"
+xcopy /E /I /Y "$(SolutionDir)\..\contrib\glshaders\presets" "$(OutputPath)\glshaders\presets\"
 if not exist "$(OutputPath)\languages\" mkdir "$(OutputPath)\languages"
 for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "$(OutputPath)\languages\"</Command>
       <Message>
@@ -703,6 +717,8 @@ if not exist "$(OutputPath)\shaders\" mkdir "$(OutputPath)\shaders"
 copy "$(SolutionDir)\..\contrib\windows\shaders\*.*" "$(OutputPath)\shaders\"
 if not exist "$(OutputPath)\glshaders\" mkdir "$(OutputPath)\glshaders"
 copy "$(SolutionDir)\..\contrib\glshaders\*.*" "$(OutputPath)\glshaders\"
+xcopy /E /I /Y "$(SolutionDir)\..\contrib\glshaders\crt" "$(OutputPath)\glshaders\crt\"
+xcopy /E /I /Y "$(SolutionDir)\..\contrib\glshaders\presets" "$(OutputPath)\glshaders\presets\"
 if not exist "$(OutputPath)\languages\" mkdir "$(OutputPath)\languages"
 for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "$(OutputPath)\languages\"</Command>
       <Message>
@@ -754,6 +770,8 @@ if not exist "$(OutputPath)\shaders\" mkdir "$(OutputPath)\shaders"
 copy "$(SolutionDir)\..\contrib\windows\shaders\*.*" "$(OutputPath)\shaders\"
 if not exist "$(OutputPath)\glshaders\" mkdir "$(OutputPath)\glshaders"
 copy "$(SolutionDir)\..\contrib\glshaders\*.*" "$(OutputPath)\glshaders\"
+xcopy /E /I /Y "$(SolutionDir)\..\contrib\glshaders\crt" "$(OutputPath)\glshaders\crt\"
+xcopy /E /I /Y "$(SolutionDir)\..\contrib\glshaders\presets" "$(OutputPath)\glshaders\presets\"
 if not exist "$(OutputPath)\languages\" mkdir "$(OutputPath)\languages"
 for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "$(OutputPath)\languages\"</Command>
     </PostBuildEvent>
@@ -803,6 +821,8 @@ if not exist "$(OutputPath)\shaders\" mkdir "$(OutputPath)\shaders"
 copy "$(SolutionDir)\..\contrib\windows\shaders\*.*" "$(OutputPath)\shaders\"
 if not exist "$(OutputPath)\glshaders\" mkdir "$(OutputPath)\glshaders"
 copy "$(SolutionDir)\..\contrib\glshaders\*.*" "$(OutputPath)\glshaders\"
+xcopy /E /I /Y "$(SolutionDir)\..\contrib\glshaders\crt" "$(OutputPath)\glshaders\crt\"
+xcopy /E /I /Y "$(SolutionDir)\..\contrib\glshaders\presets" "$(OutputPath)\glshaders\presets\"
 if not exist "$(OutputPath)\languages\" mkdir "$(OutputPath)\languages"
 for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "$(OutputPath)\languages\"</Command>
     </PostBuildEvent>
@@ -848,6 +868,8 @@ if not exist "$(OutputPath)\shaders\" mkdir "$(OutputPath)\shaders"
 copy "$(SolutionDir)\..\contrib\windows\shaders\*.*" "$(OutputPath)\shaders\"
 if not exist "$(OutputPath)\glshaders\" mkdir "$(OutputPath)\glshaders"
 copy "$(SolutionDir)\..\contrib\glshaders\*.*" "$(OutputPath)\glshaders\"
+xcopy /E /I /Y "$(SolutionDir)\..\contrib\glshaders\crt" "$(OutputPath)\glshaders\crt\"
+xcopy /E /I /Y "$(SolutionDir)\..\contrib\glshaders\presets" "$(OutputPath)\glshaders\presets\"
 if not exist "$(OutputPath)\languages\" mkdir "$(OutputPath)\languages"
 for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "$(OutputPath)\languages\"</Command>
       <Message>
@@ -893,6 +915,8 @@ if not exist "$(OutputPath)\shaders\" mkdir "$(OutputPath)\shaders"
 copy "$(SolutionDir)\..\contrib\windows\shaders\*.*" "$(OutputPath)\shaders\"
 if not exist "$(OutputPath)\glshaders\" mkdir "$(OutputPath)\glshaders"
 copy "$(SolutionDir)\..\contrib\glshaders\*.*" "$(OutputPath)\glshaders\"
+xcopy /E /I /Y "$(SolutionDir)\..\contrib\glshaders\crt" "$(OutputPath)\glshaders\crt\"
+xcopy /E /I /Y "$(SolutionDir)\..\contrib\glshaders\presets" "$(OutputPath)\glshaders\presets\"
 if not exist "$(OutputPath)\languages\" mkdir "$(OutputPath)\languages"
 for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "$(OutputPath)\languages\"</Command>
       <Message>
@@ -938,6 +962,8 @@ if not exist "$(OutputPath)\shaders\" mkdir "$(OutputPath)\shaders"
 copy "$(SolutionDir)\..\contrib\windows\shaders\*.*" "$(OutputPath)\shaders\"
 if not exist "$(OutputPath)\glshaders\" mkdir "$(OutputPath)\glshaders"
 copy "$(SolutionDir)\..\contrib\glshaders\*.*" "$(OutputPath)\glshaders\"
+xcopy /E /I /Y "$(SolutionDir)\..\contrib\glshaders\crt" "$(OutputPath)\glshaders\crt\"
+xcopy /E /I /Y "$(SolutionDir)\..\contrib\glshaders\presets" "$(OutputPath)\glshaders\presets\"
 if not exist "$(OutputPath)\languages\" mkdir "$(OutputPath)\languages"
 for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "$(OutputPath)\languages\"</Command>
       <Message>
@@ -986,6 +1012,8 @@ if not exist "$(OutputPath)\shaders\" mkdir "$(OutputPath)\shaders"
 copy "$(SolutionDir)\..\contrib\windows\shaders\*.*" "$(OutputPath)\shaders\"
 if not exist "$(OutputPath)\glshaders\" mkdir "$(OutputPath)\glshaders"
 copy "$(SolutionDir)\..\contrib\glshaders\*.*" "$(OutputPath)\glshaders\"
+xcopy /E /I /Y "$(SolutionDir)\..\contrib\glshaders\crt" "$(OutputPath)\glshaders\crt\"
+xcopy /E /I /Y "$(SolutionDir)\..\contrib\glshaders\presets" "$(OutputPath)\glshaders\presets\"
 if not exist "$(OutputPath)\languages\" mkdir "$(OutputPath)\languages"
 for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "$(OutputPath)\languages\"</Command>
       <Message>
@@ -1031,6 +1059,8 @@ if not exist "$(OutputPath)\shaders\" mkdir "$(OutputPath)\shaders"
 copy "$(SolutionDir)\..\contrib\windows\shaders\*.*" "$(OutputPath)\shaders\"
 if not exist "$(OutputPath)\glshaders\" mkdir "$(OutputPath)\glshaders"
 copy "$(SolutionDir)\..\contrib\glshaders\*.*" "$(OutputPath)\glshaders\"
+xcopy /E /I /Y "$(SolutionDir)\..\contrib\glshaders\crt" "$(OutputPath)\glshaders\crt\"
+xcopy /E /I /Y "$(SolutionDir)\..\contrib\glshaders\presets" "$(OutputPath)\glshaders\presets\"
 if not exist "$(OutputPath)\languages\" mkdir "$(OutputPath)\languages"
 for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "$(OutputPath)\languages\"</Command>
       <Message>
@@ -1076,6 +1106,8 @@ if not exist "$(OutputPath)\shaders\" mkdir "$(OutputPath)\shaders"
 copy "$(SolutionDir)\..\contrib\windows\shaders\*.*" "$(OutputPath)\shaders\"
 if not exist "$(OutputPath)\glshaders\" mkdir "$(OutputPath)\glshaders"
 copy "$(SolutionDir)\..\contrib\glshaders\*.*" "$(OutputPath)\glshaders\"
+xcopy /E /I /Y "$(SolutionDir)\..\contrib\glshaders\crt" "$(OutputPath)\glshaders\crt\"
+xcopy /E /I /Y "$(SolutionDir)\..\contrib\glshaders\presets" "$(OutputPath)\glshaders\presets\"
 if not exist "$(OutputPath)\languages\" mkdir "$(OutputPath)\languages"
 for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "$(OutputPath)\languages\"</Command>
       <Message>
@@ -1563,6 +1595,7 @@ for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "
     <ClCompile Include="..\src\output\output_direct3d11.cpp" />
     <ClCompile Include="..\src\output\output_gamelink.cpp" />
     <ClCompile Include="..\src\output\output_opengl.cpp" />
+    <ClCompile Include="..\src\output\ra_glsl.cpp" />
     <ClCompile Include="..\src\output\output_surface.cpp" />
     <ClCompile Include="..\src\output\output_tools.cpp" />
     <ClCompile Include="..\src\output\output_tools_xbrz.cpp" />
@@ -1931,6 +1964,7 @@ for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "
     <ClInclude Include="..\src\output\output_direct3d11.h" />
     <ClInclude Include="..\src\output\output_gamelink.h" />
     <ClInclude Include="..\src\output\output_opengl.h" />
+    <ClInclude Include="..\src\output\ra_glsl.h" />
     <ClInclude Include="..\src\output\output_surface.h" />
     <ClInclude Include="..\src\output\output_tools.h" />
     <ClInclude Include="..\src\output\output_tools_xbrz.h" />

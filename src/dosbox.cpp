@@ -2340,7 +2340,8 @@ void DOSBOX_SetupConfigSections(void) {
     Pstring->Set_help("Path to GLSL shader source to use with OpenGL output (\"none\" to disable, or \"default\" for default shader).\n"
             "Can be either an absolute path, a file in the \"glshaders\" subdirectory of the DOSBox-X configuration directory, "
             "or one of the built-in shaders (e.g. \"sharp\" for the pixel-perfect scaling mode):\n"
-            "advinterp2x, advinterp3x, advmame2x, advmame3x, rgb2x, rgb3x, scan2x, scan3x, tv2x, tv3x, sharp.");
+            "advinterp2x, advinterp3x, advmame2x, advmame3x, rgb2x, rgb3x, scan2x, scan3x, tv2x, tv3x, sharp.\n"
+            "RetroArch GLSL presets (.glslp) are also accepted. Use output=openglnb and a path such as crt/crt-hyllian.");
     Pstring->SetBasic(true);
 
     Pmulti = secprop->Add_multi("pixelshader",Property::Changeable::Always," ");

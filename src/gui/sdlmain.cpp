@@ -188,6 +188,9 @@ char* revert_escape_newlines(const char* aMessage);
 #include <output/output_direct3d.h>
 #include <dosbox_python.h>
 #include <output/output_opengl.h>
+#if C_OPENGL
+#include <output/ra_glsl.h>
+#endif
 #include <output/output_surface.h>
 #include <output/output_tools.h>
 #include <output/output_ttf.h>
@@ -3308,6 +3311,48 @@ static void ToggleModRenderSuppressedComparisonView(bool pressed)
 #endif
 }
 
+#if C_OPENGL
+extern std::string LoadGLShader(Section_prop * section);
+
+static void CycleNativeCrtPreset(bool pressed, int delta)
+{
+    if (!pressed)
+        return;
+    if (control == NULL)
+        return;
+
+    Section_prop *section = static_cast<Section_prop *>(control->GetSection("render"));
+    if (!section)
+        return;
+
+    Prop_path *sh = section->Get_path("glshader");
+    const std::string current = sh ? (std::string)sh->GetValue() : std::string();
+    std::string next;
+    if (!RA_GLSL_CyclePreset(current, delta, next))
+        return;
+
+    const bool had_preset = RA_GLSL_HasPreset();
+    SetVal("render", "glshader", next);
+    LoadGLShader(section);
+    /* Stay on the current GL context. Recreating it (GFX_ForceRedrawScreen)
+     * also drops the enhanced-renderer resources. Only reset when enabling or
+     * disabling a preset, because that changes native aspect-fit letterboxing. */
+    if (had_preset != RA_GLSL_HasPreset())
+        GFX_ForceRedrawScreen();
+    LOG_MSG("CRT preset: %s", next.c_str());
+}
+
+static void CycleNativeCrtPresetPrev(bool pressed)
+{
+    CycleNativeCrtPreset(pressed, -1);
+}
+
+static void CycleNativeCrtPresetNext(bool pressed)
+{
+    CycleNativeCrtPreset(pressed, 1);
+}
+#endif
+
 void GFX_SwitchLazyFullscreen(bool lazy) {
     sdl.desktop.lazy_fullscreen=lazy;
     sdl.desktop.lazy_fullscreen_req=false;
@@ -4203,6 +4248,15 @@ static void GUI_StartUp() {
                           MMOD1 | MMOD2, "modrendercmpoff",
                           "Toggle suppressed side-by-side comparison", &item);
         item->set_text("Toggle suppressed side-by-side comparison");
+
+#if C_OPENGL
+        MAPPER_AddHandler(&CycleNativeCrtPresetPrev, MK_lbracket, MMOD1,
+                          "crtcycleprev", "Previous CRT preset", &item);
+        item->set_text("Previous CRT preset");
+        MAPPER_AddHandler(&CycleNativeCrtPresetNext, MK_rbracket, MMOD1,
+                          "crtcyclenext", "Next CRT preset", &item);
+        item->set_text("Next CRT preset");
+#endif
     }
 
 #if defined(USE_TTF)

@@ -49,3 +49,19 @@ Thanks to [Delfino Furioso](https://www.vogons.org/viewtopic.php?f=32&t=72697) f
 - geom as a 'jack of all trades' for all resolutions
 
 The tweaked versions mainly reduce the curvature effect and brighten the image.
+
+# RetroArch GLSL presets (.glslp)
+
+DOSBox-X can also load a small set of RetroArch GLSL CRT presets for native
+OpenGL presentation. Set `output = openglnb` and `glshader` to one of:
+
+    crt/crt-hyllian
+    crt/crt-guest-dr-venom
+    presets/crt-guest-dr-venom-kurozumi
+    presets/crt-guest-dr-venom-stock
+
+These run on the native VGA blit. Ctrl+[ and Ctrl+] cycle `.glslp` files from
+the executable-relative `glshaders` directory. Author and license information
+is in `NOTICE`. The shaders come from https://github.com/libretro/glsl-shaders
+(snapshot 2b2c5ee); Hyllian's CRT shader is MIT, Guest Dr. Venom is GPL-2+,
+and the LUT PNGs are attributed to torridgristle.

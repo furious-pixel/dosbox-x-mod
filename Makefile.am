@@ -32,7 +32,8 @@ dosbox-x.app: $(MACOS_BINARIES) contrib/macos/dosbox.icns src/tool/mach-o-matic
 	cp -v contrib/fonts/Nouveau_IBM.ttf dosbox-x.app/Contents/Resources/Nouveau_IBM.ttf
 	cp -v contrib/fonts/SarasaGothicFixed.ttf dosbox-x.app/Contents/Resources/SarasaGothicFixed.ttf
 	cp -v contrib/windows/installer/drivez_readme.txt dosbox-x.app/Contents/Resources/drivez/readme.txt
-	cp -v contrib/glshaders/* dosbox-x.app/Contents/Resources/glshaders/
+	cp -v contrib/glshaders/*.* contrib/glshaders/NOTICE dosbox-x.app/Contents/Resources/glshaders/
+	cp -R contrib/glshaders/crt contrib/glshaders/presets dosbox-x.app/Contents/Resources/glshaders/
 	cp -v contrib/translations/*/*.lng dosbox-x.app/Contents/Resources/languages/
 	cp -v dosbox-x.reference.conf dosbox-x.app/Contents/Resources/
 	cp -v dosbox-x.reference.full.conf dosbox-x.app/Contents/Resources/
@@ -154,6 +155,8 @@ install: src/dosbox-x
 	install -m 644 $(srcdir)/contrib/fonts/SarasaGothicFixed.ttf $(DESTDIR)$(prefix)/share/dosbox-x
 	install -m 644 $(srcdir)/contrib/windows/installer/drivez_readme.txt $(DESTDIR)$(prefix)/share/dosbox-x/drivez/readme.txt
 	install -m 644 $(srcdir)/contrib/glshaders/*.glsl $(DESTDIR)$(prefix)/share/dosbox-x/glshaders
+	install -m 644 $(srcdir)/contrib/glshaders/NOTICE $(DESTDIR)$(prefix)/share/dosbox-x/glshaders
+	cp -R $(srcdir)/contrib/glshaders/crt $(srcdir)/contrib/glshaders/presets $(DESTDIR)$(prefix)/share/dosbox-x/glshaders/
 	install -m 644 $(srcdir)/contrib/translations/*/*.lng $(DESTDIR)$(prefix)/share/dosbox-x/languages
 	mkdir -p $(DESTDIR)$(prefix)/share/icons/hicolor/scalable/apps
 	install -m 644 $(srcdir)/contrib/icons/dosbox-x.svg $(DESTDIR)$(prefix)/share/icons/hicolor/scalable/apps/dosbox-x.svg

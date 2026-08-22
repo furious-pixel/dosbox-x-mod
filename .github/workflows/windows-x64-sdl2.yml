@@ -24,6 +24,11 @@ jobs:
       - name: Prepare build timestamp
         shell: bash
         run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "package_stem=dosbox-x-windows-x64-sdl2-${GITHUB_REF_NAME}" >> $GITHUB_ENV
+          else
+            echo "package_stem=dosbox-x-windows-x64-sdl2-$(echo ${GITHUB_SHA} | cut -c1-7)" >> $GITHUB_ENV
+          fi
           echo "timestamp=`git show -s --format=%at | xargs -I# date -d @# +%Y%m%d%H%M%S`" >> $GITHUB_ENV
           export shortsha=`echo ${GITHUB_SHA} | cut -c1-7`
           export copyrightyear=`git show -s --format=%at | xargs -I# date -d @# +'%Y'`
@@ -64,14 +69,15 @@ jobs:
           cp -R "$top/contrib/glshaders/crt" "$top/contrib/glshaders/presets" "$dest/glshaders/"
           cp $top/contrib/translations/*/*.lng "$dest/languages/"
           cd "$dest"
-          "$top/vs/tool/zip.exe" -r -9 "$top/dosbox-x-windows-x64-sdl2-${{ env.timestamp }}.zip" *
+          "$top/vs/tool/zip.exe" -r -9 "$top/${{ env.package_stem }}.zip" *
       - name: Upload package
         uses: actions/upload-artifact@v6.0.0
         with:
-          name: dosbox-x-windows-x64-sdl2-${{ env.timestamp }}
-          path: ${{ github.workspace }}/dosbox-x-windows-x64-sdl2-${{ env.timestamp }}.zip
+          name: ${{ env.package_stem }}
+          path: ${{ github.workspace }}/${{ env.package_stem }}.zip
       - name: Attach zip to GitHub Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: dosbox-x-windows-x64-sdl2-${{ env.timestamp }}.zip
+          files: ${{ env.package_stem }}.zip
+          prerelease: true

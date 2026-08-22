@@ -1,7 +1,7 @@
 name: HX-DOS build
+# Automatic push/PR builds disabled. This fork ships VS x64 SDL2 only
+# (windows-x64-sdl2.yml). Keep workflow_dispatch for later reuse.
 on:
-  push:
-  pull_request:
   workflow_dispatch:
 permissions:
   contents: read

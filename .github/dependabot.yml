@@ -1,6 +1,4 @@
+# Dependabot disabled: weekly Actions-version PRs are noise for this fork.
 version: 2
-updates:
-- package-ecosystem: "github-actions"
-  directory: "/"
-  schedule:
-      interval: "weekly"
+updates: []
+

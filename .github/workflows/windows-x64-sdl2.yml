@@ -1,0 +1,77 @@
+# The only automatic build for this fork: Visual Studio x64 Release SDL2.
+name: Windows x64 SDL2
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    permissions:
+      contents: write
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v6
+      - uses: microsoft/setup-msbuild@v2
+      - name: Prepare build timestamp
+        shell: bash
+        run: |
+          echo "timestamp=`git show -s --format=%at | xargs -I# date -d @# +%Y%m%d%H%M%S`" >> $GITHUB_ENV
+          export shortsha=`echo ${GITHUB_SHA} | cut -c1-7`
+          export copyrightyear=`git show -s --format=%at | xargs -I# date -d @# +'%Y'`
+          export updatestr=`git show -s --format=%at | xargs -I# date -d @# +'%b %d, %Y %I:%M:%S%P'`
+          echo '/* auto generated */' > include/build_timestamp.h
+          echo "#define UPDATED_STR \"${updatestr}\"" >> include/build_timestamp.h
+          echo "#define GIT_COMMIT_HASH \"${shortsha}\""  >> include/build_timestamp.h
+          echo "#define COPYRIGHT_END_YEAR \"${copyrightyear}\"" >> include/build_timestamp.h
+          cat include/build_timestamp.h
+      - name: Build Visual Studio x64 SDL2
+        shell: pwsh
+        run: |
+          msbuild -m vs/dosbox-x.sln -t:dosbox-x:Rebuild -p:Configuration="Release SDL2" -p:Platform=x64
+          if (-not(Test-Path -Path 'bin\x64\Release SDL2\dosbox-x.exe' -PathType Leaf)) { exit 1 }
+          contrib\windows\installer\PatchPE.exe 'bin\x64\Release SDL2\dosbox-x.exe'
+      - name: Package
+        shell: bash
+        run: |
+          top=`pwd`
+          dest=$top/package
+          mkdir -p "$dest/drivez" "$dest/glshaders" "$dest/languages"
+          cp "$top/bin/x64/Release SDL2/dosbox-x.exe" "$dest/dosbox-x.exe"
+          cp "$top/COPYING" "$dest/COPYING"
+          cp "$top/CHANGELOG" "$dest/CHANGELOG.txt"
+          cp "$top/README.md" "$dest/README.md"
+          cp "$top/dosbox-x.reference.conf" "$dest/dosbox-x.reference.conf"
+          cp "$top/dosbox-x.reference.full.conf" "$dest/dosbox-x.reference.full.conf"
+          cp "$top/dosbox-x.reference.conf" "$dest/dosbox-x.conf"
+          cp "$top/contrib/windows/installer/inpoutx64.dll" "$dest/inpoutx64.dll"
+          cp "$top/contrib/fonts/FREECG98.BMP" "$dest/FREECG98.BMP"
+          cp $top/contrib/fonts/wqy_1?pt.bdf "$dest/"
+          cp "$top/contrib/fonts/Nouveau_IBM.ttf" "$dest/Nouveau_IBM.ttf"
+          cp "$top/contrib/fonts/SarasaGothicFixed.ttf" "$dest/SarasaGothicFixed.ttf"
+          cp "$top/contrib/windows/installer/drivez_readme.txt" "$dest/drivez/readme.txt"
+          cp $top/contrib/glshaders/*.glsl "$dest/glshaders/"
+          cp "$top/contrib/glshaders/NOTICE" "$dest/glshaders/NOTICE"
+          cp "$top/contrib/glshaders/glshaders.txt" "$dest/glshaders/glshaders.txt"
+          cp -R "$top/contrib/glshaders/crt" "$top/contrib/glshaders/presets" "$dest/glshaders/"
+          cp $top/contrib/translations/*/*.lng "$dest/languages/"
+          cd "$dest"
+          "$top/vs/tool/zip.exe" -r -9 "$top/dosbox-x-windows-x64-sdl2-${{ env.timestamp }}.zip" *
+      - name: Upload package
+        uses: actions/upload-artifact@v6.0.0
+        with:
+          name: dosbox-x-windows-x64-sdl2-${{ env.timestamp }}
+          path: ${{ github.workspace }}/dosbox-x-windows-x64-sdl2-${{ env.timestamp }}.zip
+      - name: Attach zip to GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: dosbox-x-windows-x64-sdl2-${{ env.timestamp }}.zip

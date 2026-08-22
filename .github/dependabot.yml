@@ -1,4 +1,9 @@
-# Dependabot disabled: weekly Actions-version PRs are noise for this fork.
+# Dependabot version PRs are disabled (open-pull-requests-limit: 0).
+# An empty updates list is invalid; keep one ecosystem entry so the file parses.
 version: 2
-updates: []
-
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 0

@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Official DOSBox-X issues
+    url: https://github.com/joncampbell123/dosbox-x/issues
+    about: Vanilla emulator bugs and features belong on the upstream repository, not this experimental fork.

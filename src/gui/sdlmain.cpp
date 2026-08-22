@@ -1149,34 +1149,17 @@ void GFX_SetTitle(int32_t cycles, int frameskip, Bits timing, bool paused) {
     if (!menu.hidecycles) {
         char *p = title + strlen(title); // append to end of string
 #if C_OPENGL
+        /* Unmodded: stock DOSBox-X FPS from changed VGA scanlines (frames).
+         * Mod renderer: render FPS is notify_frame_ready only, not frame_start
+         * and not VGA diffs. present FPS is host swaps. */
         if ((sdl.desktop.want_type == SCREEN_OPENGL ||
              sdl.desktop.type == SCREEN_OPENGL) &&
-            strcmp(OUTPUT_OPENGL_GetModRenderViewModeTitleLabel(), "orig") != 0) {
+            OUTPUT_OPENGL_ModRendererAvailable()) {
             OpenGLModPresentationMetrics metrics = {};
             OUTPUT_OPENGL_GetModPresentationMetrics(&metrics);
-            sprintf(p, ", native %u FPS, mod %u FPS, present %u FPS",
-                    metrics.native_fps,
+            sprintf(p, ", render %u FPS, present %u FPS",
                     metrics.mod_fps,
                     metrics.presentation_fps);
-            if (metrics.latency_valid) {
-                p = title + strlen(title);
-                sprintf(p, ", latency %.1f/%.1f ms",
-                        metrics.average_latency_ms,
-                        metrics.maximum_latency_ms);
-            }
-            ModTimingSummary timing = {};
-            if (MOD_GetTimingSummary(&timing)) {
-                p = title + strlen(title);
-                sprintf(p, ", frame p99/max %.1f/%.1f ms",
-                        timing.frame_p99_ms,
-                        timing.frame_max_ms);
-                if (timing.present_max_ms > 0.0) {
-                    p = title + strlen(title);
-                    sprintf(p, ", cadence p99/max %.1f/%.1f ms",
-                            timing.present_p99_ms,
-                            timing.present_max_ms);
-                }
-            }
         } else
 #endif
             sprintf(p,", FPS %2d",(int)frames);

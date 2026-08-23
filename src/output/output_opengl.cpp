@@ -1331,6 +1331,13 @@ static bool IsModRenderSideBySideMode(const ModRenderViewMode mode)
            mode == MOD_RENDER_VIEW_SIDE_BY_SIDE_SUPPRESSED;
 }
 
+static bool UsesPixelPerfectNativeScaling(const ModRenderViewMode mode)
+{
+    // Side-by-side is a comparison view: keep the native pane unshaded and
+    // pixel-perfect regardless of the scaling selected for game-only output.
+    return IsModRenderSideBySideMode(mode);
+}
+
 static bool SetModRenderViewMode(const ModRenderViewMode mode,
                                  Bitu *target_width,
                                  Bitu *target_height)
@@ -1642,27 +1649,28 @@ static OpenGLPresentationLayout BuildOpenGLPresentationLayout(void)
         const uint32_t canvas_y =
                 (layout.backbuffer_height - presented_pane_height) / 2u;
 
-        SDL_Rect logical_game = {0, 0, (int)pane_width, (int)pane_height};
-        if (sdl_opengl.kind == GLPerfect) {
-            logical_game = FitOpenGLPPSourceToBounds((uint16_t)pane_width,
-                                                     (uint16_t)pane_height);
+        SDL_Rect presented_game = {
+                0,
+                0,
+                (int)presented_pane_width,
+                (int)presented_pane_height};
+        if (UsesPixelPerfectNativeScaling(mod_render_view_mode)) {
+            presented_game = FitOpenGLPPSourceToBounds(
+                    (uint16_t)presented_pane_width,
+                    (uint16_t)presented_pane_height);
         } else if (render.aspect || NativeCrtLetterboxes()) {
-            aspectCorrectFitClip(logical_game.w,
-                                 logical_game.h,
-                                 logical_game.x,
-                                 logical_game.y,
-                                 (int)pane_width,
-                                 (int)pane_height);
+            aspectCorrectFitClip(presented_game.w,
+                                 presented_game.h,
+                                 presented_game.x,
+                                 presented_game.y,
+                                 (int)presented_pane_width,
+                                 (int)presented_pane_height);
         }
 
-        layout.game.x = (GLint)(canvas_x + (uint32_t)std::lround(
-                (double)logical_game.x * canvas_scale));
-        layout.game.y = (GLint)(canvas_y + (uint32_t)std::lround(
-                (double)logical_game.y * canvas_scale));
-        layout.game.w = (GLsizei)std::max<uint32_t>(1u,
-                (uint32_t)std::lround((double)logical_game.w * canvas_scale));
-        layout.game.h = (GLsizei)std::max<uint32_t>(1u,
-                (uint32_t)std::lround((double)logical_game.h * canvas_scale));
+        layout.game.x = (GLint)(canvas_x + (uint32_t)presented_game.x);
+        layout.game.y = (GLint)(canvas_y + (uint32_t)presented_game.y);
+        layout.game.w = (GLsizei)std::max(1, presented_game.w);
+        layout.game.h = (GLsizei)std::max(1, presented_game.h);
 
         layout.mod.x = (GLint)(canvas_x + presented_pane_width);
         layout.mod.y = (GLint)canvas_y;

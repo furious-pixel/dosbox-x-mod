@@ -160,6 +160,7 @@ Bitu OUTPUT_OPENGL_SetSize();
 bool OUTPUT_OPENGL_StartUpdate(uint8_t* &pixels, Bitu &pitch);
 void OUTPUT_OPENGL_EndUpdate(const uint16_t *changedLines);
 bool OUTPUT_OPENGL_ModPresentationRequired(void);
+bool OUTPUT_OPENGL_CapturesPresentedScreenshot(void);
 void OUTPUT_OPENGL_PresentModFrame(void);
 bool OUTPUT_OPENGL_PresentReadyModFrame(void);
 bool OUTPUT_OPENGL_ModRendererAvailable(void);

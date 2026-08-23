@@ -8,6 +8,7 @@
 #include "dosbox_python.h"
 
 #include "control.h"
+#include "hardware.h"
 #include "joystick.h"
 #include "logging.h"
 #if C_OPENGL
@@ -440,6 +441,8 @@ static std::string build_mod_helper_bootstrap(void)
 		<< "class _DOSBoxOpenGL(object):\n"
 		<< "    def notify_frame_ready(self):\n"
 		<< "        return mod._notify_frame_ready()\n"
+		<< "    def capture_screenshot(self):\n"
+		<< "        return mod._capture_screenshot()\n"
 		<< "    def set_frame_pacing_suspended(self, suspended):\n"
 		<< "        return mod._set_frame_pacing_suspended(1 if suspended else 0)\n"
 		<< "    def set_continuous_presentation(self, active):\n"
@@ -1280,6 +1283,18 @@ static PyObject *py_notify_frame_ready(PyObject *, PyObject *args)
 	        static_cast<unsigned long long>(sequence));
 }
 
+static PyObject *py_capture_screenshot(PyObject *, PyObject *args)
+{
+	if (g_python.api.PyTuple_Size(args) != 0) {
+		set_python_error(g_python.api.PyExc_TypeError,
+		                 "_capture_screenshot expects no arguments");
+		return NULL;
+	}
+
+	CaptureState |= CAPTURE_IMAGE;
+	return g_python.api.PyLong_FromUnsignedLong(1ul);
+}
+
 static PyObject *py_set_frame_pacing_suspended(PyObject *, PyObject *args)
 {
 	if (g_python.api.PyTuple_Size(args) != 1) {
@@ -1980,6 +1995,9 @@ static bool ensure_mod_helper_module(void)
 	static PyMethodDef notify_frame_ready_method = {
 	        "_notify_frame_ready", py_notify_frame_ready,
 	        DOSBOX_PY_METH_VARARGS, NULL};
+	static PyMethodDef capture_screenshot_method = {
+	        "_capture_screenshot", py_capture_screenshot,
+	        DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef set_frame_pacing_suspended_method = {
 	        "_set_frame_pacing_suspended", py_set_frame_pacing_suspended,
 	        DOSBOX_PY_METH_VARARGS, NULL};
@@ -2050,6 +2068,8 @@ static bool ensure_mod_helper_module(void)
 	                            &get_modjoystick_axes_method) ||
 	    !attach_module_function(mod_module.get(), "_notify_frame_ready",
 	                            &notify_frame_ready_method) ||
+	    !attach_module_function(mod_module.get(), "_capture_screenshot",
+	                            &capture_screenshot_method) ||
 	    !attach_module_function(mod_module.get(), "_set_frame_pacing_suspended",
 	                            &set_frame_pacing_suspended_method) ||
 	    !attach_module_function(mod_module.get(), "_set_continuous_presentation",

@@ -491,6 +491,16 @@ void RENDER_EndUpdate( bool abort ) {
         GFX_EndUpdate(nullptr);
     }
     else {
+        const Bitu deferred_capture =
+#if C_OPENGL
+                (CaptureState & CAPTURE_IMAGE) &&
+                                OUTPUT_OPENGL_CapturesPresentedScreenshot()
+                        ? CAPTURE_IMAGE
+                        : 0;
+#else
+                0;
+#endif
+        CaptureState &= ~deferred_capture;
         if (GCC_UNLIKELY(CaptureState & (CAPTURE_IMAGE|CAPTURE_VIDEO))) {
             Bitu pitch, flags;
             flags = 0;
@@ -509,6 +519,7 @@ void RENDER_EndUpdate( bool abort ) {
             CAPTURE_AddImage( render.src.width, render.src.height, render.src.bpp, pitch,
                 flags, fps, (uint8_t*)scalerSourceCacheBuffer, (uint8_t*)&render.pal.rgb );
         }
+        CaptureState |= deferred_capture;
         if ( render.scale.outWrite) {
             GFX_EndUpdate( abort? NULL : Scaler_ChangedLines );
             render.frameskip.hadSkip[render.frameskip.index] = 0;

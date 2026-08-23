@@ -14,6 +14,7 @@ extern "C" {
 #include "control.h"
 #include "dosbox.h"
 #include "dosbox_python.h"
+#include "hardware.h"
 #include "logging.h"
 #include "menudef.h"
 #include "mod.h"
@@ -24,6 +25,7 @@ extern "C" {
 #include <output/ra_glsl.h>
 
 #include <algorithm>
+#include <vector>
 
 #include "sdlmain.h"
 #include "render.h"
@@ -1883,6 +1885,56 @@ static void DrainInactiveModRenderBuffers(const OpenGLPresentationLayout &layout
     }
 }
 
+static void CaptureOpenGLPresentation(
+        const OpenGLPresentationLayout &layout)
+{
+    if (!(CaptureState & CAPTURE_IMAGE) || layout.backbuffer_width == 0u ||
+        layout.backbuffer_height == 0u) {
+        return;
+    }
+
+    const Bitu width = (Bitu)layout.backbuffer_width;
+    const Bitu height = (Bitu)layout.backbuffer_height;
+    const Bitu pitch = width * 4u;
+    std::vector<uint8_t> pixels((size_t)pitch * (size_t)height);
+    std::vector<uint8_t> row((size_t)pitch);
+
+    if (dosbox_glBindFramebuffer)
+        dosbox_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (glBindBufferARB)
+        glBindBufferARB(GL_PIXEL_PACK_BUFFER_ARB, 0);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadBuffer(GL_BACK);
+    glReadPixels(0,
+                 0,
+                 (GLsizei)width,
+                 (GLsizei)height,
+                 GL_BGRA,
+                 GL_UNSIGNED_BYTE,
+                 pixels.data());
+
+    for (Bitu y = 0; y < height / 2u; ++y) {
+        uint8_t *top = pixels.data() + (size_t)y * (size_t)pitch;
+        uint8_t *bottom =
+                pixels.data() + (size_t)(height - 1u - y) * (size_t)pitch;
+        memcpy(row.data(), top, (size_t)pitch);
+        memcpy(top, bottom, (size_t)pitch);
+        memcpy(bottom, row.data(), (size_t)pitch);
+    }
+
+    const Bitu saved_capture_state = CaptureState;
+    CaptureState = CAPTURE_IMAGE;
+    CAPTURE_AddImage(width,
+                     height,
+                     32,
+                     pitch,
+                     0,
+                     render.src.fps,
+                     pixels.data(),
+                     nullptr);
+    CaptureState |= saved_capture_state & ~CAPTURE_IMAGE;
+}
+
 static void FinishOpenGLPresentation(const char *source)
 {
     // Guest-call execution re-enters the DOSBox loop without allowing Python
@@ -1928,6 +1980,7 @@ static void FinishOpenGLPresentation(const char *source)
     }
 
     RestoreOpenGLPresentationState(layout);
+    CaptureOpenGLPresentation(layout);
     const uint64_t swap_started = MOD_TimingBegin();
     SDL_GL_SwapBuffers();
     const uint64_t swap_ns = MOD_TimingEnd(MOD_TIMING_SWAP, swap_started);
@@ -1942,6 +1995,11 @@ static void FinishOpenGLPresentation(const char *source)
         DrainInactiveModRenderBuffers(layout);
 
     mod_render_was_active = mod_render_active;
+}
+
+bool OUTPUT_OPENGL_CapturesPresentedScreenshot(void)
+{
+    return mod_render_view_mode != MOD_RENDER_VIEW_GAME_ONLY;
 }
 
 bool OUTPUT_OPENGL_ModPresentationRequired(void)

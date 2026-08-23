@@ -2208,6 +2208,10 @@ void DOSBOX_SetupConfigSections(void) {
     Pint->Set_help("Pace supported mod-renderer-only gameplay at this frame rate. 0 disables pacing.");
     Pint->SetBasic(true);
 
+    Pbool = secprop->Add_bool("mod renderer host vsync",Property::Changeable::OnlyAtStart,false);
+    Pbool->Set_help("Synchronize OpenGL presentation to the host display without changing emulated VGA timing.");
+    Pbool->SetBasic(true);
+
     Pstring = secprop->Add_string("mod renderer start view",Property::Changeable::OnlyAtStart,"side-by-side");
     const char *modrenderstartviews[] = {"game-only", "mod-only", "side-by-side", 0};
     Pstring->Set_values(modrenderstartviews);

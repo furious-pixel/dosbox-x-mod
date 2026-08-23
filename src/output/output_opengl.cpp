@@ -136,6 +136,45 @@ struct ModPresentationMetricsState {
 
 static ModPresentationMetricsState mod_presentation_metrics = {};
 
+static bool GetConfiguredOpenGLHostVsync(void)
+{
+    const Section_prop *render_section = static_cast<const Section_prop *>(
+            control->GetSection("render"));
+    if (render_section &&
+        render_section->Get_bool("mod renderer host vsync")) {
+        return true;
+    }
+
+    const Section_prop *vsync_section = static_cast<const Section_prop *>(
+            control->GetSection("vsync"));
+    const char *vsync_mode = vsync_section ?
+            vsync_section->Get_string("vsyncmode") : nullptr;
+    return vsync_mode && !strcmp(vsync_mode, "host");
+}
+
+#if defined(C_SDL2)
+static void ConfigureOpenGLSwapInterval(const int requested)
+{
+    const int result = SDL_GL_SetSwapInterval(requested);
+    if (result != 0)
+        LOG_MSG("WARNING: SDL2 could not set OpenGL swap interval to %d: %s",
+                requested,
+                SDL_GetError());
+
+    const int active = SDL_GL_GetSwapInterval();
+    if (active != requested) {
+        LOG_MSG("WARNING: OpenGL swap interval requested=%d active=%d",
+                requested,
+                active);
+    }
+    else {
+        LOG_MSG("OpenGL swap interval requested=%d active=%d",
+                requested,
+                active);
+    }
+}
+#endif
+
 static ModRenderViewMode GetConfiguredModRenderStartView(void)
 {
     if (!DOSBoxPython_OpenGLRendererAvailable())
@@ -900,14 +939,11 @@ Bitu OUTPUT_OPENGL_SetSize()
     }
 
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-    Section_prop* sec = static_cast<Section_prop*>(control->GetSection("vsync"));
-    if (sec) {
-#if defined(C_SDL2)
-        SDL_GL_SetSwapInterval((!strcmp(sec->Get_string("vsyncmode"), "host")) ? 1 : 0);
-#elif SDL_VERSION_ATLEAST(1, 2, 11)
-        SDL_GL_SetAttribute(SDL_GL_SWAP_CONTROL, (!strcmp(sec->Get_string("vsyncmode"), "host")) ? 1 : 0);
+    const int requested_swap_interval =
+            GetConfiguredOpenGLHostVsync() ? 1 : 0;
+#if !defined(C_SDL2) && SDL_VERSION_ATLEAST(1, 2, 11)
+    SDL_GL_SetAttribute(SDL_GL_SWAP_CONTROL, requested_swap_interval);
 #endif
-    }
 
     // try 32 bits first then 16
 #if defined(C_SDL2)
@@ -920,6 +956,10 @@ Bitu OUTPUT_OPENGL_SetSize()
         LOG_MSG("SDL:OPENGL:Can't open drawing surface, are you running in 16bpp(or higher) mode?");
         return 0;
     }
+
+#if defined(C_SDL2)
+    ConfigureOpenGLSwapInterval(requested_swap_interval);
+#endif
 
     glFinish();
     glFlush();

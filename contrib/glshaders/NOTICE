@@ -19,6 +19,5 @@ crt/shaders/guest/lut/*.png | torridgristle (lut/README) | attribution only | ke
 Local .glslp edits (not upstream):
 - crt/crt-guest-dr-venom.glslp: interm=0, inter=800, warpX=0, warpY=0
 - presets/crt-guest-dr-venom-kurozumi.glslp: same interlace/warp overrides; beam_min=1.45; maskDark=0.55
-- presets/crt-guest-dr-venom-stock.glslp: rewritten as a full-res 480p Guest chain (not the upstream 240p stock preset)
 
 See CREDITS.md for the repository-wide borrowed-code list.

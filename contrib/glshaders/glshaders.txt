@@ -58,7 +58,6 @@ OpenGL presentation. Set `output = openglnb` and `glshader` to one of:
     crt/crt-hyllian
     crt/crt-guest-dr-venom
     presets/crt-guest-dr-venom-kurozumi
-    presets/crt-guest-dr-venom-stock
 
 These run on the native VGA blit. Ctrl+[ and Ctrl+] cycle `.glslp` files from
 the executable-relative `glshaders` directory. Author and license information

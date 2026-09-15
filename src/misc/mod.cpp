@@ -17,7 +17,9 @@
 #include <cstdarg>
 #include <cmath>
 #include <cstdio>
+#include <iterator>
 #include <limits>
+#include <numeric>
 #include <unordered_map>
 #include <vector>
 
@@ -148,12 +150,21 @@ struct ModFramePacingState {
 	uint64_t released_frames = 0;
 	uint64_t total_lateness_ns = 0;
 	uint64_t maximum_lateness_ns = 0;
+	uint64_t interval_released_frames = 0;
+	uint64_t interval_lateness_ns = 0;
+	uint64_t interval_maximum_lateness_ns = 0;
+	uint64_t missed_deadlines = 0;
+	uint64_t interval_missed_deadlines = 0;
 };
 
 static ModFramePacingState g_frame_pacing = {};
 
+static void timing_write_pacing_summary(bool final);
+
 static void reset_frame_pacing_runtime_state(void)
 {
+	if (g_frame_pacing.interval_released_frames > 0)
+		timing_write_pacing_summary(true);
 	g_frame_pacing.phase = ModFramePacingPhase::Inactive;
 	g_frame_pacing.waiting = false;
 	g_frame_pacing.continuous_presentation = false;
@@ -167,6 +178,11 @@ static void reset_frame_pacing_runtime_state(void)
 	g_frame_pacing.released_frames = 0;
 	g_frame_pacing.total_lateness_ns = 0;
 	g_frame_pacing.maximum_lateness_ns = 0;
+	g_frame_pacing.interval_released_frames = 0;
+	g_frame_pacing.interval_lateness_ns = 0;
+	g_frame_pacing.interval_maximum_lateness_ns = 0;
+	g_frame_pacing.missed_deadlines = 0;
+	g_frame_pacing.interval_missed_deadlines = 0;
 }
 
 static const size_t MOD_TIMING_HISTORY_CAPACITY = 256u;
@@ -177,30 +193,47 @@ static const double MOD_TIMING_SPIKE_THRESHOLD_MS = 25.0;
 struct ModTimingAccumulator {
 	std::array<uint64_t, MOD_TIMING_CATEGORY_COUNT> elapsed_ns = {};
 	std::array<uint64_t, MOD_TIMING_CATEGORY_COUNT> maximum_ns = {};
-	std::array<uint32_t, MOD_TIMING_CATEGORY_COUNT> calls = {};
-	uint64_t decoder_cycles = 0;
-	uint64_t decoder_max_slice_cycles = 0;
-	uint64_t decoder_slowest_elapsed_ns = 0;
-	uint64_t decoder_slowest_cycles = 0;
-	int64_t decoder_slowest_requested_cycles = 0;
-	int64_t decoder_slowest_cycle_max = 0;
-	bool decoder_slowest_auto_adjust = false;
-	uint32_t auto_cycle_adjustments = 0;
-	int64_t auto_cycle_max_before = 0;
-	int64_t auto_cycle_max_after = 0;
-	int32_t auto_ticks_added = 0;
-	int32_t auto_ticks_scheduled = 0;
-	int32_t auto_ticks_done = 0;
 	uint32_t native_frames = 0;
 	uint32_t ready_frames = 0;
 	uint32_t presentations = 0;
 	uint32_t new_mod_presentations = 0;
+	uint64_t frame_pacing_sleep_ns = 0;
 };
 
 struct ModTimingHistory {
 	std::array<double, MOD_TIMING_HISTORY_CAPACITY> values = {};
 	size_t count = 0;
 	size_t next = 0;
+};
+
+enum ModTimingSpikeCause {
+	MOD_TIMING_SPIKE_CPU = 0,
+	MOD_TIMING_SPIKE_PYTHON_HOOK,
+	MOD_TIMING_SPIKE_PIC,
+	MOD_TIMING_SPIKE_SAFE_POINT,
+	MOD_TIMING_SPIKE_GFX_EVENTS,
+	MOD_TIMING_SPIKE_TIMER,
+	MOD_TIMING_SPIKE_FRAME_PACING_SLEEP,
+	MOD_TIMING_SPIKE_TICK_OTHER,
+	MOD_TIMING_SPIKE_OTHER,
+	MOD_TIMING_SPIKE_CAUSE_COUNT,
+};
+
+struct ModTimingWindow {
+	uint64_t frames = 0;
+	uint64_t frame_total_ns = 0;
+	uint64_t present_samples = 0;
+	uint64_t present_total_ns = 0;
+	std::array<uint64_t, MOD_TIMING_CATEGORY_COUNT> category_total_ns = {};
+	std::array<uint64_t, MOD_TIMING_CATEGORY_COUNT> category_maximum_ns = {};
+	std::array<uint64_t, MOD_TIMING_CATEGORY_COUNT> category_maximum_call_ns = {};
+	std::array<uint64_t, MOD_TIMING_SPIKE_CAUSE_COUNT> spike_causes = {};
+	uint64_t other_total_ns = 0;
+	uint64_t other_maximum_ns = 0;
+	uint64_t frame_pacing_sleep_total_ns = 0;
+	uint64_t frame_pacing_sleep_maximum_ns = 0;
+	uint64_t worst_frame = 0;
+	uint64_t worst_frame_ns = 0;
 };
 
 struct ModTimingState {
@@ -210,16 +243,16 @@ struct ModTimingState {
 	uint64_t last_frame = 0;
 	uint64_t frame_spikes = 0;
 	uint64_t present_spikes = 0;
-	bool telemetry_log_previous_interval = false;
 	ModTimingAccumulator current = {};
 	ModTimingHistory frame_history = {};
 	ModTimingHistory present_history = {};
+	ModTimingWindow window = {};
 	ModTimingSummary summary = {};
 };
 
 static ModTimingState g_mod_timing = {};
 static FILE *g_mod_timing_log = NULL;
-// Keep ordinary sessions in memory so spike reporting never forces disk I/O.
+// Buffer the infrequent summaries so frame processing never forces disk I/O.
 static std::array<char, 1024u * 1024u> g_mod_timing_log_buffer = {};
 
 static uint64_t timing_now_ns(void)
@@ -317,29 +350,166 @@ static void close_mod_timing_log(void)
 	g_mod_timing_log = NULL;
 }
 
-static void format_recent_timing_history(const ModTimingHistory &history,
-	                                     char *output,
-	                                     const size_t output_size)
+static double timing_window_average_ms(const uint64_t total_ns,
+	                                    const uint64_t samples)
 {
-	if (!output || output_size == 0)
-		return;
-	output[0] = 0;
-	const size_t wanted = std::min<size_t>(8u, history.count);
-	const size_t start = (history.next + history.values.size() - wanted) %
-	                     history.values.size();
-	size_t used = 0;
-	for (size_t i = 0; i < wanted && used < output_size; ++i) {
-		const size_t index = (start + i) % history.values.size();
-		const int written = snprintf(output + used,
-		                             output_size - used,
-		                             "%s%.2f",
-		                             i == 0 ? "" : ",",
-		                             history.values[index]);
-		if (written <= 0)
-			break;
-		used += std::min<size_t>(static_cast<size_t>(written),
-		                         output_size - used);
+	return samples > 0
+	               ? timing_ns_to_ms(total_ns) / static_cast<double>(samples)
+	               : 0.0;
+}
+
+static ModTimingSpikeCause timing_spike_cause(
+	        const ModTimingAccumulator &sample,
+	        const uint64_t other_ns)
+{
+	const uint64_t hook_ns = sample.elapsed_ns[MOD_TIMING_PYTHON_HOOK];
+	const uint64_t cpu_ns = sample.elapsed_ns[MOD_TIMING_CPU_DECODER] > hook_ns
+	                                ? sample.elapsed_ns[MOD_TIMING_CPU_DECODER] - hook_ns
+	                                : 0;
+	const uint64_t pacing_sleep_ns = sample.frame_pacing_sleep_ns;
+	const uint64_t tick_ns = sample.elapsed_ns[MOD_TIMING_TICK_CONTROL] >
+	                                 pacing_sleep_ns
+	                                 ? sample.elapsed_ns[MOD_TIMING_TICK_CONTROL] -
+	                                           pacing_sleep_ns
+	                                 : 0;
+	const std::array<uint64_t, MOD_TIMING_SPIKE_CAUSE_COUNT> durations = {
+	        cpu_ns,
+	        hook_ns,
+	        sample.elapsed_ns[MOD_TIMING_PIC_EVENT],
+	        sample.elapsed_ns[MOD_TIMING_SAFE_POINT],
+	        sample.elapsed_ns[MOD_TIMING_GFX_EVENTS],
+	        sample.elapsed_ns[MOD_TIMING_TIMER_TICK],
+	        pacing_sleep_ns,
+	        tick_ns,
+	        other_ns,
+	};
+	return static_cast<ModTimingSpikeCause>(
+	        std::distance(durations.begin(),
+	                      std::max_element(durations.begin(), durations.end())));
+}
+
+static void timing_window_add(const uint64_t frame,
+	                          const uint64_t frame_ns,
+	                          const ModTimingAccumulator &sample)
+{
+	ModTimingWindow &window = g_mod_timing.window;
+	window.frames++;
+	window.frame_total_ns += frame_ns;
+	for (size_t i = 0; i < MOD_TIMING_CATEGORY_COUNT; ++i) {
+		window.category_total_ns[i] += sample.elapsed_ns[i];
+		window.category_maximum_ns[i] = std::max(
+		        window.category_maximum_ns[i], sample.elapsed_ns[i]);
+		window.category_maximum_call_ns[i] = std::max(
+		        window.category_maximum_call_ns[i], sample.maximum_ns[i]);
 	}
+
+	const uint64_t accounted_ns =
+	        sample.elapsed_ns[MOD_TIMING_CPU_DECODER] +
+	        sample.elapsed_ns[MOD_TIMING_PIC_EVENT] +
+	        sample.elapsed_ns[MOD_TIMING_SAFE_POINT] +
+	        sample.elapsed_ns[MOD_TIMING_GFX_EVENTS] +
+	        sample.elapsed_ns[MOD_TIMING_TIMER_TICK] +
+	        sample.elapsed_ns[MOD_TIMING_TICK_CONTROL];
+	const uint64_t other_ns = frame_ns > accounted_ns ? frame_ns - accounted_ns : 0;
+	window.other_total_ns += other_ns;
+	window.other_maximum_ns = std::max(window.other_maximum_ns, other_ns);
+	window.frame_pacing_sleep_total_ns += sample.frame_pacing_sleep_ns;
+	window.frame_pacing_sleep_maximum_ns = std::max(
+	        window.frame_pacing_sleep_maximum_ns,
+	        sample.frame_pacing_sleep_ns);
+
+	if (frame_ns >= static_cast<uint64_t>(MOD_TIMING_SPIKE_THRESHOLD_MS *
+	                                     1000000.0)) {
+		const ModTimingSpikeCause cause = timing_spike_cause(sample, other_ns);
+		window.spike_causes[cause]++;
+	}
+	if (frame_ns >= window.worst_frame_ns) {
+		window.worst_frame = frame;
+		window.worst_frame_ns = frame_ns;
+	}
+}
+
+static bool timing_write_window(const uint64_t frame, const bool final)
+{
+	ModTimingWindow &window = g_mod_timing.window;
+	if (window.frames == 0)
+		return false;
+
+	refresh_timing_summary();
+	const double frame_average_ms = timing_window_average_ms(
+	        window.frame_total_ns, window.frames);
+	const double present_average_ms = timing_window_average_ms(
+	        window.present_total_ns, window.present_samples);
+	bool wrote_log = timing_log_line(
+	        "FRAME_TIMING summary frame=%llu final=%u window_frames=%llu ready_warmup=%llu samples=%u frame_ms_avg=%.3f frame_fps_avg=%.1f frame_ms_p50=%.3f frame_ms_p95=%.3f frame_ms_p99=%.3f frame_ms_max=%.3f window_worst_frame=%llu window_frame_ms_max=%.3f present_samples=%llu present_ms_avg=%.3f present_fps_avg=%.1f present_ms_p50=%.3f present_ms_p95=%.3f present_ms_p99=%.3f present_ms_max=%.3f frame_spikes=%llu present_spikes=%llu",
+	        static_cast<unsigned long long>(frame),
+	        final ? 1u : 0u,
+	        static_cast<unsigned long long>(window.frames),
+	        static_cast<unsigned long long>(MOD_TIMING_WARMUP_READY_FRAMES),
+	        static_cast<unsigned int>(g_mod_timing.frame_history.count),
+	        frame_average_ms,
+	        frame_average_ms > 0.0 ? 1000.0 / frame_average_ms : 0.0,
+	        g_mod_timing.summary.frame_p50_ms,
+	        g_mod_timing.summary.frame_p95_ms,
+	        g_mod_timing.summary.frame_p99_ms,
+	        g_mod_timing.summary.frame_max_ms,
+	        static_cast<unsigned long long>(window.worst_frame),
+	        timing_ns_to_ms(window.worst_frame_ns),
+	        static_cast<unsigned long long>(window.present_samples),
+	        present_average_ms,
+	        present_average_ms > 0.0 ? 1000.0 / present_average_ms : 0.0,
+	        g_mod_timing.summary.present_p50_ms,
+	        g_mod_timing.summary.present_p95_ms,
+	        g_mod_timing.summary.present_p99_ms,
+	        g_mod_timing.summary.present_max_ms,
+	        static_cast<unsigned long long>(g_mod_timing.frame_spikes),
+	        static_cast<unsigned long long>(g_mod_timing.present_spikes));
+
+	const uint64_t samples = window.frames;
+	const auto average = [&window, samples](const ModTimingCategory category) {
+		return timing_window_average_ms(window.category_total_ns[category], samples);
+	};
+	const auto maximum = [&window](const ModTimingCategory category) {
+		return timing_ns_to_ms(window.category_maximum_ns[category]);
+	};
+	wrote_log = timing_log_line(
+	        "FRAME_TIMING components frame=%llu samples=%llu cpu_ms_avg=%.3f cpu_ms_max=%.3f hook_ms_avg=%.3f hook_ms_max=%.3f events_ms_avg=%.3f events_ms_max=%.3f events_call_ms_max=%.3f tick_ms_avg=%.3f tick_ms_max=%.3f sleep_ms_avg=%.3f sleep_ms_max=%.3f pacing_sleep_ms_avg=%.3f pacing_sleep_ms_max=%.3f compositor_ms_avg=%.3f compositor_ms_max=%.3f swap_ms_avg=%.3f swap_ms_max=%.3f other_ms_avg=%.3f other_ms_max=%.3f",
+	        static_cast<unsigned long long>(frame),
+	        static_cast<unsigned long long>(samples),
+	        average(MOD_TIMING_CPU_DECODER), maximum(MOD_TIMING_CPU_DECODER),
+	        average(MOD_TIMING_PYTHON_HOOK), maximum(MOD_TIMING_PYTHON_HOOK),
+	        average(MOD_TIMING_GFX_EVENTS), maximum(MOD_TIMING_GFX_EVENTS),
+	        timing_ns_to_ms(window.category_maximum_call_ns[MOD_TIMING_GFX_EVENTS]),
+	        average(MOD_TIMING_TICK_CONTROL), maximum(MOD_TIMING_TICK_CONTROL),
+	        average(MOD_TIMING_TICK_SLEEP), maximum(MOD_TIMING_TICK_SLEEP),
+	        timing_window_average_ms(window.frame_pacing_sleep_total_ns, samples),
+	        timing_ns_to_ms(window.frame_pacing_sleep_maximum_ns),
+	        average(MOD_TIMING_COMPOSITOR), maximum(MOD_TIMING_COMPOSITOR),
+	        average(MOD_TIMING_SWAP), maximum(MOD_TIMING_SWAP),
+	        timing_window_average_ms(window.other_total_ns, samples),
+	        timing_ns_to_ms(window.other_maximum_ns)) || wrote_log;
+
+	wrote_log = timing_log_line(
+	        "FRAME_TIMING causes frame=%llu spikes=%llu cpu=%llu hook=%llu pic=%llu safe=%llu events=%llu timer=%llu pacing_sleep=%llu tick_other=%llu other=%llu",
+	        static_cast<unsigned long long>(frame),
+	        static_cast<unsigned long long>(
+	                std::accumulate(window.spike_causes.begin(),
+	                                window.spike_causes.end(), uint64_t{0})),
+	        static_cast<unsigned long long>(window.spike_causes[MOD_TIMING_SPIKE_CPU]),
+	        static_cast<unsigned long long>(window.spike_causes[MOD_TIMING_SPIKE_PYTHON_HOOK]),
+	        static_cast<unsigned long long>(window.spike_causes[MOD_TIMING_SPIKE_PIC]),
+	        static_cast<unsigned long long>(window.spike_causes[MOD_TIMING_SPIKE_SAFE_POINT]),
+	        static_cast<unsigned long long>(window.spike_causes[MOD_TIMING_SPIKE_GFX_EVENTS]),
+	        static_cast<unsigned long long>(window.spike_causes[MOD_TIMING_SPIKE_TIMER]),
+	        static_cast<unsigned long long>(window.spike_causes[MOD_TIMING_SPIKE_FRAME_PACING_SLEEP]),
+	        static_cast<unsigned long long>(window.spike_causes[MOD_TIMING_SPIKE_TICK_OTHER]),
+	        static_cast<unsigned long long>(window.spike_causes[MOD_TIMING_SPIKE_OTHER])) ||
+	            wrote_log;
+
+	if (g_mod_timing_log)
+		fflush(g_mod_timing_log);
+	window = {};
+	return wrote_log;
 }
 
 static void timing_frame_boundary(const uint64_t frame)
@@ -352,8 +522,8 @@ static void timing_frame_boundary(const uint64_t frame)
 		return;
 	}
 
-	const double frame_ms = timing_ns_to_ms(
-	        now - g_mod_timing.frame_boundary_ns);
+	const uint64_t frame_ns = now - g_mod_timing.frame_boundary_ns;
+	const double frame_ms = timing_ns_to_ms(frame_ns);
 	g_mod_timing.frame_boundary_ns = now;
 	g_mod_timing.last_frame = frame;
 	const ModTimingAccumulator sample = g_mod_timing.current;
@@ -362,109 +532,18 @@ static void timing_frame_boundary(const uint64_t frame)
 	const bool steady_state =
 	        g_mod_timing.ready_total > MOD_TIMING_WARMUP_READY_FRAMES &&
 	        sample.ready_frames != 0;
-	bool wrote_log = false;
 	if (steady_state) {
 		timing_history_add(g_mod_timing.frame_history, frame_ms);
-		if (frame_ms >= MOD_TIMING_SPIKE_THRESHOLD_MS) {
+		timing_window_add(frame > 0 ? frame - 1u : 0u, frame_ns, sample);
+		if (frame_ms >= MOD_TIMING_SPIKE_THRESHOLD_MS)
 			g_mod_timing.frame_spikes++;
-			char recent[160] = {};
-			format_recent_timing_history(
-			        g_mod_timing.frame_history, recent, sizeof(recent));
-			const double cpu_ms = timing_ns_to_ms(
-			        sample.elapsed_ns[MOD_TIMING_CPU_DECODER]);
-			const double pic_ms = timing_ns_to_ms(
-			        sample.elapsed_ns[MOD_TIMING_PIC_EVENT]);
-			const double safe_ms = timing_ns_to_ms(
-			        sample.elapsed_ns[MOD_TIMING_SAFE_POINT]);
-			const double events_ms = timing_ns_to_ms(
-			        sample.elapsed_ns[MOD_TIMING_GFX_EVENTS]);
-			const double timer_ms = timing_ns_to_ms(
-			        sample.elapsed_ns[MOD_TIMING_TIMER_TICK]);
-			const double tick_ms = timing_ns_to_ms(
-			        sample.elapsed_ns[MOD_TIMING_TICK_CONTROL]);
-			const double other_ms = std::max(
-			        0.0,
-			        frame_ms - cpu_ms - pic_ms - safe_ms - events_ms -
-			                timer_ms - tick_ms);
-			wrote_log = timing_log_line(
-			        "FRAME_TIMING spike frame=%llu frame_ms=%.3f cpu_ms=%.3f cpu_max_ms=%.3f cpu_calls=%u cpu_cycles=%llu cpu_cycles_max=%llu cpu_slowest_cycles=%llu cpu_slowest_request=%lld cpu_slowest_cmax=%lld cpu_slowest_auto=%u pic_ms=%.3f pic_max_ms=%.3f pic_calls=%u hook_ms=%.3f hook_max_ms=%.3f hook_calls=%u safe_ms=%.3f events_ms=%.3f events_max_ms=%.3f events_calls=%u timer_ms=%.3f timer_max_ms=%.3f timer_calls=%u tick_ms=%.3f tick_max_ms=%.3f tick_calls=%u sleep_ms=%.3f sleep_max_ms=%.3f sleep_calls=%u auto_ms=%.3f auto_max_ms=%.3f auto_calls=%u auto_adjustments=%u auto_cmax_before=%lld auto_cmax_after=%lld auto_ticks_added=%d auto_ticks_scheduled=%d auto_ticks_done=%d dyn_ms=%.3f dyn_max_ms=%.3f dyn_blocks=%u compositor_ms=%.3f swap_ms=%.3f other_ms=%.3f native_frames=%u ready_frames=%u presentations=%u new_mod_presentations=%u prior_telemetry_log=%u recent_frame_ms=%s",
-			        static_cast<unsigned long long>(frame > 0 ? frame - 1u : 0u),
-			        frame_ms,
-			        cpu_ms,
-			        timing_ns_to_ms(sample.maximum_ns[MOD_TIMING_CPU_DECODER]),
-			        sample.calls[MOD_TIMING_CPU_DECODER],
-			        static_cast<unsigned long long>(sample.decoder_cycles),
-			        static_cast<unsigned long long>(sample.decoder_max_slice_cycles),
-			        static_cast<unsigned long long>(sample.decoder_slowest_cycles),
-			        static_cast<long long>(sample.decoder_slowest_requested_cycles),
-			        static_cast<long long>(sample.decoder_slowest_cycle_max),
-			        sample.decoder_slowest_auto_adjust ? 1u : 0u,
-			        pic_ms,
-			        timing_ns_to_ms(sample.maximum_ns[MOD_TIMING_PIC_EVENT]),
-			        sample.calls[MOD_TIMING_PIC_EVENT],
-			        timing_ns_to_ms(sample.elapsed_ns[MOD_TIMING_PYTHON_HOOK]),
-			        timing_ns_to_ms(sample.maximum_ns[MOD_TIMING_PYTHON_HOOK]),
-			        sample.calls[MOD_TIMING_PYTHON_HOOK],
-			        safe_ms,
-			        events_ms,
-			        timing_ns_to_ms(sample.maximum_ns[MOD_TIMING_GFX_EVENTS]),
-			        sample.calls[MOD_TIMING_GFX_EVENTS],
-			        timer_ms,
-			        timing_ns_to_ms(sample.maximum_ns[MOD_TIMING_TIMER_TICK]),
-			        sample.calls[MOD_TIMING_TIMER_TICK],
-			        tick_ms,
-			        timing_ns_to_ms(sample.maximum_ns[MOD_TIMING_TICK_CONTROL]),
-			        sample.calls[MOD_TIMING_TICK_CONTROL],
-			        timing_ns_to_ms(sample.elapsed_ns[MOD_TIMING_TICK_SLEEP]),
-			        timing_ns_to_ms(sample.maximum_ns[MOD_TIMING_TICK_SLEEP]),
-			        sample.calls[MOD_TIMING_TICK_SLEEP],
-			        timing_ns_to_ms(sample.elapsed_ns[MOD_TIMING_AUTO_CYCLE]),
-			        timing_ns_to_ms(sample.maximum_ns[MOD_TIMING_AUTO_CYCLE]),
-			        sample.calls[MOD_TIMING_AUTO_CYCLE],
-			        sample.auto_cycle_adjustments,
-			        static_cast<long long>(sample.auto_cycle_max_before),
-			        static_cast<long long>(sample.auto_cycle_max_after),
-			        sample.auto_ticks_added,
-			        sample.auto_ticks_scheduled,
-			        sample.auto_ticks_done,
-			        timing_ns_to_ms(sample.elapsed_ns[MOD_TIMING_DYNAMIC_COMPILE]),
-			        timing_ns_to_ms(sample.maximum_ns[MOD_TIMING_DYNAMIC_COMPILE]),
-			        sample.calls[MOD_TIMING_DYNAMIC_COMPILE],
-			        timing_ns_to_ms(sample.elapsed_ns[MOD_TIMING_COMPOSITOR]),
-			        timing_ns_to_ms(sample.elapsed_ns[MOD_TIMING_SWAP]),
-			        other_ms,
-			        sample.native_frames,
-			        sample.ready_frames,
-			        sample.presentations,
-			        sample.new_mod_presentations,
-			        g_mod_timing.telemetry_log_previous_interval ? 1u : 0u,
-			        recent);
-		}
 
 		if (frame % MOD_TIMING_SUMMARY_INTERVAL_FRAMES == 0u) {
-			refresh_timing_summary();
-			wrote_log = timing_log_line(
-			        "FRAME_TIMING summary frame=%llu ready_warmup=%llu samples=%u frame_ms_p50=%.3f frame_ms_p95=%.3f frame_ms_p99=%.3f frame_ms_max=%.3f present_ms_p50=%.3f present_ms_p95=%.3f present_ms_p99=%.3f present_ms_max=%.3f frame_spikes=%llu present_spikes=%llu",
-			        static_cast<unsigned long long>(frame),
-			        static_cast<unsigned long long>(MOD_TIMING_WARMUP_READY_FRAMES),
-			        static_cast<unsigned int>(g_mod_timing.frame_history.count),
-			        g_mod_timing.summary.frame_p50_ms,
-			        g_mod_timing.summary.frame_p95_ms,
-			        g_mod_timing.summary.frame_p99_ms,
-			        g_mod_timing.summary.frame_max_ms,
-			        g_mod_timing.summary.present_p50_ms,
-			        g_mod_timing.summary.present_p95_ms,
-			        g_mod_timing.summary.present_p99_ms,
-			        g_mod_timing.summary.present_max_ms,
-			        static_cast<unsigned long long>(g_mod_timing.frame_spikes),
-			        static_cast<unsigned long long>(g_mod_timing.present_spikes)) ||
-			        wrote_log;
+			timing_write_window(frame, false);
 		} else if (g_mod_timing.frame_history.count % 120u == 0u) {
 			refresh_timing_summary();
 		}
 	}
-
-	g_mod_timing.telemetry_log_previous_interval = wrote_log;
 }
 
 static Bitu guest_call_stop_handler(void)
@@ -754,6 +833,8 @@ static void sync_scene_raster_callsite_hooks(void)
 
 static void reset_runtime_frame_state(ModExecutableRuntime &runtime)
 {
+	if (g_mod_timing.window.frames > 0)
+		timing_write_window(g_mod_timing.last_frame, true);
 	runtime.frame_started = false;
 	runtime.frame_counter_start = 0;
 	runtime.frame_counter_last = 0;
@@ -1022,11 +1103,12 @@ static void activate_runtime_process(ModExecutableRuntime &runtime,
 	update_fast_enabled();
 	refresh_dynamic_cpu_cache();
 	timing_log_line(
-	        "FRAME_TIMING session executable=%s warmup_ready_frames=%llu spike_threshold_ms=%.3f history_capacity=%u",
+	        "FRAME_TIMING session executable=%s format=condensed-v1 warmup_ready_frames=%llu spike_threshold_ms=%.3f history_capacity=%u summary_interval_frames=%llu",
 	        runtime.config.name.c_str(),
 	        static_cast<unsigned long long>(MOD_TIMING_WARMUP_READY_FRAMES),
 	        MOD_TIMING_SPIKE_THRESHOLD_MS,
-	        static_cast<unsigned int>(MOD_TIMING_HISTORY_CAPACITY));
+	        static_cast<unsigned int>(MOD_TIMING_HISTORY_CAPACITY),
+	        static_cast<unsigned long long>(MOD_TIMING_SUMMARY_INTERVAL_FRAMES));
 
 	LOG_MSG("MOD: %s active on PSP 0x%04X",
 	        runtime.config.name.c_str(),
@@ -1218,6 +1300,40 @@ static bool frame_pacing_runtime_ready(ModExecutableRuntime **runtime)
 	return true;
 }
 
+static void timing_write_pacing_summary(const bool final)
+{
+	if (g_frame_pacing.interval_released_frames == 0 ||
+	    g_frame_pacing.released_frames == 0) {
+		return;
+	}
+	const double average_lateness_ms =
+	        timing_window_average_ms(g_frame_pacing.total_lateness_ns,
+	                                 g_frame_pacing.released_frames);
+	const double interval_average_lateness_ms =
+	        timing_window_average_ms(
+	                g_frame_pacing.interval_lateness_ns,
+	                g_frame_pacing.interval_released_frames);
+	timing_log_line(
+	        "FRAME_PACING summary final=%u target_fps=%u released=%llu deferred_checks=%llu average_lateness_ms=%.3f maximum_lateness_ms=%.3f interval_released=%llu interval_average_lateness_ms=%.3f interval_maximum_lateness_ms=%.3f missed_deadlines=%llu interval_missed_deadlines=%llu",
+	        final ? 1u : 0u,
+	        static_cast<unsigned int>(g_frame_pacing.target_fps),
+	        static_cast<unsigned long long>(g_frame_pacing.released_frames),
+	        static_cast<unsigned long long>(g_frame_pacing.deferred_checks),
+	        average_lateness_ms,
+	        timing_ns_to_ms(g_frame_pacing.maximum_lateness_ns),
+	        static_cast<unsigned long long>(
+	                g_frame_pacing.interval_released_frames),
+	        interval_average_lateness_ms,
+	        timing_ns_to_ms(g_frame_pacing.interval_maximum_lateness_ns),
+	        static_cast<unsigned long long>(g_frame_pacing.missed_deadlines),
+	        static_cast<unsigned long long>(
+	                g_frame_pacing.interval_missed_deadlines));
+	g_frame_pacing.interval_released_frames = 0;
+	g_frame_pacing.interval_lateness_ns = 0;
+	g_frame_pacing.interval_maximum_lateness_ns = 0;
+	g_frame_pacing.interval_missed_deadlines = 0;
+}
+
 static int32_t frame_pacing_on_frame_start(ModExecutableRuntime &runtime)
 {
 	ModExecutableRuntime *active = NULL;
@@ -1274,25 +1390,24 @@ static int32_t frame_pacing_on_frame_start(ModExecutableRuntime &runtime)
 	g_frame_pacing.maximum_lateness_ns = std::max(
 	        g_frame_pacing.maximum_lateness_ns, lateness_ns);
 	g_frame_pacing.released_frames++;
+	g_frame_pacing.interval_lateness_ns += lateness_ns;
+	g_frame_pacing.interval_maximum_lateness_ns = std::max(
+	        g_frame_pacing.interval_maximum_lateness_ns, lateness_ns);
+	g_frame_pacing.interval_released_frames++;
+	uint64_t deadlines_advanced = 0;
 	do {
 		g_frame_pacing.next_deadline_ns += g_frame_pacing.period_ns;
+		deadlines_advanced++;
 	} while (g_frame_pacing.next_deadline_ns <= now);
+	const uint64_t missed_deadlines = deadlines_advanced > 0
+	                                          ? deadlines_advanced - 1u
+	                                          : 0u;
+	g_frame_pacing.missed_deadlines += missed_deadlines;
+	g_frame_pacing.interval_missed_deadlines += missed_deadlines;
 
 	if ((g_frame_pacing.released_frames %
 	     MOD_TIMING_SUMMARY_INTERVAL_FRAMES) == 0u) {
-		const double average_lateness_ms =
-		        static_cast<double>(g_frame_pacing.total_lateness_ns) /
-		        static_cast<double>(g_frame_pacing.released_frames) /
-		        1000000.0;
-		timing_log_line(
-		        "FRAME_PACING summary target_fps=%u released=%llu deferred_checks=%llu average_lateness_ms=%.3f maximum_lateness_ms=%.3f",
-		        static_cast<unsigned int>(g_frame_pacing.target_fps),
-		        static_cast<unsigned long long>(
-		                g_frame_pacing.released_frames),
-		        static_cast<unsigned long long>(
-		                g_frame_pacing.deferred_checks),
-		        average_lateness_ms,
-		        timing_ns_to_ms(g_frame_pacing.maximum_lateness_ns));
+		timing_write_pacing_summary(false);
 	}
 
 	return 0;
@@ -1321,52 +1436,14 @@ uint64_t MOD_TimingEnd(const ModTimingCategory category,
 	current.elapsed_ns[category] += elapsed;
 	current.maximum_ns[category] =
 	        std::max(current.maximum_ns[category], elapsed);
-	current.calls[category]++;
 	return elapsed;
 }
 
-void MOD_TimingRecordDecoderSlice(const uint64_t elapsed_ns,
-	                              const int64_t requested_cycles,
-	                              const int64_t remaining_cycles,
-	                              const int64_t cycle_max,
-	                              const bool auto_adjust)
+void MOD_TimingRecordFramePacingSleep(const uint64_t elapsed_ns)
 {
-	if (elapsed_ns == 0)
+	if (!g_mod.fast_enabled || elapsed_ns == 0)
 		return;
-
-	ModTimingAccumulator &current = g_mod_timing.current;
-	const int64_t executed_signed = requested_cycles - remaining_cycles;
-	const uint64_t executed_cycles = executed_signed > 0
-	                                       ? static_cast<uint64_t>(executed_signed)
-	                                       : 0u;
-	current.decoder_cycles += executed_cycles;
-	current.decoder_max_slice_cycles = std::max(
-	        current.decoder_max_slice_cycles, executed_cycles);
-	if (elapsed_ns >= current.decoder_slowest_elapsed_ns) {
-		current.decoder_slowest_elapsed_ns = elapsed_ns;
-		current.decoder_slowest_cycles = executed_cycles;
-		current.decoder_slowest_requested_cycles = requested_cycles;
-		current.decoder_slowest_cycle_max = cycle_max;
-		current.decoder_slowest_auto_adjust = auto_adjust;
-	}
-}
-
-void MOD_TimingRecordAutoCycleAdjustment(const int64_t cycle_max_before,
-	                                     const int64_t cycle_max_after,
-	                                     const int32_t ticks_added,
-	                                     const int32_t ticks_scheduled,
-	                                     const int32_t ticks_done)
-{
-	if (!g_mod.fast_enabled)
-		return;
-
-	ModTimingAccumulator &current = g_mod_timing.current;
-	current.auto_cycle_adjustments++;
-	current.auto_cycle_max_before = cycle_max_before;
-	current.auto_cycle_max_after = cycle_max_after;
-	current.auto_ticks_added = ticks_added;
-	current.auto_ticks_scheduled = ticks_scheduled;
-	current.auto_ticks_done = ticks_done;
+	g_mod_timing.current.frame_pacing_sleep_ns += elapsed_ns;
 }
 
 void MOD_TimingCountNativeFrame(void)
@@ -1391,6 +1468,10 @@ void MOD_TimingPresentationBoundary(const bool compositor_invoked,
 {
 	if (!g_mod.fast_enabled)
 		return;
+	static_cast<void>(compositor_invoked);
+	static_cast<void>(compositor_ns);
+	static_cast<void>(swap_ns);
+	static_cast<void>(source);
 
 	ModTimingState &timing = g_mod_timing;
 	timing.current.presentations++;
@@ -1403,8 +1484,8 @@ void MOD_TimingPresentationBoundary(const bool compositor_invoked,
 		return;
 	}
 
-	const double present_ms = timing_ns_to_ms(
-	        now - timing.present_boundary_ns);
+	const uint64_t present_ns = now - timing.present_boundary_ns;
+	const double present_ms = timing_ns_to_ms(present_ns);
 	timing.present_boundary_ns = now;
 	if (!new_mod_frame ||
 	    timing.ready_total <= MOD_TIMING_WARMUP_READY_FRAMES) {
@@ -1412,24 +1493,10 @@ void MOD_TimingPresentationBoundary(const bool compositor_invoked,
 	}
 
 	timing_history_add(timing.present_history, present_ms);
-	if (present_ms < MOD_TIMING_SPIKE_THRESHOLD_MS)
-		return;
-
-	timing.present_spikes++;
-	char recent[160] = {};
-	format_recent_timing_history(
-	        timing.present_history, recent, sizeof(recent));
-	if (timing_log_line(
-	        "PRESENT_TIMING spike frame=%llu source=%s present_ms=%.3f compositor_invoked=%u compositor_ms=%.3f swap_ms=%.3f recent_present_ms=%s",
-	        static_cast<unsigned long long>(timing.last_frame),
-	        source ? source : "unknown",
-	        present_ms,
-	        compositor_invoked ? 1u : 0u,
-	        timing_ns_to_ms(compositor_ns),
-	        timing_ns_to_ms(swap_ns),
-	        recent)) {
-		timing.telemetry_log_previous_interval = true;
-	}
+	timing.window.present_samples++;
+	timing.window.present_total_ns += present_ns;
+	if (present_ms >= MOD_TIMING_SPIKE_THRESHOLD_MS)
+		timing.present_spikes++;
 }
 
 bool MOD_GetTimingSummary(ModTimingSummary *summary)
@@ -1483,6 +1550,10 @@ bool MOD_Init(const Config& config)
 
 void MOD_Shutdown(void)
 {
+	if (g_mod_timing.window.frames > 0)
+		timing_write_window(g_mod_timing.last_frame, true);
+	if (g_frame_pacing.interval_released_frames > 0)
+		timing_write_pacing_summary(true);
 	if (g_mod.guest_call_stop_callback != 0)
 		CALLBACK_DeAllocate(g_mod.guest_call_stop_callback);
 	g_mod = {};
@@ -1931,9 +2002,11 @@ void MOD_RunPendingSafePoint(void)
 	g_mod.safe_point_pending = false;
 	g_mod.safe_point_active = true;
 	const uint64_t timing_started = MOD_TimingBegin();
+	DOSBOX_BeginAutoCycleHostWork();
 	DOSBoxPython_InvokeSafePointCallback();
 	MOD_TimingEnd(MOD_TIMING_SAFE_POINT, timing_started);
 	g_mod.safe_point_active = false;
+	DOSBOX_EndAutoCycleHostWork();
 }
 
 bool MOD_CallRelocFunction(uint32_t reloc_eip,
@@ -1980,7 +2053,9 @@ bool MOD_CallRelocFunction(uint32_t reloc_eip,
 
 	g_mod.guest_call_stopped = false;
 	g_mod.guest_call_active = true;
+	DOSBOX_EndAutoCycleHostWork();
 	DOSBOX_RunMachine();
+	DOSBOX_BeginAutoCycleHostWork();
 
 	output->eax = reg_eax;
 	output->ebx = reg_ebx;

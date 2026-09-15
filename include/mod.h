@@ -70,7 +70,6 @@ enum ModTimingCategory {
 	MOD_TIMING_TIMER_TICK,
 	MOD_TIMING_TICK_CONTROL,
 	MOD_TIMING_TICK_SLEEP,
-	MOD_TIMING_AUTO_CYCLE,
 	MOD_TIMING_CATEGORY_COUNT,
 };
 
@@ -160,16 +159,7 @@ bool MOD_CallRelocFunction(uint32_t reloc_eip,
                            ModGuestCallRegisters *output);
 uint64_t MOD_TimingBegin(void);
 uint64_t MOD_TimingEnd(ModTimingCategory category, uint64_t started_ns);
-void MOD_TimingRecordDecoderSlice(uint64_t elapsed_ns,
-                                  int64_t requested_cycles,
-                                  int64_t remaining_cycles,
-                                  int64_t cycle_max,
-                                  bool auto_adjust);
-void MOD_TimingRecordAutoCycleAdjustment(int64_t cycle_max_before,
-                                         int64_t cycle_max_after,
-                                         int32_t ticks_added,
-                                         int32_t ticks_scheduled,
-                                         int32_t ticks_done);
+void MOD_TimingRecordFramePacingSleep(uint64_t elapsed_ns);
 void MOD_TimingCountNativeFrame(void);
 void MOD_TimingCountModFrameReady(void);
 void MOD_TimingPresentationBoundary(bool compositor_invoked,

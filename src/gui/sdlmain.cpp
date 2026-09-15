@@ -2111,6 +2111,7 @@ void GFX_ResetScreen(void) {
 		GLIDE_ResetScreen(true);
 		return;
 	}
+    DOSBOX_BeginAutoCycleHostWork();
             SDL_Rect *rect = &sdl.updateRects[0];
             rect->x = 0; rect->y = 0; rect->w = 0; rect->h = 0;
 #if defined(C_SDL2)
@@ -2123,6 +2124,7 @@ void GFX_ResetScreen(void) {
         (sdl.draw.callback)( GFX_CallBackReset );
     GFX_Start();
     CPU_Reset_AutoAdjust();
+    DOSBOX_EndAutoCycleHostWork();
     fullscreen_switch=true;
     DOSBox_RefreshMenu(); // for menu
 }

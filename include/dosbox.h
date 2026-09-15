@@ -197,6 +197,8 @@ std::string             formatString(const char* format, ...); // Generates a fo
 void					DOSBOX_RunMachine();
 void					DOSBOX_SetLoop(LoopHandler * handler);
 void					DOSBOX_SetNormalLoop();
+void                    DOSBOX_BeginAutoCycleHostWork();
+void                    DOSBOX_EndAutoCycleHostWork();
 
 /* machine tests for use with if() statements */
 #define IS_TANDY_ARCH			((machine==MCH_TANDY) || (machine==MCH_PCJR))

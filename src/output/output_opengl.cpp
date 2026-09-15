@@ -2030,7 +2030,12 @@ static void FinishOpenGLPresentation(const char *source)
     RestoreOpenGLPresentationState(layout);
     CaptureOpenGLPresentation(layout);
     const uint64_t swap_started = MOD_TimingBegin();
+    const bool exclude_mod_swap = DOSBoxPython_OpenGLRendererAvailable();
+    if (exclude_mod_swap)
+        DOSBOX_BeginAutoCycleHostWork();
     SDL_GL_SwapBuffers();
+    if (exclude_mod_swap)
+        DOSBOX_EndAutoCycleHostWork();
     const uint64_t swap_ns = MOD_TimingEnd(MOD_TIMING_SWAP, swap_started);
     const bool new_mod_frame = RecordOpenGLPresentation(compositor_invoked);
     MOD_TimingPresentationBoundary(compositor_invoked,

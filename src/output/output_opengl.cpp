@@ -671,6 +671,7 @@ void OUTPUT_OPENGL_Select( GLKind kind )
     sdl.window = GFX_SetSDLWindowMode(640,400, SCREEN_OPENGL);
     if (sdl.window) {
         if(sdl_opengl.context) {
+            DOSBoxPython_NotifyOpenGLContextDestroying();
             RA_GLSL_Release();
             SDL_GL_DeleteContext(sdl_opengl.context);
             sdl_opengl.context = nullptr;

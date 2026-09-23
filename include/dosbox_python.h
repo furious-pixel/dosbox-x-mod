@@ -18,6 +18,7 @@ bool DOSBoxPython_InvokeHook(size_t hook_id);
 bool DOSBoxPython_InvokeSafePointCallback(void);
 bool DOSBoxPython_OpenGLRendererAvailable(void);
 void DOSBoxPython_NotifyOpenGLContextCreated(uint64_t context_generation);
+void DOSBoxPython_NotifyOpenGLContextDestroying(void);
 bool DOSBoxPython_InvokeOpenGLInitCallback(const ModOpenGLState &state);
 bool DOSBoxPython_InvokeOpenGLCompositorCallback(const ModOpenGLState &state);
 

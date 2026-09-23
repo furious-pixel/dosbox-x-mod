@@ -138,6 +138,7 @@ enum PythonRenderCallbackKind {
 	PYTHON_RENDER_CALLBACK_INIT = 1,
 	PYTHON_RENDER_CALLBACK_COMPOSITOR = 2,
 	PYTHON_RENDER_CALLBACK_SAFE_POINT = 3,
+	PYTHON_RENDER_CALLBACK_RELEASE = 4,
 };
 
 struct PythonRenderCallbackRegistration {
@@ -161,6 +162,7 @@ struct PythonRuntime {
 	std::vector<PythonHookRegistration> hooks = {};
 	PythonRenderCallbackRegistration init_callback = {};
 	PythonRenderCallbackRegistration compositor_callback = {};
+	PythonRenderCallbackRegistration release_callback = {};
 	PythonRenderCallbackRegistration safe_point_callback = {};
 	uint64_t initialized_context_generation = 0;
 	ModOpenGLState gl_state = {};
@@ -599,12 +601,13 @@ static void clear_registered_hooks(void)
 
 static void clear_registered_render_callbacks(void)
 {
-	PythonRenderCallbackRegistration *callbacks[3] = {
+	PythonRenderCallbackRegistration *callbacks[] = {
 	        &g_python.init_callback,
 	        &g_python.compositor_callback,
+	        &g_python.release_callback,
 	        &g_python.safe_point_callback};
 
-	for (size_t i = 0; i < 3; ++i) {
+	for (size_t i = 0; i < sizeof(callbacks) / sizeof(callbacks[0]); ++i) {
 		if (callbacks[i]->callback && g_python.api.Py_DecRef)
 			g_python.api.Py_DecRef(callbacks[i]->callback);
 		*callbacks[i] = PythonRenderCallbackRegistration();
@@ -1016,9 +1019,12 @@ static PyObject *py_register_render_callback(PyObject *, PyObject *args)
 	} else if (kind == "compositor") {
 		slot = &g_python.compositor_callback;
 		callback_kind = PYTHON_RENDER_CALLBACK_COMPOSITOR;
+	} else if (kind == "release") {
+		slot = &g_python.release_callback;
+		callback_kind = PYTHON_RENDER_CALLBACK_RELEASE;
 	} else {
 		set_python_error(g_python.api.PyExc_ValueError,
-		                 "render callback kind must be 'init' or 'compositor'");
+		                 "render callback kind must be 'init', 'compositor', or 'release'");
 		return NULL;
 	}
 
@@ -2805,6 +2811,7 @@ bool DOSBoxPython_LoadMods(std::vector<ModPythonHookRegistration> *hooks)
 	const unsigned int callback_count =
 	        (g_python.init_callback.callback ? 1u : 0u) +
 	        (g_python.compositor_callback.callback ? 1u : 0u) +
+	        (g_python.release_callback.callback ? 1u : 0u) +
 	        (g_python.safe_point_callback.callback ? 1u : 0u);
 	if (hooks->empty() && callback_count == 0u)
 		LOG_MSG("MOD: no Python hooks or callbacks registered");
@@ -2971,6 +2978,18 @@ static bool invoke_python_render_callback(PythonRenderCallbackRegistration *call
 	}
 
 	return true;
+}
+
+void DOSBoxPython_NotifyOpenGLContextDestroying(void)
+{
+	// The caller still owns the current, live context. Cleanup must also run
+	// outside an active guest executable and after a rendering callback failed.
+	if (g_python.initialized && g_python.modstate && g_python.modgl &&
+	    g_python.release_callback.callback) {
+		invoke_python_render_callback(&g_python.release_callback, "release",
+		        g_python.modstate, g_python.modgl, NULL, NULL, NULL, NULL, NULL);
+	}
+	g_python.initialized_context_generation = 0;
 }
 
 bool DOSBoxPython_InvokeOpenGLInitCallback(const ModOpenGLState &state)

@@ -1833,6 +1833,7 @@ SDL_Window* GFX_SetSDLWindowMode(uint16_t width, uint16_t height, SCREEN_TYPES s
 
 #if C_OPENGL
     if (sdl_opengl.context) {
+        DOSBoxPython_NotifyOpenGLContextDestroying();
         SDL_GL_DeleteContext(sdl_opengl.context);
         sdl_opengl.context = nullptr;
     }

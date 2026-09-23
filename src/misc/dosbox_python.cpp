@@ -361,6 +361,28 @@ static std::string build_mod_helper_bootstrap(void)
 	std::ostringstream script;
 	script
 		<< "import mod\n"
+		<< "import sys\n"
+		<< "class _DOSBoxLogStream(object):\n"
+		<< "    encoding = 'utf-8'\n"
+		<< "    errors = 'replace'\n"
+		<< "    def __init__(self):\n"
+		<< "        self._buffer = ''\n"
+		<< "    def write(self, text):\n"
+		<< "        text = str(text)\n"
+		<< "        self._buffer += text.replace('\\r\\n', '\\n').replace('\\r', '\\n')\n"
+		<< "        while '\\n' in self._buffer:\n"
+		<< "            line, self._buffer = self._buffer.split('\\n', 1)\n"
+		<< "            if line:\n"
+		<< "                mod._log(line)\n"
+		<< "        return len(text)\n"
+		<< "    def flush(self):\n"
+		<< "        if self._buffer:\n"
+		<< "            mod._log(self._buffer)\n"
+		<< "            self._buffer = ''\n"
+		<< "    def isatty(self):\n"
+		<< "        return False\n"
+		<< "sys.stdout = _DOSBoxLogStream()\n"
+		<< "sys.stderr = _DOSBoxLogStream()\n"
 		<< "class _DOSBoxModState(object):\n"
 		<< "    def get_modjoystick_devices(self):\n"
 		<< "        return mod._get_modjoystick_devices()\n"
@@ -530,20 +552,11 @@ static std::string build_mod_loader_script(const std::string &mods_dir)
 	const std::string escaped_mods_dir = escape_python_string(mods_dir);
 	std::ostringstream script;
 	script
-		<< "import builtins\n"
 		<< "import mod\n"
-		<< "import os\n"
 		<< "import pathlib\n"
 		<< "import runpy\n"
 		<< "import sys\n"
 		<< "import traceback\n"
-		<< "if os.name == 'nt':\n"
-		<< "    try:\n"
-		<< "        _dosbox_console = builtins.open('CONOUT$', 'w', encoding='utf-8', buffering=1)\n"
-		<< "        sys.stdout = _dosbox_console\n"
-		<< "        sys.stderr = _dosbox_console\n"
-		<< "    except OSError:\n"
-		<< "        pass\n"
 		<< "mods_dir = pathlib.Path('" << escaped_mods_dir << "').resolve()\n"
 		<< "mod._postload_callbacks.clear()\n"
 		<< "if mods_dir.is_dir():\n"
@@ -568,7 +581,10 @@ static std::string build_mod_loader_script(const std::string &mods_dir)
 		<< "        print('MOD ERROR: post-load work failed', flush=True)\n"
 		<< "        traceback.print_exc()\n"
 		<< "        raise\n"
-		<< "sys.stdout.flush()\n";
+		<< "try:\n"
+		<< "    sys.stdout.flush()\n"
+		<< "except (AttributeError, OSError):\n"
+		<< "    pass\n";
 	return script.str();
 }
 
@@ -1958,6 +1974,38 @@ static PyObject *py_write_i32(PyObject *, PyObject *args)
 	return value_obj;
 }
 
+static PyObject *py_log(PyObject *, PyObject *args)
+{
+	if (g_python.api.PyTuple_Size(args) != 1) {
+		set_python_error(g_python.api.PyExc_TypeError,
+		                 "_log expects (message)");
+		return NULL;
+	}
+
+	PyObject *message_obj = g_python.api.PyTuple_GetItem(args, 0);
+	if (!message_obj) {
+		set_python_error(g_python.api.PyExc_RuntimeError,
+		                 "failed to read log message");
+		return NULL;
+	}
+
+	const char *message_utf8 = g_python.api.PyUnicode_AsUTF8(message_obj);
+	if (!message_utf8)
+		return NULL;
+
+	if (message_utf8[0] != '\0') {
+		const std::string message = message_utf8;
+		if (message.compare(0, 4, "MOD:") == 0 ||
+		    message.compare(0, 7, "PYTHON:") == 0) {
+			LOG_MSG("%s", message.c_str());
+		} else {
+			LOG_MSG("PYTHON: %s", message.c_str());
+		}
+	}
+
+	return g_python.api.PyLong_FromUnsignedLong(0ul);
+}
+
 static bool ensure_mod_helper_module(void)
 {
 	if (g_python.mod_module && g_python.modstate && g_python.gamemem && g_python.modgl)
@@ -1976,6 +2024,8 @@ static bool ensure_mod_helper_module(void)
 
 	static PyMethodDef register_hook_method = {
 	        "_register_hook", py_register_hook, DOSBOX_PY_METH_VARARGS, NULL};
+	static PyMethodDef log_method = {
+	        "_log", py_log, DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef register_render_hook_method = {
 	        "_register_render_hook", py_register_render_hook, DOSBOX_PY_METH_VARARGS, NULL};
 	static PyMethodDef register_render_callback_method = {
@@ -2053,7 +2103,8 @@ static bool ensure_mod_helper_module(void)
 	static PyMethodDef write_i32_method = {
 	        "_write_i32", py_write_i32, DOSBOX_PY_METH_VARARGS, NULL};
 
-	if (!attach_module_function(mod_module.get(), "_register_hook", &register_hook_method) ||
+	if (!attach_module_function(mod_module.get(), "_log", &log_method) ||
+	    !attach_module_function(mod_module.get(), "_register_hook", &register_hook_method) ||
 	    !attach_module_function(mod_module.get(), "_register_render_hook",
 	                            &register_render_hook_method) ||
 	    !attach_module_function(mod_module.get(), "_register_render_callback",
@@ -2651,8 +2702,7 @@ bool DOSBoxPython_Init(const Config& config)
 		LOG_MSG("PYTHON: mods directory %s", g_python.mods_dir.c_str());
 	else
 		LOG_MSG("PYTHON: mods disabled (no -moddir specified)");
-	if (!config.opt_console)
-		LOG_MSG("PYTHON: use -console to see Python print() output on Windows");
+	LOG_MSG("PYTHON: stdout and stderr routed through DOSBox-X logging");
 
 	const char *version = g_python.api.Py_GetVersion ? g_python.api.Py_GetVersion() : NULL;
 	if (version)

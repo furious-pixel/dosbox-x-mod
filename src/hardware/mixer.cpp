@@ -27,6 +27,11 @@
 #include <sys/types.h>
 #define _USE_MATH_DEFINES // needed for M_PI in Visual Studio as documented [https://msdn.microsoft.com/en-us/library/4hwaceh6.aspx]
 #include <math.h>
+#include <array>
+#include <chrono>
+#include <cstdlib>
+#include <cstdarg>
+#include <cstdio>
 
 #if defined(_MSC_VER)
 # pragma warning(disable:4244) /* const fmath::local::uint64_t to double possible loss of data */
@@ -51,6 +56,8 @@
 #include "dosbox.h"
 #include "logging.h"
 #include "mixer.h"
+#include "cpu.h"
+#include "mod.h"
 #include "timer.h"
 #include "setup.h"
 #include "cross.h"
@@ -103,6 +110,244 @@ static struct {
     Bitu            prebuffer_samples;
     bool            mute;
 } mixer;
+
+// Opt-in diagnostic only. Audio fields are protected by SDL's existing audio
+// lock; the callback never formats, writes files, allocates, or adds a lock.
+bool MIXER_TimingAuditEnabled = false;
+namespace {
+struct AudioAuditEvent {
+    uint64_t time = 0, production_gap = 0;
+    unsigned queued = 0, requested = 0, silence = 0, dropped = 0;
+    bool prebuffer = false, muted = false, underrun = false;
+};
+struct AudioAuditWindow {
+    uint64_t callbacks = 0, underruns = 0, silence = 0, dropped = 0;
+    uint64_t productions = 0, max_gap = 0;
+    unsigned min_queued = UINT32_MAX;
+    std::array<AudioAuditEvent, 64> events = {};
+};
+struct SwapAuditEvent { uint64_t start = 0, end = 0; };
+AudioAuditWindow audio_audit;
+FILE *audit_log = nullptr;
+uint64_t audit_last_production = 0;
+uint64_t audit_started = 0, audit_reported = 0, audit_swaps = 0;
+uint64_t audit_swap_total = 0, audit_swap_max = 0, audit_discarded = 0;
+uint64_t audit_last_present = 0, audit_present_gap_max = 0;
+double audit_emu = 0;
+std::array<SwapAuditEvent, 128> audit_swap_events = {};
+struct TickAuditEvent {
+    uint64_t end = 0, gap = 0, update = 0, delivered = 0, swaps = 0;
+    uint64_t swap_ns = 0, presents = 0, present_ns = 0, discarded = 0;
+    uint32_t previous_budget = 0, pending = 0, debt = 0, next_budget = 0, flags = 0;
+    int64_t cycles_before = 0, cycles_after = 0;
+    uint64_t excluded_before = 0, excluded_after = 0;
+    bool automatic = false;
+};
+TickAuditEvent audit_interval;
+std::array<TickAuditEvent, 4> audit_longest_ticks = {};
+uint64_t audit_tick_updates = 0, audit_cycle_changes = 0;
+unsigned audit_transitions = 0, audit_last_view_state = UINT32_MAX;
+uint32_t audit_last_pacing_flags = UINT32_MAX;
+int32_t audit_native_result = INT32_MIN;
+unsigned audit_native_flags = UINT32_MAX;
+
+void audit_state_change(const char *kind, int64_t value, unsigned flags)
+{
+    if (audit_transitions++ < 8)
+        MIXER_TimingAuditLog("AV_AUDIT state t_ms=%.3f kind=%s value=%lld flags=%u",
+                (MIXER_TimingAuditNow()-audit_started)/1e6, kind, (long long)value, flags);
+}
+}
+
+// Main thread only. Unlike LOG_MSG, this does not yield guest CPU cycles.
+void MIXER_TimingAuditLog(const char *format, ...)
+{
+    if (!audit_log) {
+        const char *enabled = std::getenv("MW2_AV_AUDIT");
+        if (!enabled || strcmp(enabled, "1")) return;
+        const char *path = std::getenv("MW2_AV_AUDIT_LOG");
+        audit_log = fopen(path && *path ? path : "av_timing.log", "a");
+        if (!audit_log) return;
+    }
+    va_list args;
+    va_start(args, format);
+    vfprintf(audit_log, format, args);
+    va_end(args);
+    fputc('\n', audit_log);
+}
+
+uint64_t MIXER_TimingAuditNow()
+{
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+void MIXER_TimingAuditTicks(uint32_t discarded)
+{
+    audit_discarded += discarded;
+    audit_interval.discarded += discarded;
+}
+
+void MIXER_TimingAuditSwap(uint64_t start)
+{
+    const uint64_t end = MIXER_TimingAuditNow();
+    audit_swap_events[audit_swaps++ % audit_swap_events.size()] = {start, end};
+    ++audit_interval.swaps;
+    audit_interval.swap_ns += end - start;
+    audit_swap_total += end - start;
+    audit_swap_max = std::max(audit_swap_max, end - start);
+    if (audit_last_present)
+        audit_present_gap_max = std::max(audit_present_gap_max, end - audit_last_present);
+    audit_last_present = end;
+}
+
+void MIXER_TimingAuditDeliveredTick()
+{
+    ++audit_interval.delivered;
+}
+
+void MIXER_TimingAuditTickUpdate(uint64_t start, uint32_t pending_before,
+        uint32_t debt_before, uint32_t pending_after, int64_t cycles_before,
+        uint64_t excluded_before, uint64_t excluded_after)
+{
+    const uint64_t end = MIXER_TimingAuditNow();
+    TickAuditEvent event = audit_interval;
+    event.end = end;
+    event.gap = audit_interval.end ? end-audit_interval.end : 0;
+    event.update = end-start;
+    event.pending = pending_before;
+    event.debt = debt_before;
+    event.next_budget = pending_after;
+    event.cycles_before = cycles_before;
+    event.cycles_after = CPU_CycleMax;
+    event.excluded_before = excluded_before;
+    event.excluded_after = excluded_after;
+    event.automatic = CPU_CycleAutoAdjust;
+    event.flags = MOD_FramePacingAuditFlags();
+    ++audit_tick_updates;
+    if (cycles_before != CPU_CycleMax) ++audit_cycle_changes;
+    if ((event.flags & ~4u) != audit_last_pacing_flags) {
+        audit_state_change("pacer", 0, event.flags);
+        audit_last_pacing_flags = event.flags & ~4u;
+    }
+    auto *shortest = &audit_longest_ticks[0];
+    for (auto &record : audit_longest_ticks)
+        if (record.gap < shortest->gap) shortest = &record;
+    if (event.gap > shortest->gap) *shortest = event;
+    audit_interval = {};
+    audit_interval.end = end;
+    audit_interval.previous_budget = pending_after;
+}
+
+void MIXER_TimingAuditPresentation(uint64_t start, unsigned view, bool active, bool invoked)
+{
+    ++audit_interval.presents;
+    audit_interval.present_ns += MIXER_TimingAuditNow()-start;
+    const unsigned state = view | (active ? 256u : 0u) | (invoked ? 512u : 0u);
+    if (state != audit_last_view_state) {
+        audit_state_change("presentation", view, state);
+        audit_last_view_state = state;
+    }
+}
+
+void MIXER_TimingAuditNativeState(int32_t result, unsigned flags)
+{
+    if (result != audit_native_result || flags != audit_native_flags) {
+        audit_state_change("native_compositor", result, flags);
+        audit_native_result = result;
+        audit_native_flags = flags;
+    }
+}
+
+void MIXER_TimingAuditService(bool final)
+{
+    if (!MIXER_TimingAuditEnabled)
+        return;
+    const uint64_t now = MIXER_TimingAuditNow();
+    if (!final && now - audit_reported < 1000000000ull)
+        return;
+#if C_SDL2
+    if (SDL2_AudioDevice) SDL_LockAudioDevice(SDL2_AudioDevice);
+#else
+    SDL_LockAudio();
+#endif
+    const AudioAuditWindow snapshot = audio_audit;
+    audio_audit = {};
+#if C_SDL2
+    if (SDL2_AudioDevice) SDL_UnlockAudioDevice(SDL2_AudioDevice);
+#else
+    SDL_UnlockAudio();
+#endif
+    const double emu = PIC_FullIndex();
+    const double wall_ms = (now - audit_reported) / 1e6;
+    MIXER_TimingAuditLog("AV_AUDIT window t_ms=%.3f final=%u wall_ms=%.3f emu_ms=%.3f emu_ratio=%.4f swaps=%llu swap_avg_ms=%.3f swap_max_ms=%.3f present_gap_max_ms=%.3f discarded_ticks=%llu productions=%llu production_gap_max_ms=%.3f callbacks=%llu min_queued=%u underruns=%llu silence_samples=%llu dropped_samples=%llu",
+            (now-audit_started)/1e6, (unsigned)final, wall_ms, emu-audit_emu,
+            wall_ms > 0 ? (emu-audit_emu)/wall_ms : 0,
+            (unsigned long long)audit_swaps, audit_swaps ? audit_swap_total/1e6/audit_swaps : 0,
+            audit_swap_max/1e6, audit_present_gap_max/1e6,
+            (unsigned long long)audit_discarded, (unsigned long long)snapshot.productions,
+            snapshot.max_gap/1e6, (unsigned long long)snapshot.callbacks,
+            snapshot.callbacks ? snapshot.min_queued : 0,
+            (unsigned long long)snapshot.underruns, (unsigned long long)snapshot.silence,
+            (unsigned long long)snapshot.dropped);
+    // Limit detail output to four underruns per window to avoid console I/O
+    // becoming the source of new stalls. Rings overwrite oldest events.
+    unsigned details = 0;
+    const uint64_t first = snapshot.callbacks > snapshot.events.size()
+            ? snapshot.callbacks - snapshot.events.size() : 0;
+    const uint64_t first_swap = audit_swaps > audit_swap_events.size()
+            ? audit_swaps - audit_swap_events.size() : 0;
+    for (uint64_t i = first; i < snapshot.callbacks && details < 4; ++i) {
+        const auto &e = snapshot.events[i % snapshot.events.size()];
+        if (!e.underrun) continue;
+        ++details;
+        MIXER_TimingAuditLog("AV_AUDIT underrun t_ms=%.3f production_age_ms=%.3f queued=%u requested=%u silence=%u dropped=%u prebuffer=%u muted=%u",
+                (e.time-audit_started)/1e6, e.production_gap/1e6,
+                e.queued, e.requested, e.silence, e.dropped,
+                (unsigned)e.prebuffer, (unsigned)e.muted);
+        // Most recent swap begun before this callback, including a swap
+        // still in progress at callback time. Same clock on both threads.
+        for (uint64_t j = audit_swaps; j > first_swap; --j) {
+            const auto &swap = audit_swap_events[(j-1) % audit_swap_events.size()];
+            if (swap.start > e.time) continue;
+            MIXER_TimingAuditLog("AV_AUDIT preceding_swap start_ms=%.3f end_ms=%.3f overlaps_callback=%u",
+                    (swap.start-audit_started)/1e6, (swap.end-audit_started)/1e6,
+                    (unsigned)(swap.end >= e.time));
+            break;
+        }
+    }
+    if (snapshot.underruns > details)
+        MIXER_TimingAuditLog("AV_AUDIT omitted_underrun_details=%llu",
+                (unsigned long long)(snapshot.underruns-details));
+    MIXER_TimingAuditLog("AV_AUDIT scheduler updates=%llu cycle_changes=%llu cycles_now=%lld auto=%u state=%u native_result=%d native_flags=%u presentation_state=%u omitted_states=%u open_tick_gap_ms=%.3f open_delivered=%llu open_swaps=%llu",
+            (unsigned long long)audit_tick_updates, (unsigned long long)audit_cycle_changes,
+            (long long)CPU_CycleMax, (unsigned)CPU_CycleAutoAdjust, MOD_FramePacingAuditFlags(),
+            audit_native_result, audit_native_flags, audit_last_view_state,
+            audit_transitions > 8 ? audit_transitions-8 : 0,
+            audit_interval.end ? (now-audit_interval.end)/1e6 : 0,
+            (unsigned long long)audit_interval.delivered,
+            (unsigned long long)audit_interval.swaps);
+    for (const auto &e : audit_longest_ticks) {
+        if (!e.end) continue;
+        MIXER_TimingAuditLog("AV_AUDIT tick_interval end_ms=%.3f gap_ms=%.3f update_ms=%.3f previous_budget=%u delivered=%llu pending_before=%u debt_before=%u next_budget=%u discarded=%llu swaps=%llu swap_ms=%.3f presents=%llu present_ms=%.3f cycles_before=%lld cycles_after=%lld excluded_before=%llu excluded_after=%llu auto=%u state=%u",
+                (e.end-audit_started)/1e6, e.gap/1e6, e.update/1e6,
+                e.previous_budget, (unsigned long long)e.delivered, e.pending, e.debt,
+                e.next_budget, (unsigned long long)e.discarded,
+                (unsigned long long)e.swaps, e.swap_ns/1e6,
+                (unsigned long long)e.presents, e.present_ns/1e6,
+                (long long)e.cycles_before, (long long)e.cycles_after,
+                (unsigned long long)e.excluded_before, (unsigned long long)e.excluded_after,
+                (unsigned)e.automatic, e.flags);
+    }
+    audit_longest_ticks = {};
+    audit_tick_updates = audit_cycle_changes = 0;
+    audit_transitions = 0;
+    if (audit_log) fflush(audit_log);
+    audit_reported = now;
+    audit_emu = emu;
+    audit_swaps = audit_swap_total = audit_swap_max = audit_discarded = 0;
+    audit_present_gap_max = 0;
+}
 
 uint32_t Mixer_MIXQ(void) {
 	return  ((uint32_t)mixer.freq) |
@@ -743,6 +988,13 @@ static void MIXER_Mix(void) {
     SDL_LockAudio();
 #endif
 
+    if (MIXER_TimingAuditEnabled) {
+        const uint64_t now = MIXER_TimingAuditNow();
+        if (audit_last_production)
+            audio_audit.max_gap = std::max(audio_audit.max_gap, now-audit_last_production);
+        audit_last_production = now;
+        ++audio_audit.productions;
+    }
     /* render */
     assert((mixer.work_in+mixer.samples_per_ms.w) <= MIXER_BUFSIZE);
     MIXER_MixData((Bitu)mixer.samples_this_ms.w * (Bitu)mixer.samples_this_ms.fd);
@@ -784,6 +1036,21 @@ static void SDLCALL MIXER_CallBack(void * userdata, Uint8 *stream, int len) {
     Bitu need = (Bitu)len/MIXER_SSIZE;
     int16_t *output = (int16_t*)stream;
     int remains;
+    AudioAuditEvent *audit_event = nullptr;
+    if (MIXER_TimingAuditEnabled) {
+        audit_event = &audio_audit.events[audio_audit.callbacks++ % audio_audit.events.size()];
+        *audit_event = {};
+        audit_event->time = MIXER_TimingAuditNow();
+        audit_event->production_gap = audit_last_production
+                ? audit_event->time-audit_last_production : 0;
+        int queued = (int)mixer.work_in - (int)mixer.work_out;
+        if (queued < 0) queued += (int)mixer.work_wrap;
+        audit_event->queued = (unsigned)std::max(queued, 0);
+        audit_event->requested = (unsigned)need;
+        audit_event->prebuffer = mixer.prebuffer_wait;
+        audit_event->muted = mixer.mute;
+        audio_audit.min_queued = std::min(audio_audit.min_queued, audit_event->queued);
+    }
 
     if (mixer.mute) {
         if ((CaptureState & (CAPTURE_WAVE|CAPTURE_VIDEO|CAPTURE_MULTITRACK_WAVE)) != 0)
@@ -816,6 +1083,14 @@ static void SDLCALL MIXER_CallBack(void * userdata, Uint8 *stream, int len) {
         }
     }
 
+    if (audit_event && !mixer.mute) {
+        audit_event->silence = (unsigned)need;
+        audio_audit.silence += need;
+        if (need && !mixer.prebuffer_wait) {
+            audit_event->underrun = true;
+            ++audio_audit.underruns;
+        }
+    }
     if (need > 0)
         mixer.prebuffer_wait = true;
 
@@ -837,6 +1112,10 @@ static void SDLCALL MIXER_CallBack(void * userdata, Uint8 *stream, int len) {
         else // subtle drop
             drop = (((unsigned int)remains - (unsigned int)(mixer.blocksize*2)) / 50U) + 1;
 
+        if (audit_event) {
+            audit_event->dropped = drop;
+            audio_audit.dropped += drop;
+        }
         while (drop > 0) {
             mixer.work_out++;
             if (mixer.work_out >= mixer.work_wrap) mixer.work_out = 0;
@@ -870,6 +1149,8 @@ std::string mixerinfo() {
 }
 
 static void MIXER_Stop(Section* sec) {
+    MIXER_TimingAuditService(true);
+    if (audit_log) { fclose(audit_log); audit_log = nullptr; }
     (void)sec;//UNUSED
 }
 
@@ -1060,6 +1341,12 @@ void MIXER_DOS_Boot(Section *) {
 }
 
 void MIXER_Init() {
+    const char *audit = std::getenv("MW2_AV_AUDIT");
+    MIXER_TimingAuditEnabled = audit && !strcmp(audit, "1");
+    if (MIXER_TimingAuditEnabled) {
+        audit_started = audit_reported = MIXER_TimingAuditNow();
+        audit_emu = PIC_FullIndex();
+    }
     AddExitFunction(AddExitFunctionFuncPair(MIXER_Stop));
 
     LOG(LOG_MISC,LOG_DEBUG)("Initializing DOSBox audio mixer");
@@ -1183,6 +1470,12 @@ void MIXER_Init() {
 
     AddVMEventFunction(VM_EVENT_DOS_INIT_KERNEL_READY,AddVMEventFunctionFuncPair(MIXER_DOS_Boot));
 
+    if (MIXER_TimingAuditEnabled)
+        MIXER_TimingAuditLog("AV_AUDIT schema=2 tick_gap=between_update_returns debt=host_ms_since_ticksLast budgets=guest_ms present_ms_includes_swap=1 state_bits=active:1,suspended:2,waiting:4,continuous:8,barrier:16,pending_safe:32,guest_call:64,view_eligible:128,pacer_running:256,safe_active:512 native_bits=available:1,mission:2,context:4,current_gl:8,presented:16,suspended:32,continuous:64 presentation_bits=view_low8,active:256,invoked:512");
+    if (MIXER_TimingAuditEnabled)
+        MIXER_TimingAuditLog("AV_AUDIT begin rate=%u blocksize=%u prebuffer_samples=%u sampleaccurate=%u nosound=%u",
+                mixer.freq, mixer.blocksize, (unsigned)mixer.prebuffer_samples,
+                (unsigned)mixer.sampleaccurate, (unsigned)mixer.nosound);
     MIXER_Controls_Init();
 }
 

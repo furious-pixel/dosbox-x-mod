@@ -538,6 +538,7 @@ static Bitu Normal_Loop(void) {
                 if (DOSBox_Paused() == false && ticksRemain > 0) {
                     const uint64_t timer_started = MOD_TimingBegin();
                     TIMER_AddTick();
+                    if (MIXER_TimingAuditEnabled) MIXER_TimingAuditDeliveredTick();
                     MOD_TimingEnd(MOD_TIMING_TIMER_TICK, timer_started);
                     ticksRemain--;
                 } else {
@@ -598,7 +599,29 @@ static void reset_auto_cycle_clock(uint32_t now)
         autoCycleHostWorkStarted = now;
 }
 
+// Capture every return path, including sleep, pacing, and auto-cycle updates.
+struct AuditTickUpdateScope {
+    uint64_t start = 0, excluded = 0;
+    uint32_t pending = 0, debt = 0;
+    int64_t cycles = 0;
+    AuditTickUpdateScope() {
+        if (MIXER_TimingAuditEnabled) {
+            start = MIXER_TimingAuditNow();
+            pending = ticksRemain;
+            debt = GetTicks() - ticksLast;
+            cycles = CPU_CycleMax;
+            excluded = autoCycleExcludedTicks;
+        }
+    }
+    ~AuditTickUpdateScope() {
+        if (start) MIXER_TimingAuditTickUpdate(start, pending, debt, ticksRemain, cycles,
+                                              excluded, autoCycleExcludedTicks);
+    }
+};
+
 void increaseticks() { //Make it return ticksRemain and set it in the function above to remove the global variable.
+    MIXER_TimingAuditService();
+    AuditTickUpdateScope audit_scope;
     static int32_t lastsleepDone = -1;
     static Bitu sleep1count = 0;
     const bool frame_pacing_waiting = MOD_FramePacingWaiting();
@@ -695,6 +718,13 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
     }
     ticksDone += (int32_t)autoTicksElapsed;
     if (ticksRemain > 20) {
+        // Keep short renderer stalls as debt rather than permanently slowing
+        // guest clocks. Limit retained debt after a pause/debugger/long stall.
+        const uint32_t retained = MOD_RenderActive() && emulator_speed == 100u
+                ? std::min<uint32_t>(ticksRemain - 20, 230u) : 0u;
+        ticksLast -= retained;
+        if (MIXER_TimingAuditEnabled)
+            MIXER_TimingAuditTicks(ticksRemain - 20 - retained);
         ticksRemain = 20;
     }
     ticksAdded = ticksRemain;
@@ -802,6 +832,16 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
         if (CPU_CycleMax < CPU_CYCLES_LOWER_LIMIT)
             CPU_CycleMax = CPU_CYCLES_LOWER_LIMIT;
     }
+}
+
+// Keep the next frame pending while the normal PIC/CPU loop pays timer debt.
+// Resource barriers cannot advance the guest until their final presentation.
+bool DOSBOX_ModPresentationMayRun()
+{
+    if (!MOD_RenderActive() || ticksLocked || emulator_speed != 100u ||
+        DOSBox_Paused() || MOD_SafePointBarrierActive())
+        return true;
+    return static_cast<uint64_t>(ticksRemain) + (GetTicks() - ticksLast) <= 2u;
 }
 
 void DOSBOX_BeginAutoCycleHostWork()
@@ -3879,7 +3919,7 @@ void DOSBOX_SetupConfigSections(void) {
             Pbool->Set_help(
                 "Prefer Bluetooth HFP (Hands-Free Profile) microphone mode.\n"
                 "This allows using the microphone of a BT headset but reduces\n"
-                "audio quality (typically 8kHz–16kHz telephone quality).\n"
+                "audio quality (typically 8kHzÃ¢â‚¬â€œ16kHz telephone quality).\n"
                 "When disabled, higher-quality microphones are preferred."
             );
             Pbool->SetBasic(true);

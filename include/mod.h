@@ -144,6 +144,7 @@ void MOD_SetFramePacingViewEligible(bool eligible);
 bool MOD_SetFramePacingSuspended(bool suspended);
 bool MOD_SetFramePacingContinuousPresentation(bool active);
 bool MOD_FramePacingWaiting(void);
+uint32_t MOD_FramePacingAuditFlags(void);
 bool MOD_FramePacingOwnsPresentation(void);
 void MOD_FramePacingNotifyReady(uint64_t ready_sequence);
 bool MOD_FramePacingTakePresentation(uint64_t *ready_sequence);

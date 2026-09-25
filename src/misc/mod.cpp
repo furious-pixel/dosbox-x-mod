@@ -2038,6 +2038,22 @@ bool MOD_SetFramePacingContinuousPresentation(bool active)
 	return true;
 }
 
+// Read-only diagnostics: active, suspended, waiting, continuous, barrier,
+// pending safe point, guest call, eligible view, running pacer, active safe point.
+uint32_t MOD_FramePacingAuditFlags(void)
+{
+    return (MOD_RenderActive() ? 1u : 0u) |
+           (g_frame_pacing.suspended ? 2u : 0u) |
+           (g_frame_pacing.waiting ? 4u : 0u) |
+           (g_frame_pacing.continuous_presentation ? 8u : 0u) |
+           (MOD_SafePointBarrierActive() ? 16u : 0u) |
+           (MOD_SafePointPending() ? 32u : 0u) |
+           (MOD_GuestCallActive() ? 64u : 0u) |
+           (g_frame_pacing.view_eligible ? 128u : 0u) |
+           (g_frame_pacing.phase == ModFramePacingPhase::Running ? 256u : 0u) |
+           (g_mod.safe_point_active ? 512u : 0u);
+}
+
 bool MOD_FramePacingWaiting(void)
 {
 	return g_frame_pacing.waiting && frame_pacing_runtime_ready(NULL);

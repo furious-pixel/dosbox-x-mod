@@ -10,6 +10,7 @@
 #include "logging.h"
 #include "mem.h"
 #include "mod.h"
+#include "mixer.h"
 #include "paging.h"
 
 #if C_OPENGL && defined(C_SDL2)
@@ -1092,14 +1093,22 @@ void DOSBoxNativeRenderer_ServiceResources(void)
 
 bool DOSBoxNativeRenderer_InvokeCompositor(const ModOpenGLState& state)
 {
-	if (!DOSBoxNativeRenderer_Available() || !g_native.mission ||
-	    !g_native.context_ready)
+    unsigned audit_flags = 0;
+    if (MIXER_TimingAuditEnabled) {
+        audit_flags = (DOSBoxNativeRenderer_Available() ? 1u : 0u) |
+                      (g_native.mission ? 2u : 0u) | (g_native.context_ready ? 4u : 0u);
+    }
+	if (!DOSBoxNativeRenderer_Available() || !g_native.mission || !g_native.context_ready) {
+        if (MIXER_TimingAuditEnabled) MIXER_TimingAuditNativeState(MW2ER_ERR_NOT_READY, audit_flags);
 		return false;
+    }
 #if C_OPENGL && defined(C_SDL2)
 	if (SDL_GL_GetCurrentContext() == NULL) {
+        if (MIXER_TimingAuditEnabled) MIXER_TimingAuditNativeState(MW2ER_ERR_NOT_READY, audit_flags);
 		LOG_MSG("NATIVE RENDERER ERROR: compositor has no current OpenGL context");
 		return false;
 	}
+    if (MIXER_TimingAuditEnabled) audit_flags |= 8u;
 #endif
 	g_native.viewport = make_viewport(state);
 	NativeCallScope crash_scope("composite_frame", state.present_count);
@@ -1120,11 +1129,18 @@ bool DOSBoxNativeRenderer_InvokeCompositor(const ModOpenGLState& state)
 			MOD_SetFramePacingSuspended(presented.suspend_frame_pacing != 0);
 			MOD_SetFramePacingContinuousPresentation(presented.continuous != 0);
 		}
+        if (MIXER_TimingAuditEnabled) {
+            audit_flags |= (presented.presented ? 16u : 0u) |
+                           (presented.suspend_frame_pacing ? 32u : 0u) |
+                           (presented.continuous ? 64u : 0u);
+            MIXER_TimingAuditNativeState(result, audit_flags);
+        }
 		if (result == MW2ER_OK && !presented.presented)
 			return false;
 	} else {
 		crash_scope.set_operation("composite");
 		result = g_native.api->composite(&g_native.viewport);
+        if (MIXER_TimingAuditEnabled) MIXER_TimingAuditNativeState(result, audit_flags);
 	}
 	if (result == MW2ER_ERR_NOT_READY)
 		return false;

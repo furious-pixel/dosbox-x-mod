@@ -19,6 +19,8 @@ extern "C" {
 #include "logging.h"
 #include "menudef.h"
 #include "mod.h"
+#include "mixer.h"
+#include <cstdlib>
 #include "../ints/int10.h"
 #include <output/output_opengl.h>
 #include <output/output_tools.h>
@@ -230,6 +232,14 @@ void OUTPUT_OPENGL_InstallDebugCallback()
             (unsigned long long)sdl_opengl.context_generation);
 }
 
+static void AuditOpenGLSwap()
+{
+    const uint64_t start = MIXER_TimingAuditEnabled ? MIXER_TimingAuditNow() : 0;
+    SDL_GL_SwapBuffers();
+    if (start)
+        MIXER_TimingAuditSwap(start);
+}
+
 static bool GetConfiguredOpenGLHostVsync(void)
 {
     const Section_prop *render_section = static_cast<const Section_prop *>(
@@ -256,6 +266,20 @@ static void ConfigureOpenGLSwapInterval(const int requested)
                 SDL_GetError());
 
     const int active = SDL_GL_GetSwapInterval();
+    const char *audit = std::getenv("MW2_AV_AUDIT");
+    if (audit && !strcmp(audit, "1")) {
+        const int display = SDL_GetWindowDisplayIndex(sdl.window);
+        SDL_DisplayMode mode = {};
+        const int result = display >= 0 ? SDL_GetCurrentDisplayMode(display, &mode) : -1;
+        const Section_prop *render = static_cast<const Section_prop *>(control->GetSection("render"));
+        const Section_prop *cpu = static_cast<const Section_prop *>(control->GetSection("cpu"));
+        const char *name = display >= 0 ? SDL_GetDisplayName(display) : nullptr;
+        MIXER_TimingAuditLog("AV_AUDIT display index=%d name=%s mode_valid=%u width=%d height=%d refresh_hz=%d swap_requested=%d swap_active=%d target_fps=%d cycles=%s",
+                display, name ? name : "unknown", (unsigned)(result == 0),
+                mode.w, mode.h, mode.refresh_rate, requested, active,
+                render ? render->Get_int("mod renderer target fps") : 0,
+                cpu ? cpu->Get_string("cycles") : "unknown");
+    }
     if (active != requested) {
         LOG_MSG("WARNING: OpenGL swap interval requested=%d active=%d",
                 requested,
@@ -1348,8 +1372,24 @@ Bitu OUTPUT_OPENGL_SetSize()
     return retFlags;
 }
 
+// Driver waits may occur in buffer mapping/upload or compositing, not only
+// in SwapBuffers. Nested presentation scopes share the host-work clock.
+class ModOpenGLHostWork {
+    const bool active = OUTPUT_OPENGL_ModRendererAvailable();
+public:
+    ModOpenGLHostWork() {
+        if (active) DOSBOX_BeginAutoCycleHostWork();
+    }
+    ~ModOpenGLHostWork() {
+        if (active) DOSBOX_EndAutoCycleHostWork();
+    }
+    ModOpenGLHostWork(const ModOpenGLHostWork&) = delete;
+    ModOpenGLHostWork& operator=(const ModOpenGLHostWork&) = delete;
+};
+
 bool OUTPUT_OPENGL_StartUpdate(uint8_t* &pixels, Bitu &pitch)
 {
+    const ModOpenGLHostWork host_work;
 #if C_XBRZ    
     if (sdl_xbrz.enable && sdl_xbrz.scale_on) 
     {
@@ -2026,7 +2066,7 @@ static void DrainInactiveModRenderBuffers(const OpenGLPresentationLayout &layout
         RestoreOpenGLPresentationState(layout);
 
         if (i + 1 < MOD_RENDER_INACTIVE_POST_SWAP_CLEARS)
-            SDL_GL_SwapBuffers();
+            AuditOpenGLSwap();
     }
 }
 
@@ -2088,6 +2128,8 @@ static void FinishOpenGLPresentation()
     if (MOD_GuestCallActive())
         return;
 
+    const ModOpenGLHostWork host_work;
+    const uint64_t audit_start = MIXER_TimingAuditEnabled ? MIXER_TimingAuditNow() : 0;
     const bool mod_render_active = MOD_RenderActive();
     const OpenGLPresentationLayout layout = BuildOpenGLPresentationLayout();
     const GLViewport fallback = BuildInactiveModFallbackViewport(layout);
@@ -2130,15 +2172,13 @@ static void FinishOpenGLPresentation()
     RestoreOpenGLPresentationState(layout);
     CaptureOpenGLPresentation(layout);
     const uint64_t swap_started = MOD_TimingBegin();
-    const bool exclude_mod_swap = OUTPUT_OPENGL_ModRendererAvailable();
-    if (exclude_mod_swap)
-        DOSBOX_BeginAutoCycleHostWork();
-    SDL_GL_SwapBuffers();
-    if (exclude_mod_swap)
-        DOSBOX_EndAutoCycleHostWork();
+    AuditOpenGLSwap();
     MOD_TimingEnd(MOD_TIMING_SWAP, swap_started);
     const bool new_mod_frame = RecordOpenGLPresentation(compositor_invoked);
     MOD_TimingPresentationBoundary(new_mod_frame);
+    if (audit_start)
+        MIXER_TimingAuditPresentation(audit_start, (unsigned)mod_render_view_mode, mod_render_active, compositor_invoked);
+    MIXER_TimingAuditService();
 
     if (drain_inactive_buffers)
         DrainInactiveModRenderBuffers(layout);
@@ -2161,7 +2201,8 @@ bool OUTPUT_OPENGL_ModPresentationRequired(void)
 
 void OUTPUT_OPENGL_PresentModFrame(void)
 {
-    if (sdl.updating || !OUTPUT_OPENGL_ModPresentationRequired())
+    if (sdl.updating || !OUTPUT_OPENGL_ModPresentationRequired() ||
+        !DOSBOX_ModPresentationMayRun())
         return;
 
     FinishOpenGLPresentation();
@@ -2175,7 +2216,8 @@ bool OUTPUT_OPENGL_PresentReadyModFrame(void)
     // bound until OUTPUT_OPENGL_EndUpdate. Presentation establishes its own
     // GL baseline, including unbinding that buffer, so it must wait for the
     // update to finish. Keep one-shot requests and paced frames pending.
-    if (MOD_GuestCallActive() || sdl.updating)
+    if (MOD_GuestCallActive() || sdl.updating ||
+        !DOSBOX_ModPresentationMayRun())
         return false;
 
     if (mod_render_presentation_requested) {
@@ -2202,6 +2244,7 @@ bool OUTPUT_OPENGL_PresentReadyModFrame(void)
 
 void OUTPUT_OPENGL_EndUpdate(const uint16_t *changedLines)
 {
+    const ModOpenGLHostWork host_work;
     if (!(sdl.must_redraw_all && changedLines == NULL)) 
     {
 #if C_XBRZ
@@ -2333,7 +2376,9 @@ void OUTPUT_OPENGL_EndUpdate(const uint16_t *changedLines)
             return;
 
         if (!MOD_GuestCallActive() &&
-            !MOD_FramePacingOwnsPresentation())
+            !MOD_FramePacingOwnsPresentation() &&
+            (mod_render_view_mode == MOD_RENDER_VIEW_GAME_ONLY ||
+             DOSBOX_ModPresentationMayRun()))
             FinishOpenGLPresentation();
 
 #if 0 /* DEBUG Prove to me that you're drawing the damn texture */

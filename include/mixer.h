@@ -148,4 +148,17 @@ void PCSPEAKER_SetCounter(Bitu cntr,Bitu mode);
 void PCSPEAKER_SetType(bool pit_clock_gate_enabled, bool pit_output_enabled);
 void PCSPEAKER_SetPITControl(Bitu mode);
 
+extern bool MIXER_TimingAuditEnabled;
+uint64_t MIXER_TimingAuditNow();
+void MIXER_TimingAuditLog(const char *format, ...);
+void MIXER_TimingAuditSwap(uint64_t start);
+void MIXER_TimingAuditTicks(uint32_t discarded);
+void MIXER_TimingAuditService(bool final = false);
+void MIXER_TimingAuditDeliveredTick();
+void MIXER_TimingAuditTickUpdate(uint64_t start, uint32_t pending_before,
+        uint32_t debt_before, uint32_t pending_after, int64_t cycles_before,
+        uint64_t excluded_before, uint64_t excluded_after);
+void MIXER_TimingAuditPresentation(uint64_t start, unsigned view, bool active, bool invoked);
+void MIXER_TimingAuditNativeState(int32_t result, unsigned flags);
+
 #endif

@@ -52,15 +52,6 @@ jobs:
           $manifest = Get-Content package/HOST_BUILD_INFO.json -Raw | ConvertFrom-Json
           if (@($manifest.worktree_changes).Count) { throw 'Unexpected host source modifications' }
           Compress-Archive -Path package/* -DestinationPath "${{ env.package_stem }}.zip"
-          git archive --format=tar --output=host-source.tar HEAD
-          if ($LASTEXITCODE) { throw 'Host source archive failed' }
-          New-Item -ItemType Directory source-stage | Out-Null
-          tar -xf host-source.tar -C source-stage
-          if ($LASTEXITCODE) { throw 'Host source extraction failed' }
-          Copy-Item include/build_timestamp.h source-stage/include/build_timestamp.h
-          Copy-Item package/HOST_BUILD_INFO.json source-stage/HOST_BUILD_INFO.json
-          Add-Type -AssemblyName System.IO.Compression.FileSystem
-          [System.IO.Compression.ZipFile]::CreateFromDirectory((Join-Path $PWD 'source-stage'), (Join-Path $PWD '${{ env.package_stem }}-source.zip'))
           Get-ChildItem "${{ env.package_stem }}*.zip" | ForEach-Object {
             "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($_.Name)" | Set-Content "$($_.FullName).sha256" -Encoding ascii
           }

@@ -51,7 +51,7 @@ $manifest = [ordered]@{
     revision = $revision
     worktree_changes = $changes
     executable_sha256 = (Get-FileHash (Join-Path $dest 'dosbox-x.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
-    source_url = "https://github.com/furious-pixel/dosbox-x-mod/tree/$revision"
+    source_url = "https://github.com/furious-pixel/dosbox-x-mod/archive/$revision.zip"
     configuration = 'Release SDL2 x64'
     generated_header_sha256 = (Get-FileHash (Join-Path $root 'include/build_timestamp.h') -Algorithm SHA256).Hash.ToLowerInvariant()
 }

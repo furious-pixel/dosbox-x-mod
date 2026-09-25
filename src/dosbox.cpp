@@ -306,6 +306,7 @@ static uint32_t           ticksRemain;
 static uint32_t           ticksRemainSpeedFrac;
 static uint32_t           ticksLast;
 static uint32_t           autoCycleTicksLast;
+static uint32_t           autoCycleSpeedFrac;
 static uint32_t           autoCycleHostWorkStarted;
 static uint32_t           autoCycleHostWorkDepth;
 static uint64_t           autoCycleExcludedTicks;
@@ -588,6 +589,15 @@ static Bitu Normal_Loop(void) {
 	return 0;
 }
 
+static void reset_auto_cycle_clock(uint32_t now)
+{
+    autoCycleTicksLast = now;
+    autoCycleSpeedFrac = 0;
+    autoCycleExcludedTicks = 0;
+    if (autoCycleHostWorkDepth != 0)
+        autoCycleHostWorkStarted = now;
+}
+
 void increaseticks() { //Make it return ticksRemain and set it in the function above to remove the global variable.
     static int32_t lastsleepDone = -1;
     static Bitu sleep1count = 0;
@@ -597,8 +607,7 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
         ticksRemain = 5;
         /* Reset any auto cycle guessing for this frame */
         ticksLast = GetTicks();
-        autoCycleTicksLast = ticksLast;
-        autoCycleExcludedTicks = 0;
+        reset_auto_cycle_clock(ticksLast);
         ticksAdded = 0;
         ticksDone = 0;
         ticksScheduled = 0;
@@ -607,7 +616,7 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
     uint32_t ticksNew = GetTicks();
     ticksScheduled += ticksAdded;
 
-    if (ticksNew <= ticksLast) { //lower should not be possible, only equal.
+    if (ticksNew == ticksLast) {
         ticksAdded = 0;
 
         const uint64_t sleep_started = MOD_TimingBegin();
@@ -645,15 +654,14 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
             CPU_IODelayRemoved = 0;
             ticksDone = 0;
             ticksScheduled = 0;
-            autoCycleTicksLast = GetTicks();
-            autoCycleExcludedTicks = 0;
+            reset_auto_cycle_clock(GetTicks());
             lastsleepDone = -1;
             sleep1count = 0;
         }
         return;
     }
 
-    //ticksNew > ticksLast
+    // Unsigned subtraction also handles the millisecond counter wrapping.
     ticksRemain = ticksNew - ticksLast;
 
     if (emulator_speed != 100u) {
@@ -667,24 +675,32 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
     }
 
     ticksLast = ticksNew;
-    uint32_t autoTicksElapsed = ticksNew >= autoCycleTicksLast
-                                        ? ticksNew - autoCycleTicksLast
-                                        : 0;
+    uint32_t autoTicksElapsed = ticksNew - autoCycleTicksLast;
     autoCycleTicksLast = ticksNew;
+    if (autoCycleHostWorkDepth != 0) {
+        autoCycleExcludedTicks += ticksNew - autoCycleHostWorkStarted;
+        autoCycleHostWorkStarted = ticksNew;
+    }
     const uint32_t excludedTicks = static_cast<uint32_t>(
             std::min<uint64_t>(autoCycleExcludedTicks, autoTicksElapsed));
     autoCycleExcludedTicks -= excludedTicks;
     autoTicksElapsed -= excludedTicks;
     if (emulator_speed != 100u) {
-        autoTicksElapsed = static_cast<uint32_t>(
-                (static_cast<uint64_t>(autoTicksElapsed) * emulator_speed) /
-                100u);
+        const uint64_t scaled = static_cast<uint64_t>(autoTicksElapsed) *
+                                        emulator_speed + autoCycleSpeedFrac;
+        autoCycleSpeedFrac = static_cast<uint32_t>(scaled % 100u);
+        autoTicksElapsed = static_cast<uint32_t>(scaled / 100u);
+    } else {
+        autoCycleSpeedFrac = 0;
     }
     ticksDone += (int32_t)autoTicksElapsed;
     if (ticksRemain > 20) {
         ticksRemain = 20;
     }
     ticksAdded = ticksRemain;
+    // Host waits must not trigger either long-interval downscale shortcut.
+    // Guest timer delivery and its scheduled-cycle count still use wall time.
+    const uint32_t autoTicksAdded = std::min<uint32_t>(autoTicksElapsed, 20u);
 
     // Pacing time is intentional host-side idle time, not evidence that the
     // emulated CPU is overloaded. Keep guest timer delivery above, but keep
@@ -694,6 +710,7 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
         ticksAdded = 0;
         ticksDone = 0;
         ticksScheduled = 0;
+        reset_auto_cycle_clock(ticksNew);
         lastsleepDone = -1;
         sleep1count = 0;
         return;
@@ -703,7 +720,7 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
     if (!CPU_CycleAutoAdjust || CPU_SkipCycleAutoAdjust)
         return;
 
-    if (ticksScheduled >= 250 || ticksDone >= 250 || (ticksAdded > 15 && ticksScheduled >= 5)) {
+    if (ticksScheduled >= 250 || ticksDone >= 250 || (autoTicksAdded > 15 && ticksScheduled >= 5)) {
         if (ticksDone < 1) ticksDone = 1; // Protect against div by zero
         /* ratio we are aiming for is around 90% usage*/
         int32_t ratio = (int32_t)((ticksScheduled * (CPU_CyclePercUsed * 90 * 1024 / 100 / 100)) / ticksDone);
@@ -726,7 +743,7 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
                     ratio = 5120;
 
                 // When downscaling multiple times in a row, ensure a minimum amount of downscaling
-                if (ticksAdded > 15 && ticksScheduled >= 5 && ticksScheduled <= 20 && ratio > 800)
+                if (autoTicksAdded > 15 && ticksScheduled >= 5 && ticksScheduled <= 20 && ratio > 800)
                     ratio = 800;
 
                 if (ratio <= 1024) {
@@ -776,8 +793,8 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
         lastsleepDone = -1;
         sleep1count = 0;
     }
-    else if (ticksAdded > 15) {
-        /* ticksAdded > 15 but ticksScheduled < 5, lower the cycles
+    else if (autoTicksAdded > 15) {
+        /* autoTicksAdded > 15 but ticksScheduled < 5, lower the cycles
            but do not reset the scheduled/done ticks to take them into
            account during the next auto cycle adjustment */
         RDTSC_rebase();
@@ -795,11 +812,8 @@ void DOSBOX_BeginAutoCycleHostWork()
 
 void DOSBOX_EndAutoCycleHostWork()
 {
-    if (autoCycleHostWorkDepth == 0)
+    if (autoCycleHostWorkDepth == 0 || --autoCycleHostWorkDepth != 0)
         return;
-    if (--autoCycleHostWorkDepth != 0)
-        return;
-
     autoCycleExcludedTicks += GetTicks() - autoCycleHostWorkStarted;
 }
 
@@ -992,10 +1006,8 @@ void DOSBOX_InitTickLoop() {
     ticksLocked = section->Get_bool("turbo");
     ticksLastRTtime = 0;
     ticksLast = GetTicks();
-    autoCycleTicksLast = ticksLast;
-    autoCycleHostWorkStarted = 0;
     autoCycleHostWorkDepth = 0;
-    autoCycleExcludedTicks = 0;
+    reset_auto_cycle_clock(ticksLast);
     ticksLastRTcounter = GetTicks();
     ticksLastFramecounter = GetTicks();
     DOSBOX_SetLoop(&Normal_Loop);
@@ -2221,11 +2233,15 @@ void DOSBOX_SetupConfigSections(void) {
 
     Pint = secprop->Add_int("mod renderer target fps",Property::Changeable::OnlyAtStart,0);
     Pint->SetMinMax(0,240);
-    Pint->Set_help("Pace supported mod-renderer-only gameplay at this frame rate. 0 disables pacing.");
+    Pint->Set_help("Pace the supported game frame loop in original, mod-only and side-by-side views. 0 disables pacing.");
     Pint->SetBasic(true);
 
     Pbool = secprop->Add_bool("mod renderer host vsync",Property::Changeable::OnlyAtStart,false);
     Pbool->Set_help("Synchronize OpenGL presentation to the host display without changing emulated VGA timing.");
+    Pbool->SetBasic(true);
+
+    Pbool = secprop->Add_bool("opengl debug output",Property::Changeable::OnlyAtStart,false);
+    Pbool->Set_help("Log OpenGL KHR_debug errors and warnings. Intended for diagnostics only.");
     Pbool->SetBasic(true);
 
     Pstring = secprop->Add_string("mod renderer start view",Property::Changeable::OnlyAtStart,"side-by-side");
@@ -5538,10 +5554,8 @@ private:
 		// Reset any auto cycle guessing for this frame
 		ticksRemain=5;
 		ticksLast = GetTicks();
-		autoCycleTicksLast = ticksLast;
-		autoCycleHostWorkStarted = 0;
 		autoCycleHostWorkDepth = 0;
-		autoCycleExcludedTicks = 0;
+		reset_auto_cycle_clock(ticksLast);
 		ticksAdded = 0;
 		ticksDone = 0;
 		ticksScheduled = 0;

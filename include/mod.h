@@ -62,6 +62,7 @@ enum ModTimingCategory {
 	MOD_TIMING_CPU_DECODER = 0,
 	MOD_TIMING_PIC_EVENT,
 	MOD_TIMING_PYTHON_HOOK,
+	MOD_TIMING_NATIVE_RENDERER_HOOK,
 	MOD_TIMING_SAFE_POINT,
 	MOD_TIMING_DYNAMIC_COMPILE,
 	MOD_TIMING_COMPOSITOR,
@@ -134,9 +135,11 @@ void MOD_OnExecutableStarted(const char *name, uint16_t pspseg);
 void MOD_OnTerminatePSP(uint16_t pspseg, bool tsr, uint8_t exitcode);
 bool MOD_FastEnabled(void);
 bool MOD_RenderActive(void);
+const char *MOD_GetRendererSourceName(void);
 bool MOD_GuestCallActive(void);
 int32_t MOD_OnCallsite(uint32_t linear_eip);
 bool MOD_CallsiteCanBeSuppressed(uint32_t linear_eip);
+void MOD_SetSceneRasterSuppressionViewEligible(bool eligible);
 void MOD_SetFramePacingViewEligible(bool eligible);
 bool MOD_SetFramePacingSuspended(bool suspended);
 bool MOD_SetFramePacingContinuousPresentation(bool active);
@@ -144,7 +147,6 @@ bool MOD_FramePacingWaiting(void);
 bool MOD_FramePacingOwnsPresentation(void);
 void MOD_FramePacingNotifyReady(uint64_t ready_sequence);
 bool MOD_FramePacingTakePresentation(uint64_t *ready_sequence);
-void MOD_FramePacingPresented(uint64_t ready_sequence);
 bool MOD_SetSceneRasterSuppression(bool enabled);
 void MOD_DisableSceneRasterSuppression(void);
 bool MOD_GetSceneRasterSuppressionStats(ModSceneRasterSuppressionStats *stats);
@@ -160,13 +162,8 @@ bool MOD_CallRelocFunction(uint32_t reloc_eip,
 uint64_t MOD_TimingBegin(void);
 uint64_t MOD_TimingEnd(ModTimingCategory category, uint64_t started_ns);
 void MOD_TimingRecordFramePacingSleep(uint64_t elapsed_ns);
-void MOD_TimingCountNativeFrame(void);
 void MOD_TimingCountModFrameReady(void);
-void MOD_TimingPresentationBoundary(bool compositor_invoked,
-                                    bool new_mod_frame,
-                                    uint64_t compositor_ns,
-                                    uint64_t swap_ns,
-                                    const char *source);
+void MOD_TimingPresentationBoundary(bool new_mod_frame);
 bool MOD_GetTimingSummary(ModTimingSummary *summary);
 
 bool MOD_ReadMemoryU8(uint32_t reloc_addr, uint8_t *value);

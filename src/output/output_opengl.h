@@ -151,6 +151,7 @@ struct OpenGLModPresentationMetrics {
 
 // output API
 void OUTPUT_OPENGL_Initialize();
+void OUTPUT_OPENGL_InstallDebugCallback();
 /* Anton Shepelev: the GLKind parameter violates the generality of the API, */
 /* but I think will do until a more useful general API is adopted. One      */
 /* example of doing it seen in my original Pixel-perfect patch:             */
@@ -164,9 +165,12 @@ bool OUTPUT_OPENGL_CapturesPresentedScreenshot(void);
 void OUTPUT_OPENGL_PresentModFrame(void);
 bool OUTPUT_OPENGL_PresentReadyModFrame(void);
 bool OUTPUT_OPENGL_ModRendererAvailable(void);
+bool OUTPUT_OPENGL_ModRenderViewShowsRenderer(void);
 uint64_t OUTPUT_OPENGL_NotifyModFrameReady(void);
+void OUTPUT_OPENGL_RequestModPresentation(void);
 void OUTPUT_OPENGL_GetModPresentationMetrics(OpenGLModPresentationMetrics *metrics);
 void OUTPUT_OPENGL_Shutdown();
+void OUTPUT_OPENGL_ReleaseContext();
 bool OUTPUT_OPENGL_ToggleModRenderSingleView(Bitu *target_width,
                                               Bitu *target_height);
 bool OUTPUT_OPENGL_ToggleModRenderComparisonView(bool suppress_native_scene,

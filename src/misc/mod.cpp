@@ -5,10 +5,15 @@
 #include "cpu.h"
 #include "dosbox.h"
 #include "dosbox_python.h"
+#include "dosbox_native_renderer.h"
+#include "mw2er_abi.h"
 #include "logging.h"
 #include "mem.h"
 #include "paging.h"
 #include "timer.h"
+#if C_OPENGL
+#include <output/output_opengl.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -16,6 +21,7 @@
 #include <cctype>
 #include <cstdarg>
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <iterator>
 #include <limits>
@@ -51,6 +57,12 @@ struct ModHookRuntime {
 	std::string description = {};
 };
 
+struct ModNativeHookRuntime {
+	uint32_t event = 0;
+	uint32_t kind = 0;
+	uint32_t reloc_eip = 0;
+};
+
 struct ModCallSuppressionSiteRuntime {
 	uint32_t callsite_reloc = 0;
 	uint32_t callsite_linear = 0;
@@ -64,6 +76,8 @@ static const size_t MOD_NO_CALL_SUPPRESSION_SITE = static_cast<size_t>(-1);
 
 struct ModCallsiteRuntime {
 	std::vector<size_t> python_hook_indices = {};
+	uint32_t native_renderer_event = 0;
+	uint32_t native_renderer_kind = 0;
 	bool scene_raster_phase_enter = false;
 	bool scene_raster_phase_leave = false;
 	size_t scene_raster_suppression_index = MOD_NO_CALL_SUPPRESSION_SITE;
@@ -86,6 +100,8 @@ struct ModExecutableRuntime {
 	bool process_start_pending = false;
 	uint16_t process_start_psp = 0;
 	std::vector<ModHookRuntime> hooks = {};
+	std::vector<ModNativeHookRuntime> native_renderer_hooks = {};
+	bool has_native_renderer_hooks = false;
 	std::unordered_map<uint32_t, ModCallsiteRuntime> callsites = {};
 	bool scene_raster_suppression_validated = false;
 	bool scene_raster_suppression_requested = false;
@@ -115,6 +131,7 @@ struct ModRuntime {
 	bool guest_call_active = false;
 	bool guest_call_stopped = false;
 	Bitu guest_call_stop_callback = 0;
+	bool scene_raster_suppression_view_eligible = false;
 	std::vector<ModExecutableRuntime> executables = {};
 };
 
@@ -127,9 +144,8 @@ static void reset_safe_point_barrier(void)
 }
 
 enum class ModFramePacingPhase {
-	Inactive,
-	AwaitingFirstFrame,
-	Running,
+	Inactive = 0,
+	Running = 2,
 };
 
 struct ModFramePacingState {
@@ -143,7 +159,6 @@ struct ModFramePacingState {
 	bool ready_since_release = false;
 	bool presentation_pending = false;
 	uint64_t pending_ready_sequence = 0;
-	uint64_t last_frame_start_ns = 0;
 	uint64_t next_deadline_ns = 0;
 	uint64_t continuous_presentation_deadline_ns = 0;
 	uint64_t deferred_checks = 0;
@@ -161,19 +176,23 @@ static ModFramePacingState g_frame_pacing = {};
 
 static void timing_write_pacing_summary(bool final);
 
+static void reset_frame_pacing_presentation_state(void)
+{
+	g_frame_pacing.continuous_presentation = false;
+	g_frame_pacing.ready_since_release = false;
+	g_frame_pacing.presentation_pending = false;
+	g_frame_pacing.pending_ready_sequence = 0;
+	g_frame_pacing.continuous_presentation_deadline_ns = 0;
+}
+
 static void reset_frame_pacing_runtime_state(void)
 {
 	if (g_frame_pacing.interval_released_frames > 0)
 		timing_write_pacing_summary(true);
 	g_frame_pacing.phase = ModFramePacingPhase::Inactive;
 	g_frame_pacing.waiting = false;
-	g_frame_pacing.continuous_presentation = false;
-	g_frame_pacing.ready_since_release = false;
-	g_frame_pacing.presentation_pending = false;
-	g_frame_pacing.pending_ready_sequence = 0;
-	g_frame_pacing.last_frame_start_ns = 0;
+	reset_frame_pacing_presentation_state();
 	g_frame_pacing.next_deadline_ns = 0;
-	g_frame_pacing.continuous_presentation_deadline_ns = 0;
 	g_frame_pacing.deferred_checks = 0;
 	g_frame_pacing.released_frames = 0;
 	g_frame_pacing.total_lateness_ns = 0;
@@ -193,10 +212,9 @@ static const double MOD_TIMING_SPIKE_THRESHOLD_MS = 25.0;
 struct ModTimingAccumulator {
 	std::array<uint64_t, MOD_TIMING_CATEGORY_COUNT> elapsed_ns = {};
 	std::array<uint64_t, MOD_TIMING_CATEGORY_COUNT> maximum_ns = {};
-	uint32_t native_frames = 0;
+	double native_extract_ms = 0.0;
+	double native_draw_submit_ms = 0.0;
 	uint32_t ready_frames = 0;
-	uint32_t presentations = 0;
-	uint32_t new_mod_presentations = 0;
 	uint64_t frame_pacing_sleep_ns = 0;
 };
 
@@ -209,6 +227,7 @@ struct ModTimingHistory {
 enum ModTimingSpikeCause {
 	MOD_TIMING_SPIKE_CPU = 0,
 	MOD_TIMING_SPIKE_PYTHON_HOOK,
+	MOD_TIMING_SPIKE_NATIVE_HOOK,
 	MOD_TIMING_SPIKE_PIC,
 	MOD_TIMING_SPIKE_SAFE_POINT,
 	MOD_TIMING_SPIKE_GFX_EVENTS,
@@ -232,6 +251,10 @@ struct ModTimingWindow {
 	uint64_t other_maximum_ns = 0;
 	uint64_t frame_pacing_sleep_total_ns = 0;
 	uint64_t frame_pacing_sleep_maximum_ns = 0;
+	double native_extract_total_ms = 0.0;
+	double native_extract_maximum_ms = 0.0;
+	double native_draw_submit_total_ms = 0.0;
+	double native_draw_submit_maximum_ms = 0.0;
 	uint64_t worst_frame = 0;
 	uint64_t worst_frame_ns = 0;
 };
@@ -252,8 +275,27 @@ struct ModTimingState {
 
 static ModTimingState g_mod_timing = {};
 static FILE *g_mod_timing_log = NULL;
-// Buffer the infrequent summaries so frame processing never forces disk I/O.
+// Buffer individual records and flush once per summary window.
 static std::array<char, 1024u * 1024u> g_mod_timing_log_buffer = {};
+
+struct ModStartupSample {
+	ModTimingAccumulator costs = {};
+	uint64_t clock_ns = 0, frame = 0, interval_ns = 0, scope_ns = 0;
+	uint64_t ready = 0, released = 0, missed = 0;
+	int64_t cycles = 0;
+	uint32_t flags = 0, phase = 0;
+	char kind = 0;
+};
+
+struct ModStartupTrace {
+	std::array<ModStartupSample, 8192> samples = {};
+	size_t count = 0;
+	uint64_t id = 0, start_ns = 0, scene_ns = 0;
+	bool recording = false, loading = false;
+	const char *stop_reason = "session-end";
+};
+
+static ModStartupTrace g_startup_trace;
 
 static uint64_t timing_now_ns(void)
 {
@@ -316,12 +358,12 @@ static void refresh_timing_summary(void)
 	summary.present_spikes = g_mod_timing.present_spikes;
 }
 
-static bool timing_log_line(const char *format, ...)
+static void timing_log_line(const char *format, ...)
 {
 	if (!g_mod_timing_log) {
 		g_mod_timing_log = fopen("frame_timing.log", "a");
 		if (!g_mod_timing_log)
-			return false;
+			return;
 		setvbuf(g_mod_timing_log,
 		        g_mod_timing_log_buffer.data(),
 		        _IOFBF,
@@ -333,7 +375,125 @@ static bool timing_log_line(const char *format, ...)
 	vfprintf(g_mod_timing_log, format, arguments);
 	va_end(arguments);
 	fputc('\n', g_mod_timing_log);
-	return true;
+}
+
+static void timing_startup_record(char kind, uint64_t frame, uint64_t now,
+	                              uint64_t interval_ns, bool new_mod_frame);
+
+static void timing_startup_flush(const char *reason)
+{
+	ModStartupTrace &trace = g_startup_trace;
+	if (!trace.start_ns)
+		return;
+	if (trace.recording) {
+		const uint64_t now = timing_now_ns();
+		const uint64_t origin = g_mod_timing.frame_boundary_ns
+		                              ? g_mod_timing.frame_boundary_ns : trace.start_ns;
+		timing_startup_record('E', g_mod_timing.last_frame, now,
+		                      now - std::max(origin, trace.start_ns), false);
+	}
+	trace.recording = false;
+	timing_log_line(
+	        "STARTUP_HOST begin id=%llu clock_ms=%.3f records=%u stop=%s flush=%s target_fps=%u "
+	        "components=completed_inclusive_calls_since_frame_boundary "
+	        "present_snapshots_overlap_frame_samples=1 "
+	        "scope_may_precede_capture=1 "
+	        "flags=auto:1,skip_auto:2,suspended:4,waiting:8,continuous:16,view_eligible:32,new_mod_frame:64,loading:128 "
+	        "phase=inactive:0,running:2",
+	        static_cast<unsigned long long>(trace.id), timing_ns_to_ms(trace.start_ns),
+	        static_cast<unsigned int>(trace.count), trace.stop_reason, reason, g_frame_pacing.target_fps);
+	for (size_t i = 0; i < trace.count; ++i) {
+		const ModStartupSample &s = trace.samples[i];
+		const auto ms = [&s](ModTimingCategory category) {
+			return timing_ns_to_ms(s.costs.elapsed_ns[category]);
+		};
+		timing_log_line(
+		        "STARTUP_HOST sample id=%llu kind=%c clock_ms=%.3f elapsed_ms=%.3f frame=%llu "
+		        "interval_ms=%.3f scope_ms=%.3f ready=%llu scope_ready=%u cycles=%lld flags=%u phase=%u released=%llu missed=%llu "
+		        "cpu_ms=%.3f python_ms=%.3f native_ms=%.3f extract_ms=%.3f draw_submit_ms=%.3f "
+		        "pic_ms=%.3f safe_ms=%.3f dyn_ms=%.3f events_ms=%.3f timer_ms=%.3f tick_ms=%.3f "
+		        "sleep_ms=%.3f pacing_sleep_ms=%.3f compositor_ms=%.3f swap_ms=%.3f swap_call_max_ms=%.3f",
+		        static_cast<unsigned long long>(trace.id), s.kind,
+		        timing_ns_to_ms(s.clock_ns), timing_ns_to_ms(s.clock_ns - trace.start_ns),
+		        static_cast<unsigned long long>(s.frame), timing_ns_to_ms(s.interval_ns),
+		        timing_ns_to_ms(s.scope_ns), static_cast<unsigned long long>(s.ready),
+		        s.costs.ready_frames, static_cast<long long>(s.cycles), s.flags, s.phase,
+		        static_cast<unsigned long long>(s.released), static_cast<unsigned long long>(s.missed),
+		        ms(MOD_TIMING_CPU_DECODER), ms(MOD_TIMING_PYTHON_HOOK),
+		        ms(MOD_TIMING_NATIVE_RENDERER_HOOK), s.costs.native_extract_ms,
+		        s.costs.native_draw_submit_ms, ms(MOD_TIMING_PIC_EVENT),
+		        ms(MOD_TIMING_SAFE_POINT), ms(MOD_TIMING_DYNAMIC_COMPILE),
+		        ms(MOD_TIMING_GFX_EVENTS), ms(MOD_TIMING_TIMER_TICK),
+		        ms(MOD_TIMING_TICK_CONTROL), ms(MOD_TIMING_TICK_SLEEP),
+		        timing_ns_to_ms(s.costs.frame_pacing_sleep_ns), ms(MOD_TIMING_COMPOSITOR),
+		        ms(MOD_TIMING_SWAP), timing_ns_to_ms(s.costs.maximum_ns[MOD_TIMING_SWAP]));
+	}
+	timing_log_line("STARTUP_HOST end id=%llu kind_F=frame_end kind_P=post_swap kind_E=partial_end "
+	                "first_interval_uses_capture_start=1 capacity=%u",
+	                static_cast<unsigned long long>(trace.id),
+	                static_cast<unsigned int>(trace.samples.size()));
+	if (g_mod_timing_log)
+		fflush(g_mod_timing_log);
+	trace.start_ns = 0;
+	trace.count = 0;
+}
+
+static void timing_startup_begin(void)
+{
+	timing_startup_flush("restart");
+	const char *enabled = getenv("MW2_STARTUP_TRACE");
+	if (!enabled || enabled[0] != '1' || enabled[1] != '\0')
+		return;
+	ModStartupTrace &trace = g_startup_trace;
+	++trace.id;
+	trace.start_ns = timing_now_ns();
+	trace.scene_ns = 0;
+	trace.loading = false;
+	trace.recording = true;
+	trace.stop_reason = "session-end";
+}
+
+static void timing_startup_record(char kind, uint64_t frame, uint64_t now,
+	                              uint64_t interval_ns, bool new_mod_frame)
+{
+	ModStartupTrace &trace = g_startup_trace;
+	if (!trace.recording)
+		return;
+	if (kind == 'P' && new_mod_frame && !trace.loading && !trace.scene_ns)
+		trace.scene_ns = now;
+	if (now - trace.start_ns >= 120000000000ull ||
+	    (trace.scene_ns && now - trace.scene_ns >= 8000000000ull)) {
+		trace.recording = false;
+		trace.stop_reason = now - trace.start_ns >= 120000000000ull
+		                            ? "time-limit" : "scene-window";
+		return;
+	}
+	if (trace.count == trace.samples.size()) {
+		trace.recording = false;
+		trace.stop_reason = "capacity-truncated";
+		return;
+	}
+	ModStartupSample &s = trace.samples[trace.count++];
+	s.costs = g_mod_timing.current;
+	s.clock_ns = now;
+	s.frame = frame;
+	s.interval_ns = interval_ns;
+	const uint64_t origin = g_mod_timing.frame_boundary_ns
+	                              ? g_mod_timing.frame_boundary_ns : trace.start_ns;
+	s.scope_ns = now >= origin ? now - origin : 0;
+	s.ready = g_mod_timing.ready_total;
+	s.released = g_frame_pacing.released_frames;
+	s.missed = g_frame_pacing.missed_deadlines;
+	s.cycles = CPU_CycleMax;
+	s.phase = static_cast<uint32_t>(g_frame_pacing.phase);
+	s.kind = kind;
+	s.flags = (CPU_CycleAutoAdjust ? 1u : 0u) |
+	          (CPU_SkipCycleAutoAdjust ? 2u : 0u) |
+	          (g_frame_pacing.suspended ? 4u : 0u) |
+	          (g_frame_pacing.waiting ? 8u : 0u) |
+	          (g_frame_pacing.continuous_presentation ? 16u : 0u) |
+	          (g_frame_pacing.view_eligible ? 32u : 0u) |
+	          (new_mod_frame ? 64u : 0u) | (trace.loading ? 128u : 0u);
 }
 
 static void reset_mod_timing_state(void)
@@ -362,7 +522,9 @@ static ModTimingSpikeCause timing_spike_cause(
 	        const ModTimingAccumulator &sample,
 	        const uint64_t other_ns)
 {
-	const uint64_t hook_ns = sample.elapsed_ns[MOD_TIMING_PYTHON_HOOK];
+	const uint64_t python_hook_ns = sample.elapsed_ns[MOD_TIMING_PYTHON_HOOK];
+	const uint64_t native_hook_ns = sample.elapsed_ns[MOD_TIMING_NATIVE_RENDERER_HOOK];
+	const uint64_t hook_ns = python_hook_ns + native_hook_ns;
 	const uint64_t cpu_ns = sample.elapsed_ns[MOD_TIMING_CPU_DECODER] > hook_ns
 	                                ? sample.elapsed_ns[MOD_TIMING_CPU_DECODER] - hook_ns
 	                                : 0;
@@ -374,7 +536,8 @@ static ModTimingSpikeCause timing_spike_cause(
 	                                 : 0;
 	const std::array<uint64_t, MOD_TIMING_SPIKE_CAUSE_COUNT> durations = {
 	        cpu_ns,
-	        hook_ns,
+	        python_hook_ns,
+	        native_hook_ns,
 	        sample.elapsed_ns[MOD_TIMING_PIC_EVENT],
 	        sample.elapsed_ns[MOD_TIMING_SAFE_POINT],
 	        sample.elapsed_ns[MOD_TIMING_GFX_EVENTS],
@@ -403,6 +566,13 @@ static void timing_window_add(const uint64_t frame,
 		        window.category_maximum_call_ns[i], sample.maximum_ns[i]);
 	}
 
+	window.native_extract_total_ms += sample.native_extract_ms;
+	window.native_extract_maximum_ms = std::max(
+	        window.native_extract_maximum_ms, sample.native_extract_ms);
+	window.native_draw_submit_total_ms += sample.native_draw_submit_ms;
+	window.native_draw_submit_maximum_ms = std::max(
+	        window.native_draw_submit_maximum_ms, sample.native_draw_submit_ms);
+
 	const uint64_t accounted_ns =
 	        sample.elapsed_ns[MOD_TIMING_CPU_DECODER] +
 	        sample.elapsed_ns[MOD_TIMING_PIC_EVENT] +
@@ -429,18 +599,18 @@ static void timing_window_add(const uint64_t frame,
 	}
 }
 
-static bool timing_write_window(const uint64_t frame, const bool final)
+static void timing_write_window(const uint64_t frame, const bool final)
 {
 	ModTimingWindow &window = g_mod_timing.window;
 	if (window.frames == 0)
-		return false;
+		return;
 
 	refresh_timing_summary();
 	const double frame_average_ms = timing_window_average_ms(
 	        window.frame_total_ns, window.frames);
 	const double present_average_ms = timing_window_average_ms(
 	        window.present_total_ns, window.present_samples);
-	bool wrote_log = timing_log_line(
+	timing_log_line(
 	        "FRAME_TIMING summary frame=%llu final=%u window_frames=%llu ready_warmup=%llu samples=%u frame_ms_avg=%.3f frame_fps_avg=%.1f frame_ms_p50=%.3f frame_ms_p95=%.3f frame_ms_p99=%.3f frame_ms_max=%.3f window_worst_frame=%llu window_frame_ms_max=%.3f present_samples=%llu present_ms_avg=%.3f present_fps_avg=%.1f present_ms_p50=%.3f present_ms_p95=%.3f present_ms_p99=%.3f present_ms_max=%.3f frame_spikes=%llu present_spikes=%llu",
 	        static_cast<unsigned long long>(frame),
 	        final ? 1u : 0u,
@@ -472,12 +642,22 @@ static bool timing_write_window(const uint64_t frame, const bool final)
 	const auto maximum = [&window](const ModTimingCategory category) {
 		return timing_ns_to_ms(window.category_maximum_ns[category]);
 	};
-	wrote_log = timing_log_line(
-	        "FRAME_TIMING components frame=%llu samples=%llu cpu_ms_avg=%.3f cpu_ms_max=%.3f hook_ms_avg=%.3f hook_ms_max=%.3f events_ms_avg=%.3f events_ms_max=%.3f events_call_ms_max=%.3f tick_ms_avg=%.3f tick_ms_max=%.3f sleep_ms_avg=%.3f sleep_ms_max=%.3f pacing_sleep_ms_avg=%.3f pacing_sleep_ms_max=%.3f compositor_ms_avg=%.3f compositor_ms_max=%.3f swap_ms_avg=%.3f swap_ms_max=%.3f other_ms_avg=%.3f other_ms_max=%.3f",
+	timing_log_line(
+	        "FRAME_TIMING components frame=%llu samples=%llu cpu_ms_avg=%.3f cpu_ms_max=%.3f hook_ms_avg=%.3f hook_ms_max=%.3f native_hook_ms_avg=%.3f native_hook_ms_max=%.3f native_extract_ms_avg=%.3f native_extract_ms_max=%.3f native_draw_submit_ms_avg=%.3f native_draw_submit_ms_max=%.3f pic_ms_avg=%.3f pic_ms_max=%.3f safe_ms_avg=%.3f safe_ms_max=%.3f timer_ms_avg=%.3f timer_ms_max=%.3f dyn_ms_avg=%.3f dyn_ms_max=%.3f events_ms_avg=%.3f events_ms_max=%.3f events_call_ms_max=%.3f tick_ms_avg=%.3f tick_ms_max=%.3f sleep_ms_avg=%.3f sleep_ms_max=%.3f pacing_sleep_ms_avg=%.3f pacing_sleep_ms_max=%.3f compositor_ms_avg=%.3f compositor_ms_max=%.3f swap_ms_avg=%.3f swap_ms_max=%.3f other_ms_avg=%.3f other_ms_max=%.3f",
 	        static_cast<unsigned long long>(frame),
 	        static_cast<unsigned long long>(samples),
 	        average(MOD_TIMING_CPU_DECODER), maximum(MOD_TIMING_CPU_DECODER),
 	        average(MOD_TIMING_PYTHON_HOOK), maximum(MOD_TIMING_PYTHON_HOOK),
+	        average(MOD_TIMING_NATIVE_RENDERER_HOOK),
+	        maximum(MOD_TIMING_NATIVE_RENDERER_HOOK),
+	        window.native_extract_total_ms / static_cast<double>(samples),
+	        window.native_extract_maximum_ms,
+	        window.native_draw_submit_total_ms / static_cast<double>(samples),
+	        window.native_draw_submit_maximum_ms,
+	        average(MOD_TIMING_PIC_EVENT), maximum(MOD_TIMING_PIC_EVENT),
+	        average(MOD_TIMING_SAFE_POINT), maximum(MOD_TIMING_SAFE_POINT),
+	        average(MOD_TIMING_TIMER_TICK), maximum(MOD_TIMING_TIMER_TICK),
+	        average(MOD_TIMING_DYNAMIC_COMPILE), maximum(MOD_TIMING_DYNAMIC_COMPILE),
 	        average(MOD_TIMING_GFX_EVENTS), maximum(MOD_TIMING_GFX_EVENTS),
 	        timing_ns_to_ms(window.category_maximum_call_ns[MOD_TIMING_GFX_EVENTS]),
 	        average(MOD_TIMING_TICK_CONTROL), maximum(MOD_TIMING_TICK_CONTROL),
@@ -487,34 +667,39 @@ static bool timing_write_window(const uint64_t frame, const bool final)
 	        average(MOD_TIMING_COMPOSITOR), maximum(MOD_TIMING_COMPOSITOR),
 	        average(MOD_TIMING_SWAP), maximum(MOD_TIMING_SWAP),
 	        timing_window_average_ms(window.other_total_ns, samples),
-	        timing_ns_to_ms(window.other_maximum_ns)) || wrote_log;
+	        timing_ns_to_ms(window.other_maximum_ns));
 
-	wrote_log = timing_log_line(
-	        "FRAME_TIMING causes frame=%llu spikes=%llu cpu=%llu hook=%llu pic=%llu safe=%llu events=%llu timer=%llu pacing_sleep=%llu tick_other=%llu other=%llu",
+	timing_log_line(
+	        "FRAME_TIMING causes frame=%llu spikes=%llu cpu=%llu hook=%llu native_hook=%llu pic=%llu safe=%llu events=%llu timer=%llu pacing_sleep=%llu tick_other=%llu other=%llu",
 	        static_cast<unsigned long long>(frame),
 	        static_cast<unsigned long long>(
 	                std::accumulate(window.spike_causes.begin(),
 	                                window.spike_causes.end(), uint64_t{0})),
 	        static_cast<unsigned long long>(window.spike_causes[MOD_TIMING_SPIKE_CPU]),
 	        static_cast<unsigned long long>(window.spike_causes[MOD_TIMING_SPIKE_PYTHON_HOOK]),
+	        static_cast<unsigned long long>(window.spike_causes[MOD_TIMING_SPIKE_NATIVE_HOOK]),
 	        static_cast<unsigned long long>(window.spike_causes[MOD_TIMING_SPIKE_PIC]),
 	        static_cast<unsigned long long>(window.spike_causes[MOD_TIMING_SPIKE_SAFE_POINT]),
 	        static_cast<unsigned long long>(window.spike_causes[MOD_TIMING_SPIKE_GFX_EVENTS]),
 	        static_cast<unsigned long long>(window.spike_causes[MOD_TIMING_SPIKE_TIMER]),
 	        static_cast<unsigned long long>(window.spike_causes[MOD_TIMING_SPIKE_FRAME_PACING_SLEEP]),
 	        static_cast<unsigned long long>(window.spike_causes[MOD_TIMING_SPIKE_TICK_OTHER]),
-	        static_cast<unsigned long long>(window.spike_causes[MOD_TIMING_SPIKE_OTHER])) ||
-	            wrote_log;
+	        static_cast<unsigned long long>(window.spike_causes[MOD_TIMING_SPIKE_OTHER]));
 
 	if (g_mod_timing_log)
 		fflush(g_mod_timing_log);
 	window = {};
-	return wrote_log;
 }
 
 static void timing_frame_boundary(const uint64_t frame)
 {
 	const uint64_t now = timing_now_ns();
+	if (g_startup_trace.recording) {
+		const uint64_t origin = g_mod_timing.frame_boundary_ns
+		                              ? g_mod_timing.frame_boundary_ns : g_startup_trace.start_ns;
+		timing_startup_record('F', frame > 0 ? frame - 1u : 0u,
+		                      now, now - std::max(origin, g_startup_trace.start_ns), false);
+	}
 	if (g_mod_timing.frame_boundary_ns == 0) {
 		g_mod_timing.frame_boundary_ns = now;
 		g_mod_timing.last_frame = frame;
@@ -768,6 +953,7 @@ static void prune_empty_callsite(ModExecutableRuntime &runtime,
 
 	const ModCallsiteRuntime &callsite = it->second;
 	if (callsite.python_hook_indices.empty() &&
+	    callsite.native_renderer_event == 0 &&
 	    !callsite.scene_raster_phase_enter &&
 	    !callsite.scene_raster_phase_leave &&
 	    callsite.scene_raster_suppression_index ==
@@ -833,6 +1019,7 @@ static void sync_scene_raster_callsite_hooks(void)
 
 static void reset_runtime_frame_state(ModExecutableRuntime &runtime)
 {
+	timing_startup_flush("runtime-reset");
 	if (g_mod_timing.window.frames > 0)
 		timing_write_window(g_mod_timing.last_frame, true);
 	runtime.frame_started = false;
@@ -930,6 +1117,17 @@ static void rebuild_runtime_hooks(ModExecutableRuntime &runtime)
 
 		hook.linear_eip = linear_eip;
 		runtime.callsites[linear_eip].python_hook_indices.push_back(i);
+	}
+
+	for (size_t i = 0; i < runtime.native_renderer_hooks.size(); ++i) {
+		const ModNativeHookRuntime& hook = runtime.native_renderer_hooks[i];
+		uint32_t linear_eip = 0;
+		if (apply_delta(hook.reloc_eip, runtime.delta, &linear_eip)) {
+			runtime.callsites[linear_eip].native_renderer_event = hook.event;
+			runtime.callsites[linear_eip].native_renderer_kind = hook.kind;
+		} else {
+			LOG_MSG("MOD ERROR: native renderer hook has invalid runtime address");
+		}
 	}
 
 	if (runtime.config.has_scene_raster_suppression &&
@@ -1102,9 +1300,12 @@ static void activate_runtime_process(ModExecutableRuntime &runtime,
 	reset_scene_raster_suppression(runtime, true);
 	update_fast_enabled();
 	refresh_dynamic_cpu_cache();
+	timing_startup_begin();
+	const char *variant = getenv("MW2_PERF_VARIANT");
 	timing_log_line(
-	        "FRAME_TIMING session executable=%s format=condensed-v1 warmup_ready_frames=%llu spike_threshold_ms=%.3f history_capacity=%u summary_interval_frames=%llu",
+	        "FRAME_TIMING session executable=%s variant=%s format=condensed-v1 warmup_ready_frames=%llu spike_threshold_ms=%.3f history_capacity=%u summary_interval_frames=%llu",
 	        runtime.config.name.c_str(),
+	        variant && variant[0] ? variant : "unspecified",
 	        static_cast<unsigned long long>(MOD_TIMING_WARMUP_READY_FRAMES),
 	        MOD_TIMING_SPIKE_THRESHOLD_MS,
 	        static_cast<unsigned int>(MOD_TIMING_HISTORY_CAPACITY),
@@ -1113,6 +1314,10 @@ static void activate_runtime_process(ModExecutableRuntime &runtime,
 	LOG_MSG("MOD: %s active on PSP 0x%04X",
 	        runtime.config.name.c_str(),
 	        static_cast<unsigned int>(pspseg));
+	if (runtime.has_native_renderer_hooks &&
+	    !DOSBoxNativeRenderer_MissionBegin(runtime.delta)) {
+		LOG_MSG("NATIVE RENDERER: mission start deferred or unavailable");
+	}
 }
 
 static void run_pending_scan(ModExecutableRuntime &runtime, size_t runtime_index)
@@ -1266,6 +1471,40 @@ static void attach_python_hooks(const std::vector<ModPythonHookRegistration> &ho
 	}
 }
 
+static void attach_native_renderer_hook(void)
+{
+	const size_t count = DOSBoxNativeRenderer_GetHookCount();
+	for (size_t binding = 0; binding < count; ++binding) {
+		std::string exe_name_upper;
+		uint32_t event = 0;
+		uint32_t kind = 0;
+		uint32_t reloc_eip = 0;
+		if (!DOSBoxNativeRenderer_GetHook(
+		            binding, &exe_name_upper, &event, &kind, &reloc_eip))
+			continue;
+		bool matched = false;
+		for (size_t i = 0; i < g_mod.executables.size(); ++i) {
+			ModExecutableRuntime &runtime = g_mod.executables[i];
+			if (runtime.config.name_upper != exe_name_upper)
+				continue;
+			runtime.has_native_renderer_hooks = true;
+			ModNativeHookRuntime hook = {};
+			hook.event = event;
+			hook.kind = kind;
+			hook.reloc_eip = reloc_eip;
+			runtime.native_renderer_hooks.push_back(hook);
+			matched = true;
+			break;
+		}
+		if (!matched) {
+			LOG_MSG("NATIVE RENDERER ERROR: descriptor references unknown executable %s",
+			        exe_name_upper.c_str());
+			DOSBoxNativeRenderer_Shutdown();
+			return;
+		}
+	}
+}
+
 static bool find_executable_runtime_by_name(const char *name, size_t *runtime_index)
 {
 	if (!name || !runtime_index)
@@ -1285,9 +1524,7 @@ static bool find_executable_runtime_by_name(const char *name, size_t *runtime_in
 
 static bool frame_pacing_runtime_ready(ModExecutableRuntime **runtime)
 {
-	if (g_frame_pacing.target_fps == 0 ||
-	    !g_frame_pacing.view_eligible ||
-	    g_frame_pacing.suspended) {
+	if (g_frame_pacing.target_fps == 0) {
 		return false;
 	}
 
@@ -1298,6 +1535,12 @@ static bool frame_pacing_runtime_ready(ModExecutableRuntime **runtime)
 	if (runtime)
 		*runtime = active;
 	return true;
+}
+
+static bool frame_pacing_presentation_ready(void)
+{
+	return g_frame_pacing.view_eligible && !g_frame_pacing.suspended &&
+	       frame_pacing_runtime_ready(NULL);
 }
 
 static void timing_write_pacing_summary(const bool final)
@@ -1344,35 +1587,10 @@ static int32_t frame_pacing_on_frame_start(ModExecutableRuntime &runtime)
 
 	const uint64_t now = timing_now_ns();
 	if (g_frame_pacing.phase == ModFramePacingPhase::Inactive) {
-		g_frame_pacing.phase = ModFramePacingPhase::AwaitingFirstFrame;
-		g_frame_pacing.last_frame_start_ns = now;
-		return 0;
-	}
-
-	if (g_frame_pacing.phase == ModFramePacingPhase::AwaitingFirstFrame) {
-		g_frame_pacing.last_frame_start_ns = now;
-		return 0;
-	}
-
-	if (g_frame_pacing.continuous_presentation) {
-		if (now < g_frame_pacing.next_deadline_ns) {
-			g_frame_pacing.waiting = true;
-			g_frame_pacing.deferred_checks++;
-			CPU_Cycles = 0;
-			return runtime.frame_start_defer_adjustment;
-		}
-
-		g_frame_pacing.waiting = false;
-		do {
-			g_frame_pacing.next_deadline_ns += g_frame_pacing.period_ns;
-		} while (g_frame_pacing.next_deadline_ns <= now);
-		return 0;
-	}
-
-	if (!g_frame_pacing.ready_since_release) {
-		reset_frame_pacing_runtime_state();
-		g_frame_pacing.phase = ModFramePacingPhase::AwaitingFirstFrame;
-		g_frame_pacing.last_frame_start_ns = now;
+		g_frame_pacing.phase = ModFramePacingPhase::Running;
+		g_frame_pacing.next_deadline_ns = now + g_frame_pacing.period_ns;
+		LOG_MSG("MOD: guest frame pacing active at %u FPS",
+		        static_cast<unsigned int>(g_frame_pacing.target_fps));
 		return 0;
 	}
 
@@ -1383,8 +1601,10 @@ static int32_t frame_pacing_on_frame_start(ModExecutableRuntime &runtime)
 		return runtime.frame_start_defer_adjustment;
 	}
 
-	g_frame_pacing.waiting = false;
+	if (!g_frame_pacing.ready_since_release && !g_frame_pacing.continuous_presentation)
+		reset_frame_pacing_presentation_state();
 	g_frame_pacing.ready_since_release = false;
+	g_frame_pacing.waiting = false;
 	const uint64_t lateness_ns = now - g_frame_pacing.next_deadline_ns;
 	g_frame_pacing.total_lateness_ns += lateness_ns;
 	g_frame_pacing.maximum_lateness_ns = std::max(
@@ -1446,12 +1666,6 @@ void MOD_TimingRecordFramePacingSleep(const uint64_t elapsed_ns)
 	g_mod_timing.current.frame_pacing_sleep_ns += elapsed_ns;
 }
 
-void MOD_TimingCountNativeFrame(void)
-{
-	if (g_mod.fast_enabled)
-		g_mod_timing.current.native_frames++;
-}
-
 void MOD_TimingCountModFrameReady(void)
 {
 	if (!g_mod.fast_enabled)
@@ -1460,25 +1674,19 @@ void MOD_TimingCountModFrameReady(void)
 	g_mod_timing.ready_total++;
 }
 
-void MOD_TimingPresentationBoundary(const bool compositor_invoked,
-	                                const bool new_mod_frame,
-	                                const uint64_t compositor_ns,
-	                                const uint64_t swap_ns,
-	                                const char *source)
+void MOD_TimingPresentationBoundary(const bool new_mod_frame)
 {
 	if (!g_mod.fast_enabled)
 		return;
-	static_cast<void>(compositor_invoked);
-	static_cast<void>(compositor_ns);
-	static_cast<void>(swap_ns);
-	static_cast<void>(source);
 
 	ModTimingState &timing = g_mod_timing;
-	timing.current.presentations++;
-	if (new_mod_frame)
-		timing.current.new_mod_presentations++;
-
 	const uint64_t now = timing_now_ns();
+	if (g_startup_trace.recording) {
+		const uint64_t origin = timing.present_boundary_ns
+		                              ? timing.present_boundary_ns : g_startup_trace.start_ns;
+		timing_startup_record('P', timing.last_frame, now,
+		                      now - std::max(origin, g_startup_trace.start_ns), new_mod_frame);
+	}
 	if (timing.present_boundary_ns == 0) {
 		timing.present_boundary_ns = now;
 		return;
@@ -1544,12 +1752,23 @@ bool MOD_Init(const Config& config)
 	if (DOSBoxPython_LoadMods(&hooks))
 		attach_python_hooks(hooks);
 
+	if (!DOSBoxNativeRenderer_Init(config))
+		return false;
+	if (DOSBoxNativeRenderer_Available() &&
+	    DOSBoxPython_OpenGLRendererAvailable()) {
+		LOG_MSG("NATIVE RENDERER ERROR: Python and native renderers cannot be active together; native renderer disabled");
+		DOSBoxNativeRenderer_Shutdown();
+	} else {
+		attach_native_renderer_hook();
+	}
+
 	g_mod.initialized = true;
 	return true;
 }
 
 void MOD_Shutdown(void)
 {
+	timing_startup_flush("shutdown");
 	if (g_mod_timing.window.frames > 0)
 		timing_write_window(g_mod_timing.last_frame, true);
 	if (g_frame_pacing.interval_released_frames > 0)
@@ -1558,6 +1777,7 @@ void MOD_Shutdown(void)
 		CALLBACK_DeAllocate(g_mod.guest_call_stop_callback);
 	g_mod = {};
 	g_frame_pacing = {};
+	DOSBoxNativeRenderer_Shutdown();
 	DOSBoxPython_Shutdown();
 	close_mod_timing_log();
 }
@@ -1566,6 +1786,7 @@ void MOD_OnOpenFile(const char *name, unsigned short handle)
 {
 	if (!g_mod.initialized || !name || g_mod.executables.empty())
 		return;
+	DOSBoxNativeRenderer_OnFileOpened(name);
 
 	size_t runtime_index = 0;
 	if (!find_executable_runtime_by_name(name, &runtime_index))
@@ -1634,6 +1855,8 @@ void MOD_OnTerminatePSP(uint16_t pspseg, bool tsr, uint8_t exitcode)
 		ModExecutableRuntime &runtime =
 		        g_mod.executables[g_mod.active_executable_index];
 		if (runtime.process_active && runtime.process_psp == pspseg) {
+			if (runtime.has_native_renderer_hooks)
+				DOSBoxNativeRenderer_MissionEnd();
 			g_mod.safe_point_pending = false;
 			reset_safe_point_barrier();
 			runtime.process_active = false;
@@ -1691,6 +1914,15 @@ bool MOD_RenderActive(void)
 	return get_active_runtime(&runtime);
 }
 
+const char *MOD_GetRendererSourceName(void)
+{
+	if (DOSBoxNativeRenderer_Available())
+		return DOSBoxNativeRenderer_GetSourceName();
+	if (DOSBoxPython_OpenGLRendererAvailable())
+		return DOSBoxPython_GetOpenGLRendererSourceName();
+	return "";
+}
+
 bool MOD_GuestCallActive(void)
 {
 	return g_mod.guest_call_active;
@@ -1700,6 +1932,8 @@ bool MOD_SetSceneRasterSuppression(bool enabled)
 {
 	ModExecutableRuntime *runtime = NULL;
 	if (!get_active_runtime(&runtime))
+		return false;
+	if (enabled && !g_mod.scene_raster_suppression_view_eligible)
 		return false;
 
 	if (!enabled) {
@@ -1719,6 +1953,15 @@ bool MOD_SetSceneRasterSuppression(bool enabled)
 	if (changed)
 		g_mod.dynamic_cache_refresh_pending = true;
 	return true;
+}
+
+void MOD_SetSceneRasterSuppressionViewEligible(bool eligible)
+{
+	if (g_mod.scene_raster_suppression_view_eligible == eligible)
+		return;
+	g_mod.scene_raster_suppression_view_eligible = eligible;
+	if (!eligible)
+		MOD_DisableSceneRasterSuppression();
 }
 
 bool MOD_CallsiteCanBeSuppressed(uint32_t linear_eip)
@@ -1748,17 +1991,22 @@ void MOD_SetFramePacingViewEligible(bool eligible)
 	if (g_frame_pacing.view_eligible == eligible)
 		return;
 	g_frame_pacing.view_eligible = eligible;
-	reset_frame_pacing_runtime_state();
+	reset_frame_pacing_presentation_state();
 }
 
 bool MOD_SetFramePacingSuspended(bool suspended)
 {
+	// A new loading presentation can begin without restarting the executable.
+	if (g_startup_trace.start_ns && suspended && !g_startup_trace.loading &&
+	    g_startup_trace.scene_ns)
+		timing_startup_begin();
+	g_startup_trace.loading = suspended;
 	if (g_frame_pacing.target_fps == 0)
 		return false;
 	if (g_frame_pacing.suspended == suspended)
 		return true;
 	g_frame_pacing.suspended = suspended;
-	reset_frame_pacing_runtime_state();
+	reset_frame_pacing_presentation_state();
 	return true;
 }
 
@@ -1770,12 +2018,11 @@ bool MOD_SetFramePacingContinuousPresentation(bool active)
 	if (!active) {
 		g_frame_pacing.continuous_presentation = false;
 		g_frame_pacing.continuous_presentation_deadline_ns = 0;
-		g_frame_pacing.waiting = false;
 		return true;
 	}
 
 	if (g_frame_pacing.phase != ModFramePacingPhase::Running ||
-	    !frame_pacing_runtime_ready(NULL) ||
+	    !frame_pacing_presentation_ready() ||
 	    g_frame_pacing.pending_ready_sequence == 0) {
 		return false;
 	}
@@ -1788,27 +2035,24 @@ bool MOD_SetFramePacingContinuousPresentation(bool active)
 		                : now + g_frame_pacing.period_ns;
 		g_frame_pacing.continuous_presentation = true;
 	}
-	g_frame_pacing.waiting = true;
-	CPU_Cycles = 0;
 	return true;
 }
 
 bool MOD_FramePacingWaiting(void)
 {
-	return (g_frame_pacing.waiting ||
-	        g_frame_pacing.continuous_presentation) &&
-	       frame_pacing_runtime_ready(NULL);
+	return g_frame_pacing.waiting && frame_pacing_runtime_ready(NULL);
 }
 
 bool MOD_FramePacingOwnsPresentation(void)
 {
 	return g_frame_pacing.phase == ModFramePacingPhase::Running &&
-	       frame_pacing_runtime_ready(NULL);
+	       g_frame_pacing.pending_ready_sequence != 0 &&
+	       frame_pacing_presentation_ready();
 }
 
 void MOD_FramePacingNotifyReady(uint64_t ready_sequence)
 {
-	if (ready_sequence == 0 || !frame_pacing_runtime_ready(NULL) ||
+	if (ready_sequence == 0 || !frame_pacing_presentation_ready() ||
 	    g_frame_pacing.phase == ModFramePacingPhase::Inactive) {
 		return;
 	}
@@ -1821,7 +2065,7 @@ void MOD_FramePacingNotifyReady(uint64_t ready_sequence)
 
 bool MOD_FramePacingTakePresentation(uint64_t *ready_sequence)
 {
-	if (!ready_sequence || !frame_pacing_runtime_ready(NULL)) {
+	if (!ready_sequence || !frame_pacing_presentation_ready()) {
 		return false;
 	}
 
@@ -1846,27 +2090,6 @@ bool MOD_FramePacingTakePresentation(uint64_t *ready_sequence)
 	*ready_sequence = g_frame_pacing.pending_ready_sequence;
 	g_frame_pacing.presentation_pending = false;
 	return true;
-}
-
-void MOD_FramePacingPresented(uint64_t ready_sequence)
-{
-	if (ready_sequence == 0 ||
-	    ready_sequence != g_frame_pacing.pending_ready_sequence ||
-	    !frame_pacing_runtime_ready(NULL)) {
-		return;
-	}
-
-	if (g_frame_pacing.phase == ModFramePacingPhase::AwaitingFirstFrame) {
-		const uint64_t now = timing_now_ns();
-		g_frame_pacing.phase = ModFramePacingPhase::Running;
-		g_frame_pacing.next_deadline_ns =
-		        g_frame_pacing.last_frame_start_ns +
-		        g_frame_pacing.period_ns;
-		while (g_frame_pacing.next_deadline_ns <= now)
-			g_frame_pacing.next_deadline_ns += g_frame_pacing.period_ns;
-		LOG_MSG("MOD: renderer-owned frame pacing active at %u FPS",
-		        static_cast<unsigned int>(g_frame_pacing.target_fps));
-	}
 }
 
 void MOD_DisableSceneRasterSuppression(void)
@@ -2003,7 +2226,14 @@ void MOD_RunPendingSafePoint(void)
 	g_mod.safe_point_active = true;
 	const uint64_t timing_started = MOD_TimingBegin();
 	DOSBOX_BeginAutoCycleHostWork();
-	DOSBoxPython_InvokeSafePointCallback();
+	try {
+		DOSBoxNativeRenderer_ServiceResources();
+		DOSBoxPython_InvokeSafePointCallback();
+	} catch (...) {
+		g_mod.safe_point_active = false;
+		DOSBOX_EndAutoCycleHostWork();
+		throw;
+	}
 	MOD_TimingEnd(MOD_TIMING_SAFE_POINT, timing_started);
 	g_mod.safe_point_active = false;
 	DOSBOX_EndAutoCycleHostWork();
@@ -2040,6 +2270,15 @@ bool MOD_CallRelocFunction(uint32_t reloc_eip,
 	const Segments saved_segments = Segs;
 	const CPUBlock saved_cpu = cpu;
 	CPU_Decoder * const saved_decoder = cpudecoder;
+	const auto restore_guest_state = [&]() {
+		g_mod.guest_call_active = false;
+		g_mod.guest_call_stopped = false;
+		cpu_regs = saved_regs;
+		Segs = saved_segments;
+		cpu = saved_cpu;
+		cpudecoder = saved_decoder;
+		DestroyConditionFlags();
+	};
 
 	CPU_Push32(stop_eip);
 	reg_eax = input.eax;
@@ -2054,7 +2293,13 @@ bool MOD_CallRelocFunction(uint32_t reloc_eip,
 	g_mod.guest_call_stopped = false;
 	g_mod.guest_call_active = true;
 	DOSBOX_EndAutoCycleHostWork();
-	DOSBOX_RunMachine();
+	try {
+		DOSBOX_RunMachine();
+	} catch (...) {
+		DOSBOX_BeginAutoCycleHostWork();
+		restore_guest_state();
+		throw;
+	}
 	DOSBOX_BeginAutoCycleHostWork();
 
 	output->eax = reg_eax;
@@ -2063,13 +2308,7 @@ bool MOD_CallRelocFunction(uint32_t reloc_eip,
 	output->edx = reg_edx;
 	const bool stopped = g_mod.guest_call_stopped;
 
-	g_mod.guest_call_active = false;
-	g_mod.guest_call_stopped = false;
-	cpu_regs = saved_regs;
-	Segs = saved_segments;
-	cpu = saved_cpu;
-	cpudecoder = saved_decoder;
-	DestroyConditionFlags();
+	restore_guest_state();
 	return stopped;
 }
 
@@ -2122,6 +2361,39 @@ int32_t MOD_OnCallsite(uint32_t linear_eip)
 		const uint64_t timing_started = MOD_TimingBegin();
 		DOSBoxPython_InvokeHook(runtime->hooks[hook_index].python_hook_id);
 		MOD_TimingEnd(MOD_TIMING_PYTHON_HOOK, timing_started);
+	}
+
+	if (it->second.native_renderer_event != 0) {
+		const uint64_t timing_started = MOD_TimingBegin();
+		const uint32_t event = it->second.native_renderer_event;
+		const uint32_t kind = it->second.native_renderer_kind;
+		const bool handled = DOSBoxNativeRenderer_InvokeHook(
+		        event, kind, runtime->frame_state, runtime->delta);
+		MOD_TimingEnd(MOD_TIMING_NATIVE_RENDERER_HOOK, timing_started);
+		if (kind == MW2ER_HOOK_RENDER) {
+			double extract_ms = 0.0;
+			double draw_submit_ms = 0.0;
+			DOSBoxNativeRenderer_GetLastTiming(&extract_ms, &draw_submit_ms);
+			g_mod_timing.current.native_extract_ms += extract_ms;
+			g_mod_timing.current.native_draw_submit_ms += draw_submit_ms;
+		}
+		if (kind == MW2ER_HOOK_RENDER && handled) {
+			if (g_mod.scene_raster_suppression_view_eligible)
+				MOD_SetSceneRasterSuppression(true);
+#if C_OPENGL
+			OUTPUT_OPENGL_NotifyModFrameReady();
+#endif
+		} else if (kind == MW2ER_HOOK_RENDER) {
+			MOD_SetSceneRasterSuppression(false);
+		}
+		if (kind == MW2ER_HOOK_COMPOSITOR && handled) {
+#if C_OPENGL
+			/* Presentation hooks schedule one compositor call. The compositor
+			 * then requests further calls while its effect remains active. */
+			OUTPUT_OPENGL_RequestModPresentation();
+			CPU_Cycles = 0;
+#endif
+		}
 	}
 
 	const size_t suppression_index =

@@ -187,6 +187,7 @@ char* revert_escape_newlines(const char* aMessage);
 #include <output/output_direct3d11.h>
 #include <output/output_direct3d.h>
 #include <dosbox_python.h>
+#include <dosbox_native_renderer.h>
 #include <output/output_opengl.h>
 #if C_OPENGL
 #include <output/ra_glsl.h>
@@ -1790,6 +1791,35 @@ SDL_Window* GFX_GetSDLWindow(void) {
     return sdl.window;
 }
 
+#if C_OPENGL
+static bool GFX_CreateOpenGLContext()
+{
+    sdl_opengl.context = SDL_GL_CreateContext(sdl.window);
+    if (!sdl_opengl.context) {
+        LOG_MSG("SDL2 unable to create GL context: %s", SDL_GetError());
+        SDL_DestroyWindow(sdl.window);
+        sdl.window = nullptr;
+        return false;
+    }
+    if (SDL_GL_MakeCurrent(sdl.window, sdl_opengl.context) != 0) {
+        LOG_MSG("SDL2 unable to make GL context current: %s", SDL_GetError());
+        SDL_GL_DeleteContext(sdl_opengl.context);
+        sdl_opengl.context = nullptr;
+        SDL_DestroyWindow(sdl.window);
+        sdl.window = nullptr;
+        return false;
+    }
+    ++sdl_opengl.context_generation;
+    sdl_opengl.mod_present_count = 0;
+    OUTPUT_OPENGL_InstallDebugCallback();
+    DOSBoxPython_NotifyOpenGLContextCreated(sdl_opengl.context_generation);
+    DOSBoxNativeRenderer_NotifyOpenGLContextCreated(sdl_opengl.context_generation);
+    LOG_MSG("SDL2 GL context created: %s generation=%llu", glGetString(GL_VERSION),
+            (unsigned long long)sdl_opengl.context_generation);
+    return true;
+}
+#endif
+
 SDL_Window* GFX_SetSDLWindowMode(uint16_t width, uint16_t height, SCREEN_TYPES screenType)
 {
     static SCREEN_TYPES lastType = SCREEN_SURFACE;
@@ -1833,7 +1863,11 @@ SDL_Window* GFX_SetSDLWindowMode(uint16_t width, uint16_t height, SCREEN_TYPES s
 
 #if C_OPENGL
     if (sdl_opengl.context) {
+        if (SDL_GL_MakeCurrent(sdl.window, sdl_opengl.context) != 0)
+            E_Exit("Unable to restore OpenGL context for safe teardown: %s", SDL_GetError());
         DOSBoxPython_NotifyOpenGLContextDestroying();
+        DOSBoxNativeRenderer_NotifyOpenGLContextLost();
+        OUTPUT_OPENGL_ReleaseContext();
         SDL_GL_DeleteContext(sdl_opengl.context);
         sdl_opengl.context = nullptr;
     }
@@ -1893,27 +1927,8 @@ SDL_Window* GFX_SetSDLWindowMode(uint16_t width, uint16_t height, SCREEN_TYPES s
         currentWindowHeight = currHeight;
 
 #if C_OPENGL
-        if (screenType == SCREEN_OPENGL) {
-            sdl_opengl.context = SDL_GL_CreateContext(sdl.window);
-            if (sdl_opengl.context == NULL) LOG_MSG("WARNING: SDL2 unable to create GL context");
-            if (SDL_GL_MakeCurrent(sdl.window, sdl_opengl.context) != 0) LOG_MSG("WARNING: SDL2 unable to make current GL context");
-            if (sdl_opengl.context != NULL) {
-                sdl_opengl.context_generation++;
-                sdl_opengl.mod_present_count = 0;
-                DOSBoxPython_NotifyOpenGLContextCreated(sdl_opengl.context_generation);
-                int gl_major = 0, gl_minor = 0, gl_profile = 0;
-                SDL_GL_GetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, &gl_major);
-                SDL_GL_GetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, &gl_minor);
-                SDL_GL_GetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, &gl_profile);
-                LOG_MSG("SDL2 GL context created: %d.%d profile=%s generation=%llu",
-                        gl_major,
-                        gl_minor,
-                        gl_profile == SDL_GL_CONTEXT_PROFILE_CORE ? "core" :
-                        gl_profile == SDL_GL_CONTEXT_PROFILE_COMPATIBILITY ? "compatibility" :
-                        gl_profile == SDL_GL_CONTEXT_PROFILE_ES ? "es" : "unknown",
-                        (unsigned long long)sdl_opengl.context_generation);
-            }
-        }
+        if (screenType == SCREEN_OPENGL && !GFX_CreateOpenGLContext())
+            return nullptr;
 #endif
 
         return sdl.window;
@@ -1964,27 +1979,8 @@ SDL_Window* GFX_SetSDLWindowMode(uint16_t width, uint16_t height, SCREEN_TYPES s
     currentWindowHeight = currHeight;
 
 #if C_OPENGL
-    if (screenType == SCREEN_OPENGL) {
-        sdl_opengl.context = SDL_GL_CreateContext(sdl.window);
-        if (sdl_opengl.context == NULL) LOG_MSG("WARNING: SDL2 unable to create GL context");
-        if (SDL_GL_MakeCurrent(sdl.window, sdl_opengl.context) != 0) LOG_MSG("WARNING: SDL2 unable to make current GL context");
-        if (sdl_opengl.context != NULL) {
-            sdl_opengl.context_generation++;
-            sdl_opengl.mod_present_count = 0;
-            DOSBoxPython_NotifyOpenGLContextCreated(sdl_opengl.context_generation);
-            int gl_major = 0, gl_minor = 0, gl_profile = 0;
-            SDL_GL_GetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, &gl_major);
-            SDL_GL_GetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, &gl_minor);
-            SDL_GL_GetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, &gl_profile);
-            LOG_MSG("SDL2 GL context created: %d.%d profile=%s generation=%llu",
-                    gl_major,
-                    gl_minor,
-                    gl_profile == SDL_GL_CONTEXT_PROFILE_CORE ? "core" :
-                    gl_profile == SDL_GL_CONTEXT_PROFILE_COMPATIBILITY ? "compatibility" :
-                    gl_profile == SDL_GL_CONTEXT_PROFILE_ES ? "es" : "unknown",
-                    (unsigned long long)sdl_opengl.context_generation);
-        }
-    }
+    if (screenType == SCREEN_OPENGL && !GFX_CreateOpenGLContext())
+        return nullptr;
 #endif
 
     return sdl.window;
@@ -3202,7 +3198,15 @@ static void ApplyModRenderViewChange(bool resize_window,
                                      Bitu target_height)
 {
 #if C_OPENGL
-    LOG_MSG("MOD: render view -> %s", OUTPUT_OPENGL_GetModRenderViewModeName());
+    if (OUTPUT_OPENGL_ModRenderViewShowsRenderer()) {
+        const char *renderer_name = MOD_GetRendererSourceName();
+        LOG_MSG("MOD: render view -> %s renderer = %s",
+                OUTPUT_OPENGL_GetModRenderViewModeName(),
+                renderer_name && renderer_name[0] ? renderer_name : "unknown");
+    } else {
+        LOG_MSG("MOD: render view -> %s",
+                OUTPUT_OPENGL_GetModRenderViewModeName());
+    }
     GFX_SetTitle(-1, -1, -1, false);
 
 #if defined(C_SDL2)
@@ -3604,6 +3608,7 @@ bool GFX_ServiceModSafePointBarrierPresentation(void)
 {
 #if C_OPENGL
     if (sdl.desktop.type == SCREEN_OPENGL &&
+        !sdl.updating &&
         OUTPUT_OPENGL_ModPresentationRequired()) {
         OUTPUT_OPENGL_PresentModFrame();
         return true;

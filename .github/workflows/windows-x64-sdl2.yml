@@ -42,42 +42,40 @@ jobs:
         shell: pwsh
         run: |
           msbuild -m vs/dosbox-x.sln -t:dosbox-x:Rebuild -p:Configuration="Release SDL2" -p:Platform=x64
+          if ($LASTEXITCODE) { throw 'Host build failed' }
           if (-not(Test-Path -Path 'bin\x64\Release SDL2\dosbox-x.exe' -PathType Leaf)) { exit 1 }
           contrib\windows\installer\PatchPE.exe 'bin\x64\Release SDL2\dosbox-x.exe'
       - name: Package
-        shell: bash
         run: |
-          top=`pwd`
-          dest=$top/package
-          mkdir -p "$dest/drivez" "$dest/glshaders" "$dest/languages"
-          cp "$top/bin/x64/Release SDL2/dosbox-x.exe" "$dest/dosbox-x.exe"
-          cp "$top/COPYING" "$dest/COPYING"
-          cp "$top/CHANGELOG" "$dest/CHANGELOG.txt"
-          cp "$top/README.md" "$dest/README.md"
-          cp "$top/dosbox-x.reference.conf" "$dest/dosbox-x.reference.conf"
-          cp "$top/dosbox-x.reference.full.conf" "$dest/dosbox-x.reference.full.conf"
-          cp "$top/dosbox-x.reference.conf" "$dest/dosbox-x.conf"
-          cp "$top/contrib/windows/installer/inpoutx64.dll" "$dest/inpoutx64.dll"
-          cp "$top/contrib/fonts/FREECG98.BMP" "$dest/FREECG98.BMP"
-          cp $top/contrib/fonts/wqy_1?pt.bdf "$dest/"
-          cp "$top/contrib/fonts/Nouveau_IBM.ttf" "$dest/Nouveau_IBM.ttf"
-          cp "$top/contrib/fonts/SarasaGothicFixed.ttf" "$dest/SarasaGothicFixed.ttf"
-          cp "$top/contrib/windows/installer/drivez_readme.txt" "$dest/drivez/readme.txt"
-          cp $top/contrib/glshaders/*.glsl "$dest/glshaders/"
-          cp "$top/contrib/glshaders/NOTICE" "$dest/glshaders/NOTICE"
-          cp "$top/contrib/glshaders/glshaders.txt" "$dest/glshaders/glshaders.txt"
-          cp -R "$top/contrib/glshaders/crt" "$top/contrib/glshaders/presets" "$dest/glshaders/"
-          cp $top/contrib/translations/*/*.lng "$dest/languages/"
-          cd "$dest"
-          "$top/vs/tool/zip.exe" -r -9 "$top/${{ env.package_stem }}.zip" *
+          ./tools/package_windows_sdl2.ps1 -Destination package
+          if ($LASTEXITCODE) { throw 'Host staging failed' }
+          $manifest = Get-Content package/HOST_BUILD_INFO.json -Raw | ConvertFrom-Json
+          if (@($manifest.worktree_changes).Count) { throw 'Unexpected host source modifications' }
+          Compress-Archive -Path package/* -DestinationPath "${{ env.package_stem }}.zip"
+          git archive --format=tar --output=host-source.tar HEAD
+          if ($LASTEXITCODE) { throw 'Host source archive failed' }
+          New-Item -ItemType Directory source-stage | Out-Null
+          tar -xf host-source.tar -C source-stage
+          if ($LASTEXITCODE) { throw 'Host source extraction failed' }
+          Copy-Item include/build_timestamp.h source-stage/include/build_timestamp.h
+          Copy-Item package/HOST_BUILD_INFO.json source-stage/HOST_BUILD_INFO.json
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          [System.IO.Compression.ZipFile]::CreateFromDirectory((Join-Path $PWD 'source-stage'), (Join-Path $PWD '${{ env.package_stem }}-source.zip'))
+          Get-ChildItem "${{ env.package_stem }}*.zip" | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($_.Name)" | Set-Content "$($_.FullName).sha256" -Encoding ascii
+          }
       - name: Upload package
         uses: actions/upload-artifact@v6.0.0
         with:
           name: ${{ env.package_stem }}
-          path: ${{ github.workspace }}/${{ env.package_stem }}.zip
+          path: |
+            ${{ github.workspace }}/${{ env.package_stem }}*.zip
+            ${{ github.workspace }}/${{ env.package_stem }}*.sha256
       - name: Attach zip to GitHub Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: ${{ env.package_stem }}.zip
+          files: |
+            ${{ env.package_stem }}*.zip
+            ${{ env.package_stem }}*.sha256
           prerelease: true

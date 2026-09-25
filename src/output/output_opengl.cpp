@@ -14,6 +14,7 @@ extern "C" {
 #include "control.h"
 #include "dosbox.h"
 #include "dosbox_python.h"
+#include "dosbox_native_renderer.h"
 #include "hardware.h"
 #include "logging.h"
 #include "menudef.h"
@@ -115,6 +116,7 @@ SDL_OpenGL sdl_opengl = {0};
 static ModRenderViewMode mod_render_view_mode = MOD_RENDER_VIEW_GAME_ONLY;
 static ModRenderViewMode mod_render_single_view_mode = MOD_RENDER_VIEW_MOD_ONLY;
 static bool mod_render_view_initialized = false;
+static bool mod_render_presentation_requested = false;
 static bool mod_render_saved_window_size_valid = false;
 static Bitu mod_render_saved_window_width = 0;
 static Bitu mod_render_saved_window_height = 0;
@@ -135,6 +137,98 @@ struct ModPresentationMetricsState {
 };
 
 static ModPresentationMetricsState mod_presentation_metrics = {};
+
+static const char *GetOpenGLDebugSourceName(const GLenum source)
+{
+    switch (source) {
+    case GL_DEBUG_SOURCE_API: return "api";
+    case GL_DEBUG_SOURCE_WINDOW_SYSTEM: return "window-system";
+    case GL_DEBUG_SOURCE_SHADER_COMPILER: return "shader-compiler";
+    case GL_DEBUG_SOURCE_THIRD_PARTY: return "third-party";
+    case GL_DEBUG_SOURCE_APPLICATION: return "application";
+    case GL_DEBUG_SOURCE_OTHER: return "other";
+    default: return "unknown";
+    }
+}
+
+static const char *GetOpenGLDebugTypeName(const GLenum type)
+{
+    switch (type) {
+    case GL_DEBUG_TYPE_ERROR: return "error";
+    case GL_DEBUG_TYPE_DEPRECATED_BEHAVIOR: return "deprecated-behavior";
+    case GL_DEBUG_TYPE_UNDEFINED_BEHAVIOR: return "undefined-behavior";
+    case GL_DEBUG_TYPE_PORTABILITY: return "portability";
+    case GL_DEBUG_TYPE_PERFORMANCE: return "performance";
+    case GL_DEBUG_TYPE_MARKER: return "marker";
+    case GL_DEBUG_TYPE_PUSH_GROUP: return "push-group";
+    case GL_DEBUG_TYPE_POP_GROUP: return "pop-group";
+    case GL_DEBUG_TYPE_OTHER: return "other";
+    default: return "unknown";
+    }
+}
+
+static const char *GetOpenGLDebugSeverityName(const GLenum severity)
+{
+    switch (severity) {
+    case GL_DEBUG_SEVERITY_HIGH: return "high";
+    case GL_DEBUG_SEVERITY_MEDIUM: return "medium";
+    case GL_DEBUG_SEVERITY_LOW: return "low";
+    case GL_DEBUG_SEVERITY_NOTIFICATION: return "notification";
+    default: return "unknown";
+    }
+}
+
+static void APIENTRY OpenGLDebugCallback(const GLenum source,
+                                         const GLenum type,
+                                         const GLuint id,
+                                         const GLenum severity,
+                                         const GLsizei length,
+                                         const GLchar *message,
+                                         const void *)
+{
+    const int message_length = message && length > 0 ?
+            std::min<int>(length, 4096) : 0;
+    LOG_MSG("OPENGL DEBUG: source=%s type=%s severity=%s id=%u: %.*s",
+            GetOpenGLDebugSourceName(source),
+            GetOpenGLDebugTypeName(type),
+            GetOpenGLDebugSeverityName(severity),
+            id,
+            message_length,
+            message ? message : "");
+}
+
+void OUTPUT_OPENGL_InstallDebugCallback()
+{
+    const Section_prop *render_section = static_cast<const Section_prop *>(
+            control->GetSection("render"));
+    if (!render_section || !render_section->Get_bool("opengl debug output"))
+        return;
+
+    const auto debug_callback =
+            reinterpret_cast<PFNGLDEBUGMESSAGECALLBACKPROC>(
+                    SDL_GL_GetProcAddress("glDebugMessageCallback"));
+    const auto debug_control =
+            reinterpret_cast<PFNGLDEBUGMESSAGECONTROLPROC>(
+                    SDL_GL_GetProcAddress("glDebugMessageControl"));
+    if (!debug_callback) {
+        LOG_MSG("WARNING: OpenGL debug output requested, but KHR_debug is unavailable");
+        return;
+    }
+
+    glEnable(GL_DEBUG_OUTPUT);
+    glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
+    debug_callback(OpenGLDebugCallback, nullptr);
+    if (debug_control) {
+        debug_control(GL_DONT_CARE,
+                      GL_DONT_CARE,
+                      GL_DEBUG_SEVERITY_NOTIFICATION,
+                      0,
+                      nullptr,
+                      GL_FALSE);
+    }
+    LOG_MSG("OpenGL KHR_debug callback enabled for generation=%llu",
+            (unsigned long long)sdl_opengl.context_generation);
+}
 
 static bool GetConfiguredOpenGLHostVsync(void)
 {
@@ -177,7 +271,7 @@ static void ConfigureOpenGLSwapInterval(const int requested)
 
 static ModRenderViewMode GetConfiguredModRenderStartView(void)
 {
-    if (!DOSBoxPython_OpenGLRendererAvailable())
+    if (!OUTPUT_OPENGL_ModRendererAvailable())
         return MOD_RENDER_VIEW_GAME_ONLY;
 
     const Section_prop *render_section = static_cast<const Section_prop *>(
@@ -634,7 +728,9 @@ void OUTPUT_OPENGL_Initialize()
     mod_render_view_mode = MOD_RENDER_VIEW_GAME_ONLY;
     mod_render_single_view_mode = MOD_RENDER_VIEW_MOD_ONLY;
     mod_render_view_initialized = false;
+    mod_render_presentation_requested = false;
     MOD_SetFramePacingViewEligible(false);
+    MOD_SetSceneRasterSuppressionViewEligible(false);
 }
 
 void OUTPUT_OPENGL_Select( GLKind kind )
@@ -649,6 +745,9 @@ void OUTPUT_OPENGL_Select( GLKind kind )
     }
     MOD_SetFramePacingViewEligible(
             mod_render_view_mode == MOD_RENDER_VIEW_MOD_ONLY);
+    MOD_SetSceneRasterSuppressionViewEligible(
+            mod_render_view_mode == MOD_RENDER_VIEW_MOD_ONLY ||
+            mod_render_view_mode == MOD_RENDER_VIEW_SIDE_BY_SIDE_SUPPRESSED);
 
     sdl.desktop.want_type = SCREEN_OPENGL;
     render.aspectOffload = true;
@@ -668,22 +767,15 @@ void OUTPUT_OPENGL_Select( GLKind kind )
 
     void GFX_SetResizeable(bool enable);
     GFX_SetResizeable(true);
+    const uint64_t previous_generation = sdl_opengl.context_generation;
     sdl.window = GFX_SetSDLWindowMode(640,400, SCREEN_OPENGL);
-    if (sdl.window) {
-        if(sdl_opengl.context) {
-            DOSBoxPython_NotifyOpenGLContextDestroying();
-            RA_GLSL_Release();
-            SDL_GL_DeleteContext(sdl_opengl.context);
-            sdl_opengl.context = nullptr;
-        }
-        sdl_opengl.context = SDL_GL_CreateContext(sdl.window);
-        if (sdl_opengl.context && SDL_GL_MakeCurrent(sdl.window, sdl_opengl.context) != 0)
-            LOG_MSG("WARNING: SDL2 unable to make current GL context");
-        if (sdl_opengl.context) {
-            sdl_opengl.context_generation++;
-            sdl_opengl.mod_present_count = 0;
-            DOSBoxPython_NotifyOpenGLContextCreated(sdl_opengl.context_generation);
-        }
+    if (sdl.window && sdl_opengl.context) {
+        if (SDL_GL_MakeCurrent(sdl.window, sdl_opengl.context) != 0)
+            E_Exit("Unable to activate OpenGL output context: %s", SDL_GetError());
+        // The resize shortcut may retain the context. Release host objects
+        // before selection resets their handles; native objects stay owned.
+        if (sdl_opengl.context_generation == previous_generation)
+            OUTPUT_OPENGL_ReleaseContext();
         sdl.surface = SDL_GetWindowSurface(sdl.window);
 
         LOG_MSG( "OpenGL Version : %s", glGetString( GL_VERSION ));
@@ -839,7 +931,6 @@ void UpdateSDLDrawTexture() {
     glBindTexture(GL_TEXTURE_2D, SDLDrawGenFontTexture);
 
     glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
-    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_COLOR, 0);
 
     // No borders
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
@@ -881,7 +972,6 @@ void UpdateSDLDrawDBCSTexture(Bitu code) {
     glBindTexture(GL_TEXTURE_2D, SDLDrawGenDBCSFontTexture);
 
     glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
-    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_COLOR, 0);
 
     // No borders
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
@@ -1131,7 +1221,6 @@ Bitu OUTPUT_OPENGL_SetSize()
     glGenTextures(1, &sdl_opengl.texture);
     glBindTexture(GL_TEXTURE_2D, sdl_opengl.texture);
     glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
-    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_COLOR, 0);
 
     // No borders
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
@@ -1241,6 +1330,8 @@ Bitu OUTPUT_OPENGL_SetSize()
     err = 0;
     glGetError(); /* read and discard last error */
 
+    if (SDLDrawGenDBCSFontTexture != 0 && SDLDrawGenDBCSFontTexture != (GLuint)(~0UL))
+        glDeleteTextures(1, &SDLDrawGenDBCSFontTexture);
     SDLDrawGenDBCSFontTexture = (GLuint)(~0UL);
     glGenTextures(1, &SDLDrawGenDBCSFontTexture);
 #endif
@@ -1389,19 +1480,15 @@ static bool SetModRenderViewMode(const ModRenderViewMode mode,
         *target_height = 0;
 
     MOD_SetFramePacingViewEligible(mode == MOD_RENDER_VIEW_MOD_ONLY);
+    MOD_SetSceneRasterSuppressionViewEligible(
+            mode == MOD_RENDER_VIEW_MOD_ONLY ||
+            mode == MOD_RENDER_VIEW_SIDE_BY_SIDE_SUPPRESSED);
     if (mode == mod_render_view_mode)
         return false;
 
     const bool was_side_by_side = IsModRenderSideBySideMode(mod_render_view_mode);
     const bool will_be_side_by_side = IsModRenderSideBySideMode(mode);
     mod_render_view_mode = mode;
-
-    // Non-suppressed presentation choices fail open immediately. Entering a
-    // suppression-capable view still waits for Python to publish a fresh frame.
-    if (mode == MOD_RENDER_VIEW_GAME_ONLY ||
-        mode == MOD_RENDER_VIEW_SIDE_BY_SIDE) {
-        MOD_DisableSceneRasterSuppression();
-    }
 
     if (!was_side_by_side && will_be_side_by_side) {
         if (sdl.desktop.fullscreen)
@@ -1508,7 +1595,13 @@ const char *OUTPUT_OPENGL_GetModRenderViewModeTitleLabel(void)
 
 bool OUTPUT_OPENGL_ModRendererAvailable(void)
 {
-    return DOSBoxPython_OpenGLRendererAvailable();
+    return DOSBoxNativeRenderer_Available() ||
+           DOSBoxPython_OpenGLRendererAvailable();
+}
+
+bool OUTPUT_OPENGL_ModRenderViewShowsRenderer(void)
+{
+    return mod_render_view_mode != MOD_RENDER_VIEW_GAME_ONLY;
 }
 
 uint64_t OUTPUT_OPENGL_NotifyModFrameReady(void)
@@ -1526,6 +1619,11 @@ uint64_t OUTPUT_OPENGL_NotifyModFrameReady(void)
     return metrics.latest_ready_sequence;
 }
 
+void OUTPUT_OPENGL_RequestModPresentation(void)
+{
+    mod_render_presentation_requested = true;
+}
+
 static void RecordNativeFrame(void)
 {
     ModPresentationMetricsState &metrics = mod_presentation_metrics;
@@ -1533,7 +1631,6 @@ static void RecordNativeFrame(void)
     if (metrics.interval_start_ticks == 0)
         metrics.interval_start_ticks = now;
     metrics.native_count++;
-    MOD_TimingCountNativeFrame();
 }
 
 void OUTPUT_OPENGL_GetModPresentationMetrics(
@@ -1816,7 +1913,6 @@ static void PrepareOpenGLPresentationState(const OpenGLPresentationLayout &layou
                      1.0);
 
         glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
-        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_COLOR, 0);
     }
 }
 
@@ -1984,7 +2080,7 @@ static void CaptureOpenGLPresentation(
     CaptureState |= saved_capture_state & ~CAPTURE_IMAGE;
 }
 
-static void FinishOpenGLPresentation(const char *source)
+static void FinishOpenGLPresentation()
 {
     // Guest-call execution re-enters the DOSBox loop without allowing Python
     // compositor callbacks. Never clear or swap a mod backbuffer from that
@@ -2001,10 +2097,13 @@ static void FinishOpenGLPresentation(const char *source)
             mod_render_view_mode != MOD_RENDER_VIEW_GAME_ONLY &&
             mod_render_was_active && !mod_render_active;
     bool compositor_invoked = false;
-    uint64_t compositor_ns = 0;
 
-    if (mod_render_active)
-        DOSBoxPython_InvokeOpenGLInitCallback(mod_state);
+    if (mod_render_active) {
+        if (DOSBoxNativeRenderer_Available())
+            DOSBoxNativeRenderer_InvokeOpenGLInit(mod_state);
+        else
+            DOSBoxPython_InvokeOpenGLInitCallback(mod_state);
+    }
 
     if (mod_render_view_mode != MOD_RENDER_VIEW_GAME_ONLY || NativeCrtLetterboxes())
         ClearOpenGLBackbuffer();
@@ -2015,10 +2114,10 @@ static void FinishOpenGLPresentation(const char *source)
     if (mod_render_view_mode != MOD_RENDER_VIEW_GAME_ONLY) {
         if (mod_render_active) {
             const uint64_t timing_started = MOD_TimingBegin();
-            compositor_invoked =
-                    DOSBoxPython_InvokeOpenGLCompositorCallback(mod_state);
-            compositor_ns = MOD_TimingEnd(MOD_TIMING_COMPOSITOR,
-                                          timing_started);
+            compositor_invoked = DOSBoxNativeRenderer_Available()
+                    ? DOSBoxNativeRenderer_InvokeCompositor(mod_state)
+                    : DOSBoxPython_InvokeOpenGLCompositorCallback(mod_state);
+            MOD_TimingEnd(MOD_TIMING_COMPOSITOR, timing_started);
         }
 
         // MOD_RenderActive reports that the configured executable is running,
@@ -2031,19 +2130,15 @@ static void FinishOpenGLPresentation(const char *source)
     RestoreOpenGLPresentationState(layout);
     CaptureOpenGLPresentation(layout);
     const uint64_t swap_started = MOD_TimingBegin();
-    const bool exclude_mod_swap = DOSBoxPython_OpenGLRendererAvailable();
+    const bool exclude_mod_swap = OUTPUT_OPENGL_ModRendererAvailable();
     if (exclude_mod_swap)
         DOSBOX_BeginAutoCycleHostWork();
     SDL_GL_SwapBuffers();
     if (exclude_mod_swap)
         DOSBOX_EndAutoCycleHostWork();
-    const uint64_t swap_ns = MOD_TimingEnd(MOD_TIMING_SWAP, swap_started);
+    MOD_TimingEnd(MOD_TIMING_SWAP, swap_started);
     const bool new_mod_frame = RecordOpenGLPresentation(compositor_invoked);
-    MOD_TimingPresentationBoundary(compositor_invoked,
-                                   new_mod_frame,
-                                   compositor_ns,
-                                   swap_ns,
-                                   source);
+    MOD_TimingPresentationBoundary(new_mod_frame);
 
     if (drain_inactive_buffers)
         DrainInactiveModRenderBuffers(layout);
@@ -2066,25 +2161,40 @@ bool OUTPUT_OPENGL_ModPresentationRequired(void)
 
 void OUTPUT_OPENGL_PresentModFrame(void)
 {
-    if (!OUTPUT_OPENGL_ModPresentationRequired())
+    if (sdl.updating || !OUTPUT_OPENGL_ModPresentationRequired())
         return;
 
-    FinishOpenGLPresentation("vga");
+    FinishOpenGLPresentation();
     if (!menu.hidecycles && !sdl.desktop.fullscreen)
         frames++;
 }
 
 bool OUTPUT_OPENGL_PresentReadyModFrame(void)
 {
-    if (MOD_GuestCallActive())
+    // A native output update can leave the pixel-unpack buffer mapped and
+    // bound until OUTPUT_OPENGL_EndUpdate. Presentation establishes its own
+    // GL baseline, including unbinding that buffer, so it must wait for the
+    // update to finish. Keep one-shot requests and paced frames pending.
+    if (MOD_GuestCallActive() || sdl.updating)
         return false;
+
+    if (mod_render_presentation_requested) {
+        mod_render_presentation_requested = false;
+        if (mod_render_view_mode == MOD_RENDER_VIEW_GAME_ONLY ||
+            (!MOD_RenderActive() && !mod_render_was_active)) {
+            return false;
+        }
+        FinishOpenGLPresentation();
+        if (!menu.hidecycles && !sdl.desktop.fullscreen)
+            frames++;
+        return true;
+    }
 
     uint64_t ready_sequence = 0;
     if (!MOD_FramePacingTakePresentation(&ready_sequence))
         return false;
 
-    FinishOpenGLPresentation("mod-ready");
-    MOD_FramePacingPresented(ready_sequence);
+    FinishOpenGLPresentation();
     if (!menu.hidecycles && !sdl.desktop.fullscreen)
         frames++;
     return true;
@@ -2224,7 +2334,7 @@ void OUTPUT_OPENGL_EndUpdate(const uint16_t *changedLines)
 
         if (!MOD_GuestCallActive() &&
             !MOD_FramePacingOwnsPresentation())
-            FinishOpenGLPresentation("vga");
+            FinishOpenGLPresentation();
 
 #if 0 /* DEBUG Prove to me that you're drawing the damn texture */
         glBindTexture(GL_TEXTURE_2D, SDLDrawGenFontTexture);
@@ -2265,10 +2375,37 @@ void OUTPUT_OPENGL_EndUpdate(const uint16_t *changedLines)
     }
 }
 
+static void release_output_buffers();
+
+// Called only while the owning context is current, before its destruction.
+void OUTPUT_OPENGL_ReleaseContext()
+{
+    release_output_buffers();
+    if (sdl_opengl.texture) glDeleteTextures(1, &sdl_opengl.texture);
+    if (sdl_opengl.displaylist) glDeleteLists(sdl_opengl.displaylist, 1);
+    if (sdl_opengl.program_object && glDeleteProgram)
+        glDeleteProgram(sdl_opengl.program_object);
+    sdl_opengl.texture = sdl_opengl.displaylist = sdl_opengl.program_object = 0;
+    sdl_opengl.buffer = 0;
+    sdl_opengl.use_shader = false;
+#if DOSBOXMENU_TYPE == DOSBOXMENU_SDLDRAW
+    if (SDLDrawGenFontTextureInit) glDeleteTextures(1, &SDLDrawGenFontTexture);
+    if (SDLDrawGenDBCSFontTexture != 0 && SDLDrawGenDBCSFontTexture != (GLuint)(~0UL))
+        glDeleteTextures(1, &SDLDrawGenDBCSFontTexture);
+    SDLDrawGenFontTexture = SDLDrawGenDBCSFontTexture = (GLuint)(~0UL);
+    SDLDrawGenFontTextureInit = 0;
+#endif
+}
+
 void OUTPUT_OPENGL_Shutdown()
 {
+    MOD_SetFramePacingViewEligible(false);
+    release_output_buffers();
+}
+
+static void release_output_buffers()
+{
 	RA_GLSL_Release();
-	MOD_SetFramePacingViewEligible(false);
 	if (sdl_opengl.pixel_buffer_object)
 	{
 		glBindBufferARB(GL_PIXEL_UNPACK_BUFFER_EXT, 0);

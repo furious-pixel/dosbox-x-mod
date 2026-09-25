@@ -144,6 +144,7 @@ enum PythonRenderCallbackKind {
 struct PythonRenderCallbackRegistration {
 	PythonRenderCallbackKind kind = PYTHON_RENDER_CALLBACK_NONE;
 	std::string description = {};
+	std::string source_name = {};
 	bool enabled = true;
 	PyObject *callback = NULL;
 };
@@ -831,6 +832,28 @@ static std::string get_callable_name(PyObject *callable)
 	return description.str();
 }
 
+static std::string get_callable_source_name(PyObject *callable)
+{
+	PyOwnedRef code(g_python.api.PyObject_GetAttrString(callable, "__code__"));
+	if (!code) {
+		clear_python_error();
+		return {};
+	}
+
+	PyOwnedRef filename(g_python.api.PyObject_GetAttrString(code.get(),
+	                                                       "co_filename"));
+	if (!filename) {
+		clear_python_error();
+		return {};
+	}
+
+	std::string path = {};
+	if (!py_object_to_string(filename.get(), "co_filename", &path))
+		return {};
+	const size_t separator = path.find_last_of("/\\");
+	return separator == std::string::npos ? path : path.substr(separator + 1u);
+}
+
 static std::string get_callable_description(PyObject *callable,
                                             const std::string &exe_name_upper,
                                             uint32_t reloc_eip)
@@ -1036,6 +1059,7 @@ static PyObject *py_register_render_callback(PyObject *, PyObject *args)
 
 	slot->kind = callback_kind;
 	slot->description = get_callable_name(callable_obj);
+	slot->source_name = get_callable_source_name(callable_obj);
 	slot->enabled = true;
 	slot->callback = callable_obj;
 	g_python.api.Py_IncRef(slot->callback);
@@ -2939,6 +2963,15 @@ bool DOSBoxPython_OpenGLRendererAvailable(void)
 	       g_python.init_callback.callback &&
 	       g_python.compositor_callback.enabled &&
 	       g_python.compositor_callback.callback;
+}
+
+const char *DOSBoxPython_GetOpenGLRendererSourceName(void)
+{
+	if (!DOSBoxPython_OpenGLRendererAvailable())
+		return "";
+	if (!g_python.compositor_callback.source_name.empty())
+		return g_python.compositor_callback.source_name.c_str();
+	return g_python.init_callback.source_name.c_str();
 }
 
 void DOSBoxPython_NotifyOpenGLContextCreated(uint64_t context_generation)

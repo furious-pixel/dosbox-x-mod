@@ -3,7 +3,10 @@ name: Windows x64 SDL2
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches: [mod]
   push:
+    branches: [mod]
     tags:
       - 'v*'
 
@@ -14,7 +17,7 @@ jobs:
   build:
     permissions:
       contents: write
-    runs-on: windows-latest
+    runs-on: windows-2022
     defaults:
       run:
         shell: pwsh
@@ -45,6 +48,7 @@ jobs:
           if ($LASTEXITCODE) { throw 'Host build failed' }
           if (-not(Test-Path -Path 'bin\x64\Release SDL2\dosbox-x.exe' -PathType Leaf)) { exit 1 }
           contrib\windows\installer\PatchPE.exe 'bin\x64\Release SDL2\dosbox-x.exe'
+          if ($LASTEXITCODE) { throw 'PE patching failed' }
       - name: Package
         run: |
           ./tools/package_windows_sdl2.ps1 -Destination package
@@ -59,12 +63,13 @@ jobs:
         uses: actions/upload-artifact@v6.0.0
         with:
           name: ${{ env.package_stem }}
+          if-no-files-found: error
           path: |
             ${{ github.workspace }}/${{ env.package_stem }}*.zip
             ${{ github.workspace }}/${{ env.package_stem }}*.sha256
       - name: Attach zip to GitHub Release
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         with:
           files: |
             ${{ env.package_stem }}*.zip
